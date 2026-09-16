@@ -1,0 +1,41 @@
+# Environnement d'atelier MISTRAL — instance cible épinglée + source legacy.
+#
+# L'épinglage (2 vCPU, 8 Go, swap désactivé) n'est pas un confort : sans lui
+# les mesures des participants ne sont pas comparables (L01).
+# PGDATA est monté sur le disque hôte : les jeux dépassent la partition
+# du démon docker sur la plupart des postes.
+
+services:
+  timescaledb:
+    image: timescale/timescaledb-ha:pg17
+    container_name: timescaledb
+    cpuset: "0,1"
+    mem_limit: 8g
+    memswap_limit: 8g          # mémoire = mémoire+swap : pas de swap
+    shm_size: 1g
+    environment:
+      POSTGRES_PASSWORD: mistral
+      PGDATA: /home/postgres/pgdata/data
+    command: >
+      postgres -c shared_preload_libraries=timescaledb,pg_stat_statements
+    ports:
+      - "127.0.0.1:6543:5432"
+    volumes:
+      - ./pgdata:/home/postgres/pgdata
+      - ../generateur/output:/jeux:ro
+      - ./conf:/conf:ro
+      - ./archives:/archives          # archivage des journaux (L12)
+
+  legacy:
+    image: postgres:16
+    container_name: legacy
+    environment:
+      POSTGRES_PASSWORD: mistral
+      PGDATA: /var/lib/postgresql/data/pgdata
+    command: >
+      postgres -c wal_level=logical
+    ports:
+      - "127.0.0.1:6544:5432"
+    volumes:
+      - ./pgdata-legacy:/var/lib/postgresql/data
+      - ../generateur/output:/jeux:ro

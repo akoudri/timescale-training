@@ -1,0 +1,9 @@
+{
+  "description": "Profil de retard d'arrivée de référence du parc MISTRAL — valeur utilisée par la chaîne d'instantanés pour dimensionner les fenêtres de M08. Les mesures en salle doivent être du même ordre.",
+  "composantes": [
+    {"part": 0.85, "loi": "normale", "moyenne_s": 2.0, "sigma_s": 1.0, "min_s": 0.2},
+    {"part": 0.12, "loi": "lognormale", "mu": 4.0, "sigma": 0.8, "commentaire": "liaisons dégradées, ~30-300 s"},
+    {"part": 0.03, "loi": "uniforme", "min_s": 600, "max_s": 900, "commentaire": "reprise groupée après incident de collecte"}
+  ],
+  "reference_attendue": {"p50_s": 2, "p95_s": 90, "p99_s": 800, "pire_s": 900}
+}

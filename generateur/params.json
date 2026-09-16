@@ -1,0 +1,534 @@
+{
+  "_attribution": "Données de calibration issues du jeu SCADA Kelmarsh, publié par Cubico Sustainable Investments Ltd sous licence CC-BY-4.0 (DOI 10.5281/zenodo.8252025), année 2020, 6 éoliennes Senvion MM92.",
+  "_extraction": "2026-08-31",
+  "referentiel": {
+    "modele": "Senvion MM92",
+    "puissance_nominale_kw": 2050.0,
+    "diametre_rotor_m": 92.0,
+    "hauteur_moyeu_m": 78.5
+  },
+  "courbe_puissance": [
+    {
+      "vitesse_ms": 0.25,
+      "mediane_kw": -0.9,
+      "sigma_kw": 0.8,
+      "q10_kw": -2.1,
+      "q90_kw": -0.3,
+      "n": 208
+    },
+    {
+      "vitesse_ms": 0.75,
+      "mediane_kw": -0.9,
+      "sigma_kw": 0.8,
+      "q10_kw": -1.9,
+      "q90_kw": -0.3,
+      "n": 1348
+    },
+    {
+      "vitesse_ms": 1.25,
+      "mediane_kw": -1.0,
+      "sigma_kw": 0.8,
+      "q10_kw": -2.0,
+      "q90_kw": -0.3,
+      "n": 2783
+    },
+    {
+      "vitesse_ms": 1.75,
+      "mediane_kw": -1.1,
+      "sigma_kw": 1.7,
+      "q10_kw": -2.4,
+      "q90_kw": -0.4,
+      "n": 5199
+    },
+    {
+      "vitesse_ms": 2.25,
+      "mediane_kw": -1.5,
+      "sigma_kw": 6.8,
+      "q10_kw": -3.3,
+      "q90_kw": 0.7,
+      "n": 8535
+    },
+    {
+      "vitesse_ms": 2.75,
+      "mediane_kw": 1.6,
+      "sigma_kw": 17.7,
+      "q10_kw": -3.2,
+      "q90_kw": 33.3,
+      "n": 11681
+    },
+    {
+      "vitesse_ms": 3.25,
+      "mediane_kw": 41.5,
+      "sigma_kw": 27.7,
+      "q10_kw": 10.7,
+      "q90_kw": 78.1,
+      "n": 13197
+    },
+    {
+      "vitesse_ms": 3.75,
+      "mediane_kw": 85.9,
+      "sigma_kw": 32.6,
+      "q10_kw": 53.3,
+      "q90_kw": 129.0,
+      "n": 15594
+    },
+    {
+      "vitesse_ms": 4.25,
+      "mediane_kw": 138.7,
+      "sigma_kw": 39.7,
+      "q10_kw": 98.3,
+      "q90_kw": 192.8,
+      "n": 18472
+    },
+    {
+      "vitesse_ms": 4.75,
+      "mediane_kw": 202.1,
+      "sigma_kw": 48.2,
+      "q10_kw": 152.6,
+      "q90_kw": 268.0,
+      "n": 20173
+    },
+    {
+      "vitesse_ms": 5.25,
+      "mediane_kw": 281.4,
+      "sigma_kw": 56.5,
+      "q10_kw": 218.9,
+      "q90_kw": 358.9,
+      "n": 21413
+    },
+    {
+      "vitesse_ms": 5.75,
+      "mediane_kw": 378.6,
+      "sigma_kw": 67.6,
+      "q10_kw": 302.9,
+      "q90_kw": 471.2,
+      "n": 21971
+    },
+    {
+      "vitesse_ms": 6.25,
+      "mediane_kw": 496.2,
+      "sigma_kw": 78.8,
+      "q10_kw": 405.8,
+      "q90_kw": 600.6,
+      "n": 21791
+    },
+    {
+      "vitesse_ms": 6.75,
+      "mediane_kw": 634.4,
+      "sigma_kw": 89.0,
+      "q10_kw": 531.9,
+      "q90_kw": 755.1,
+      "n": 20113
+    },
+    {
+      "vitesse_ms": 7.25,
+      "mediane_kw": 790.4,
+      "sigma_kw": 98.4,
+      "q10_kw": 675.7,
+      "q90_kw": 925.3,
+      "n": 18097
+    },
+    {
+      "vitesse_ms": 7.75,
+      "mediane_kw": 968.7,
+      "sigma_kw": 109.4,
+      "q10_kw": 837.3,
+      "q90_kw": 1117.0,
+      "n": 15371
+    },
+    {
+      "vitesse_ms": 8.25,
+      "mediane_kw": 1163.9,
+      "sigma_kw": 117.0,
+      "q10_kw": 1015.7,
+      "q90_kw": 1316.6,
+      "n": 13273
+    },
+    {
+      "vitesse_ms": 8.75,
+      "mediane_kw": 1362.7,
+      "sigma_kw": 118.2,
+      "q10_kw": 1213.0,
+      "q90_kw": 1518.2,
+      "n": 11716
+    },
+    {
+      "vitesse_ms": 9.25,
+      "mediane_kw": 1564.5,
+      "sigma_kw": 115.4,
+      "q10_kw": 1418.9,
+      "q90_kw": 1711.8,
+      "n": 10417
+    },
+    {
+      "vitesse_ms": 9.75,
+      "mediane_kw": 1740.0,
+      "sigma_kw": 107.2,
+      "q10_kw": 1597.4,
+      "q90_kw": 1871.8,
+      "n": 9634
+    },
+    {
+      "vitesse_ms": 10.25,
+      "mediane_kw": 1875.0,
+      "sigma_kw": 91.5,
+      "q10_kw": 1743.6,
+      "q90_kw": 1976.9,
+      "n": 8144
+    },
+    {
+      "vitesse_ms": 10.75,
+      "mediane_kw": 1959.7,
+      "sigma_kw": 72.5,
+      "q10_kw": 1849.0,
+      "q90_kw": 2028.7,
+      "n": 6844
+    },
+    {
+      "vitesse_ms": 11.25,
+      "mediane_kw": 2005.0,
+      "sigma_kw": 56.6,
+      "q10_kw": 1915.8,
+      "q90_kw": 2046.5,
+      "n": 5600
+    },
+    {
+      "vitesse_ms": 11.75,
+      "mediane_kw": 2028.1,
+      "sigma_kw": 50.6,
+      "q10_kw": 1965.3,
+      "q90_kw": 2053.5,
+      "n": 4394
+    },
+    {
+      "vitesse_ms": 12.25,
+      "mediane_kw": 2037.1,
+      "sigma_kw": 32.4,
+      "q10_kw": 1993.1,
+      "q90_kw": 2057.1,
+      "n": 3382
+    },
+    {
+      "vitesse_ms": 12.75,
+      "mediane_kw": 2043.2,
+      "sigma_kw": 25.6,
+      "q10_kw": 2009.4,
+      "q90_kw": 2058.8,
+      "n": 2407
+    },
+    {
+      "vitesse_ms": 13.25,
+      "mediane_kw": 2046.3,
+      "sigma_kw": 25.7,
+      "q10_kw": 2019.6,
+      "q90_kw": 2061.0,
+      "n": 1934
+    },
+    {
+      "vitesse_ms": 13.75,
+      "mediane_kw": 2047.0,
+      "sigma_kw": 19.7,
+      "q10_kw": 2022.3,
+      "q90_kw": 2061.5,
+      "n": 1502
+    },
+    {
+      "vitesse_ms": 14.25,
+      "mediane_kw": 2047.0,
+      "sigma_kw": 23.2,
+      "q10_kw": 2020.8,
+      "q90_kw": 2061.9,
+      "n": 1164
+    },
+    {
+      "vitesse_ms": 14.75,
+      "mediane_kw": 2046.4,
+      "sigma_kw": 18.2,
+      "q10_kw": 2022.6,
+      "q90_kw": 2061.9,
+      "n": 968
+    },
+    {
+      "vitesse_ms": 15.25,
+      "mediane_kw": 2045.4,
+      "sigma_kw": 23.4,
+      "q10_kw": 2022.5,
+      "q90_kw": 2062.1,
+      "n": 733
+    },
+    {
+      "vitesse_ms": 15.75,
+      "mediane_kw": 2045.6,
+      "sigma_kw": 16.4,
+      "q10_kw": 2020.1,
+      "q90_kw": 2062.7,
+      "n": 497
+    },
+    {
+      "vitesse_ms": 16.25,
+      "mediane_kw": 2045.2,
+      "sigma_kw": 55.7,
+      "q10_kw": 2016.5,
+      "q90_kw": 2061.2,
+      "n": 374
+    },
+    {
+      "vitesse_ms": 16.75,
+      "mediane_kw": 2044.2,
+      "sigma_kw": 52.2,
+      "q10_kw": 2011.6,
+      "q90_kw": 2063.2,
+      "n": 259
+    },
+    {
+      "vitesse_ms": 17.25,
+      "mediane_kw": 2044.0,
+      "sigma_kw": 30.2,
+      "q10_kw": 2018.5,
+      "q90_kw": 2060.3,
+      "n": 203
+    },
+    {
+      "vitesse_ms": 17.75,
+      "mediane_kw": 2044.8,
+      "sigma_kw": 51.8,
+      "q10_kw": 2015.4,
+      "q90_kw": 2060.0,
+      "n": 144
+    },
+    {
+      "vitesse_ms": 18.25,
+      "mediane_kw": 2045.1,
+      "sigma_kw": 34.6,
+      "q10_kw": 2017.0,
+      "q90_kw": 2060.9,
+      "n": 96
+    },
+    {
+      "vitesse_ms": 18.75,
+      "mediane_kw": 2033.1,
+      "sigma_kw": 22.7,
+      "q10_kw": 1999.8,
+      "q90_kw": 2058.5,
+      "n": 76
+    },
+    {
+      "vitesse_ms": 19.25,
+      "mediane_kw": 2044.3,
+      "sigma_kw": 37.4,
+      "q10_kw": 2010.4,
+      "q90_kw": 2061.2,
+      "n": 57
+    },
+    {
+      "vitesse_ms": 19.75,
+      "mediane_kw": 2042.8,
+      "sigma_kw": 26.5,
+      "q10_kw": 2017.6,
+      "q90_kw": 2068.2,
+      "n": 35
+    },
+    {
+      "vitesse_ms": 20.25,
+      "mediane_kw": 2046.5,
+      "sigma_kw": 201.7,
+      "q10_kw": 2006.0,
+      "q90_kw": 2072.3,
+      "n": 20
+    }
+  ],
+  "vent": {
+    "weibull_k": 2.379,
+    "weibull_lambda_ms": 7.399,
+    "autocorrelation_10min": 0.9697,
+    "moyenne_ms": 6.558
+  },
+  "rotor": [
+    {
+      "vitesse_ms": 0.25,
+      "rpm": 0.0
+    },
+    {
+      "vitesse_ms": 0.75,
+      "rpm": 0.0
+    },
+    {
+      "vitesse_ms": 1.25,
+      "rpm": 0.0
+    },
+    {
+      "vitesse_ms": 1.75,
+      "rpm": 0.39
+    },
+    {
+      "vitesse_ms": 2.25,
+      "rpm": 0.69
+    },
+    {
+      "vitesse_ms": 2.75,
+      "rpm": 8.14
+    },
+    {
+      "vitesse_ms": 3.25,
+      "rpm": 8.15
+    },
+    {
+      "vitesse_ms": 3.75,
+      "rpm": 8.27
+    },
+    {
+      "vitesse_ms": 4.25,
+      "rpm": 8.67
+    },
+    {
+      "vitesse_ms": 4.75,
+      "rpm": 9.17
+    },
+    {
+      "vitesse_ms": 5.25,
+      "rpm": 9.83
+    },
+    {
+      "vitesse_ms": 5.75,
+      "rpm": 10.65
+    },
+    {
+      "vitesse_ms": 6.25,
+      "rpm": 11.52
+    },
+    {
+      "vitesse_ms": 6.75,
+      "rpm": 12.4
+    },
+    {
+      "vitesse_ms": 7.25,
+      "rpm": 13.25
+    },
+    {
+      "vitesse_ms": 7.75,
+      "rpm": 14.01
+    },
+    {
+      "vitesse_ms": 8.25,
+      "rpm": 14.6
+    },
+    {
+      "vitesse_ms": 8.75,
+      "rpm": 14.93
+    },
+    {
+      "vitesse_ms": 9.25,
+      "rpm": 15.08
+    },
+    {
+      "vitesse_ms": 9.75,
+      "rpm": 15.13
+    },
+    {
+      "vitesse_ms": 10.25,
+      "rpm": 15.15
+    },
+    {
+      "vitesse_ms": 10.75,
+      "rpm": 15.16
+    },
+    {
+      "vitesse_ms": 11.25,
+      "rpm": 15.16
+    },
+    {
+      "vitesse_ms": 11.75,
+      "rpm": 15.16
+    },
+    {
+      "vitesse_ms": 12.25,
+      "rpm": 15.16
+    },
+    {
+      "vitesse_ms": 12.75,
+      "rpm": 15.16
+    },
+    {
+      "vitesse_ms": 13.25,
+      "rpm": 15.16
+    },
+    {
+      "vitesse_ms": 13.75,
+      "rpm": 15.16
+    },
+    {
+      "vitesse_ms": 14.25,
+      "rpm": 15.16
+    },
+    {
+      "vitesse_ms": 14.75,
+      "rpm": 15.16
+    },
+    {
+      "vitesse_ms": 15.25,
+      "rpm": 15.16
+    },
+    {
+      "vitesse_ms": 15.75,
+      "rpm": 15.16
+    },
+    {
+      "vitesse_ms": 16.25,
+      "rpm": 15.16
+    },
+    {
+      "vitesse_ms": 16.75,
+      "rpm": 15.16
+    },
+    {
+      "vitesse_ms": 17.25,
+      "rpm": 15.17
+    },
+    {
+      "vitesse_ms": 17.75,
+      "rpm": 15.17
+    },
+    {
+      "vitesse_ms": 18.25,
+      "rpm": 15.18
+    },
+    {
+      "vitesse_ms": 18.75,
+      "rpm": 15.16
+    },
+    {
+      "vitesse_ms": 19.25,
+      "rpm": 15.17
+    },
+    {
+      "vitesse_ms": 19.75,
+      "rpm": 15.19
+    },
+    {
+      "vitesse_ms": 20.25,
+      "rpm": 15.19
+    }
+  ],
+  "disponibilite": {
+    "taux_moyen": 0.9542,
+    "arrets_par_jour_machine": 0.581,
+    "duree_arret_lognorm_mu": 5.8993,
+    "duree_arret_lognorm_sigma": 1.5606
+  },
+  "interruptions_collecte": {
+    "par_jour_machine": 0.0524,
+    "duree_lognorm_mu": 9.0054,
+    "duree_lognorm_sigma": 1.1109
+  },
+  "temperatures": {
+    "nacelle_moyenne_c": 11.61,
+    "nacelle_sigma_c": 5.63,
+    "multiplicateur_base_c": 51.89,
+    "multiplicateur_pente_c_par_kw": 0.000493,
+    "constante_temps_s": 14400.0
+  },
+  "tension": {
+    "moyenne_v": 404.1,
+    "sigma_v": 20.59
+  }
+}

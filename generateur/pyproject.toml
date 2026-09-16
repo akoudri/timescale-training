@@ -1,0 +1,31 @@
+[project]
+name = "mistral-gen"
+version = "1.0.0"
+description = "Générateur des jeux de données MISTRAL — formation TimescaleDB"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=1.26",
+    "pyyaml>=6.0",
+    "scipy>=1.18.1",
+    "zstandard>=0.22",
+]
+
+[project.scripts]
+mistral-gen = "mistral_gen.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mistral_gen"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "lent: régénération complète (déterminisme)",
+    "chargement: nécessite docker et l'image timescaledb pg17",
+]

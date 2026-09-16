@@ -1,0 +1,40 @@
+# Configuration du générateur MISTRAL — fiche §9
+graine: 20260315
+
+fenetre:
+  debut: "2026-09-15T00:00:00+02:00"
+  jours: 45
+  fuseau: "Europe/Paris"
+
+series:
+  eoliennes: 42
+  centrales_pv: 3
+  points_livraison: 1
+
+frequence_hz: 0.1
+
+haute_cardinalite:
+  series: 20000
+  pas_minutes: 15
+  jours: 7
+
+contraintes:
+  machines_avec_arret: 3        # 6.2 — pas irrégulier pendant arrêt maintenance
+  arret_duree_heures: [42, 48]  # 6.2 — durée de l'arrêt (bornes)
+  remises_a_zero_compteur: 2    # 6.3
+  interruptions_min: 20         # 6.4 — trous > 30 min
+  interruptions_total: 24       # nombre effectivement généré
+
+legacy:
+  debut: "2026-07-20T00:00:00+02:00"
+  jours: 72
+  series: 400
+  pas_secondes: 60
+
+mesures_avant:
+  jours: 5                      # jours 1..5 de la fenêtre, table ordinaire
+
+pdl:
+  pertes: 0.025
+
+sortie: "output"
