@@ -36,6 +36,8 @@ C'est le seul atelier de la formation dont le livrable n'est pas une décision t
 - `mistral-legacy.dump` restauré sur l'instance PostgreSQL 16
 - `mesures-hc.bin` chargé (il ne servira qu'en M09, mais son chargement se vérifie ici)
 
+**Lecture recommandée** : `L00-mistral-modele-de-donnees.md` décrit le parc MISTRAL, le référentiel et les tables restaurées. Il est indispensable avant L02, utile dès maintenant pour savoir ce que mesurent R1, R2 et R3.
+
 **Fichiers fournis dans le dépôt**
 
 | Fichier | Rôle |
@@ -50,14 +52,22 @@ C'est le seul atelier de la formation dont le livrable n'est pas une décision t
 
 ## SOCLE — pour tous
 
+**Avant l'étape 1 : le parcours amont doit avoir été joué.** Il crée les répertoires de données, démarre les deux instances, crée la base `mistral` et y restaure les trois jeux. Toutes les étapes ci-dessous se font **dans la base `mistral`**. Si `verifier-poste.sh` ne répond pas « poste conforme », le jouer maintenant, depuis `atelier/` :
+
+```bash
+./amont/restaurer.sh && ./verifier-poste.sh
+```
+
 ### Étape 1 — Démarrer l'instance épinglée
 
 L'épinglage n'est pas un détail de confort : sans lui, les mesures d'un participant ne sont pas comparables à celles d'un autre, et la règle du rapport plutôt que de la durée absolue perd son sens.
 
 ```bash
-docker compose up -d timescaledb
+docker compose up -d timescaledb      # sans effet si le parcours amont l'a déjà démarrée
 docker stats --no-stream timescaledb
 ```
+
+Les répertoires de données (`pgdata/`, `pgdata-legacy/`, `archives/`) sont montés depuis le disque hôte. Le parcours amont les a créés à votre nom ; s'ils n'existent pas au premier `up`, Docker les crée lui-même, propriété de root, et l'instance ne démarre pas (voir les pièges).
 
 Vérifier que la sortie de `docker stats` affiche bien une limite mémoire de 8 Go et non la mémoire totale du poste.
 
@@ -73,9 +83,16 @@ Les deux valeurs doivent être identiques : mémoire et mémoire+swap au même p
 
 Trois extensions, pas une. La première porte le produit ; les deux autres sont exigées par des modules ultérieurs, et ce sont celles qu'on oublie.
 
+Se connecter à la base `mistral` — **une extension se crée par base** : le parcours amont n'y a créé que `timescaledb`, les deux autres sont à votre charge, et une extension créée dans la base `postgres` ne sert à rien ici.
+
+```bash
+docker compose exec timescaledb psql -U postgres -d mistral
+```
+
+La première bibliothèque et la troisième doivent être **préchargées au démarrage** : c'est le paramètre `shared_preload_libraries`, qui ne se modifie qu'avec un redémarrage. Dans le kit, il n'est pas à écrire dans `postgresql.conf` (le fichier de configuration du serveur, dans le conteneur) : le `docker-compose.yml` le passe sur la ligne de commande du serveur (`command: postgres -c shared_preload_libraries=…`). Le vérifier avant de créer les extensions :
+
 ```sql
--- postgresql.conf doit contenir la ligne suivante avant tout démarrage :
---   shared_preload_libraries = 'timescaledb,pg_stat_statements'
+SHOW shared_preload_libraries;   -- attendu : timescaledb,pg_stat_statements
 
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 CREATE EXTENSION IF NOT EXISTS timescaledb_toolkit;
@@ -97,11 +114,23 @@ SELECT version();
 
 ### Étape 3 — Appliquer la configuration et vérifier les workers
 
+Deux fichiers sont en jeu, à ne pas confondre :
+
+- `conf/timescaledb-mistral.conf`, dans le dépôt, monté dans le conteneur sous `/conf` : la configuration d'atelier (mémoire, workers, suivi des requêtes) ;
+- `postgresql.conf`, dans le conteneur, créé par l'image au premier démarrage : la configuration du serveur. Il ne lit la première que si on la lui fait **inclure**.
+
+Le parcours amont a préparé le point d'inclusion (un répertoire `conf.d/` et la ligne `include_dir` dans `postgresql.conf`). Il reste à y copier la configuration d'atelier et à redémarrer, depuis `atelier/` :
+
 ```bash
-docker compose exec timescaledb \
-  cp /conf/timescaledb-mistral.conf /home/postgres/pgdata/data/conf.d/
+D=/home/postgres/pgdata/data
+docker compose exec timescaledb mkdir -p $D/conf.d
+docker compose exec timescaledb sh -c "grep -q '^include_dir' $D/postgresql.conf \
+  || echo \"include_dir = 'conf.d'\" >> $D/postgresql.conf"
+docker compose exec timescaledb cp /conf/timescaledb-mistral.conf $D/conf.d/
 docker compose restart timescaledb
 ```
+
+Les deux premières commandes ne font rien si le parcours amont est passé ; elles rendent l'étape rejouable sur une instance démarrée sans lui. Un redémarrage complet est obligatoire : ces paramètres ne se rechargent pas à chaud.
 
 Puis, une fois l'instance revenue :
 
@@ -216,6 +245,12 @@ Modifier `mesure.sh` pour qu'il consigne également, à chaque exécution, le no
 ---
 
 ## Pièges et indices
+
+**Le conteneur s'arrête aussitôt : « mkdir: cannot create directory '/home/postgres/pgdata/data': Permission denied ».**
+Le répertoire `pgdata/` a été créé par Docker (donc par root) parce qu'il n'existait pas au premier `up`. L'image tourne sous l'uid 1000 et ne peut pas y écrire. Supprimer le répertoire vide (`rmdir pgdata`), le recréer à votre nom (`mkdir pgdata`), relancer. `./amont/restaurer.sh` fait cette création correctement ; c'est une raison de plus de ne pas sauter le parcours amont.
+
+**`ERROR: relation "mesures" does not exist`, alors que le parcours amont est passé.**
+La session `psql` n'est pas connectée à la bonne base. Sans option `-d`, `psql` ouvre la base `postgres`, qui est vide ; tout le travail des quinze labs se fait dans `mistral`. Le prompt le dit : il doit afficher `mistral=#`, pas `postgres=#`. Corriger avec `\c mistral`, ou se connecter par `docker compose exec timescaledb psql -U postgres -d mistral`. `mesure.sh` n'a pas ce problème, il nomme la base lui-même — c'est pour cela que l'étape 4 passe et que l'étape 5, tapée à la main, échoue.
 
 **La limite du conteneur semble ignorée.**
 Sur macOS et Windows, `--memory` ne fait effet que si la machine virtuelle de Docker Desktop est plus grande que la limite demandée. Vérifier d'abord le dimensionnement de la VM dans les préférences, ensuite seulement celui du conteneur. Un conteneur à 8 Go dans une VM à 4 Go se comporte comme un conteneur à 4 Go, sans le signaler.

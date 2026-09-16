@@ -9,6 +9,8 @@
 
 ## Contexte
 
+Le métier, le référentiel et les tables restaurées sont décrits dans `L00-mistral-modele-de-donnees.md` : le lire avant de trancher quoi que ce soit. Les six décisions ci-dessous portent sur ce qu'il laisse volontairement ouvert.
+
 C'est le seul atelier de la formation dont le livrable est une **décision** et non une mesure. Le schéma produit ici n'est pas un exercice : il est utilisé par les douze modules suivants, et c'est lui qui est migré en M12.
 
 Deux conséquences pratiques. D'abord, il ne s'agit pas de partir d'une page blanche : le dépôt fournit un squelette avec **six points de décision** explicitement marqués, et le travail consiste à les trancher et à écrire pourquoi. Ensuite, la chaîne d'instantanés impose une **variante de référence** : c'est celle que `reprise/M03.sql` implémente, et c'est sur elle que les modules suivants s'appuient. Un sous-groupe qui retient un autre modèle a le droit d'avoir raison — il consigne son choix dans son plan d'application et poursuit sur la référence.
@@ -19,12 +21,16 @@ Ce qui est réellement évalué n'est pas le schéma retenu, mais la qualité de
 
 ## Prérequis
 
+**Lecture préalable obligatoire**
+
+- `L00-mistral-modele-de-donnees.md` : le métier MISTRAL, le catalogue des 25 signaux, l'affectation datée, la fenêtre du jeu et ses irrégularités. Les six décisions ne se tranchent pas sans savoir ce que l'on modélise ; compter dix minutes de lecture, avant la séance.
+
 **État attendu**
 
 - `mistral-M02` atteint : instance conforme, extension 2.29 chargée, `mesures.md` renseigné avec trois médianes
 - Le jeu MISTRAL est restauré, `mesures` est encore une **table ordinaire**
 
-**Tables de référentiel déjà présentes**
+**Tables de référentiel déjà présentes** (détaillées dans L00)
 
 | Table | Colonnes utiles |
 |---|---|

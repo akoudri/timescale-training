@@ -3,7 +3,11 @@
 # L'épinglage (2 vCPU, 8 Go, swap désactivé) n'est pas un confort : sans lui
 # les mesures des participants ne sont pas comparables (L01).
 # PGDATA est monté sur le disque hôte : les jeux dépassent la partition
-# du démon docker sur la plupart des postes.
+# du démon docker sur la plupart des postes. Les répertoires pgdata/,
+# pgdata-legacy/ et archives/ doivent exister AVANT le premier démarrage et
+# appartenir à l'utilisateur courant (uid 1000, comme postgres dans l'image) :
+# amont/restaurer.sh les crée ; sinon `mkdir -p pgdata pgdata-legacy archives`.
+# Un répertoire créé par Docker appartient à root et l'instance ne démarre pas.
 
 services:
   timescaledb:
