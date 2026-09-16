@@ -8,6 +8,12 @@
 # appartenir à l'utilisateur courant (uid 1000, comme postgres dans l'image) :
 # amont/restaurer.sh les crée ; sinon `mkdir -p pgdata pgdata-legacy archives`.
 # Un répertoire créé par Docker appartient à root et l'instance ne démarre pas.
+#
+# Profil « outils » (facultatif, jamais démarré par défaut) :
+#   docker compose --profile outils up -d     → Grafana (L15) et pgAdmin
+#   Grafana : http://127.0.0.1:3000  admin / mistral
+#   pgAdmin : http://127.0.0.1:5050  (serveurs préenregistrés, mot de passe : mistral)
+# Ni l'un ni l'autre ne sert à mesurer : le protocole reste psql + mesure.sh.
 
 services:
   timescaledb:
@@ -44,3 +50,43 @@ services:
     volumes:
       - ./pgdata-legacy:/var/lib/postgresql/data
       - ../generateur/output:/jeux:ro
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    container_name: grafana
+    profiles: ["outils"]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: mistral
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./outils/grafana/datasources.yml:/etc/grafana/provisioning/datasources/mistral.yml:ro
+      - ./l15:/l15:ro                  # tableau-de-bord.json, à importer depuis l'interface
+    depends_on:
+      - timescaledb
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: pgadmin
+    profiles: ["outils"]
+    environment:
+      PGADMIN_DEFAULT_EMAIL: formateur@janus-academy.fr   # pgAdmin refuse les domaines réservés (.local, .example)
+      PGADMIN_DEFAULT_PASSWORD: mistral
+      PGADMIN_CONFIG_SERVER_MODE: "False"                 # pas d'écran de connexion
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+      PGADMIN_SERVER_JSON_FILE: /pgadmin4/servers.json
+    ports:
+      - "127.0.0.1:5050:80"
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
+      - ./outils/pgadmin/servers.json:/pgadmin4/servers.json:ro
+    depends_on:
+      - timescaledb
+      - legacy
+
+volumes:
+  grafana-data:
+  pgadmin-data:

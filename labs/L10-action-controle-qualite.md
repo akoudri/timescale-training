@@ -64,25 +64,22 @@ CREATE PROCEDURE controle_qualite(job_id int, config jsonb)
 LANGUAGE plpgsql AS $$
 DECLARE
   seuil interval := (config->>'seuil')::interval;
-  -- l'anciennete se mesure contre le dernier point du PARC, pas l'horloge :
-  -- le jeu est date, et un incident global de collecte n'est pas
-  -- « 490 capteurs muets »
-  ref   timestamptz := (SELECT max(ts) FROM mesures);
   n     integer;
 BEGIN
   -- journaliser le parametre recu : voir les pieges
   RAISE NOTICE 'controle_qualite job=% seuil=%', job_id, seuil;
 
-  INSERT INTO alertes_qualite (detecte_le, series_id, dernier_point, anciennete)
-  SELECT now(), series_id, max(ts), ref - max(ts)
-  FROM   mesures
-  GROUP  BY series_id
-  HAVING max(ts) < ref - seuil;
+  -- a completer : consigner dans alertes_qualite chaque serie dont le
+  -- dernier point est plus ancien que le seuil (detecte_le, series_id,
+  -- dernier_point, anciennete)
+  ...
 
   GET DIAGNOSTICS n = ROW_COUNT;
   RAISE NOTICE 'controle_qualite : % capteurs muets', n;
 END $$;
 ```
+
+**Une question à trancher avant d'écrire la requête** : « plus ancien que le seuil » par rapport à quoi ? L'horloge murale, ou le dernier point reçu par le parc ? Le jeu MISTRAL est daté, ce qui règle la question pour l'atelier — mais en production aussi, un incident de collecte global ne doit pas déclarer 490 capteurs muets d'un coup. Écrire le choix en commentaire.
 
 **Ne pas tester en appelant la procédure directement.** Le contexte d'exécution d'un job diffère de celui d'une session interactive — rôle, `search_path`, privilèges. Un test qui passe à la main ne prouve rien.
 
@@ -196,7 +193,7 @@ Le contexte diffère : rôle propriétaire, `search_path`, privilèges. Toujours
 Deux causes. Soit on la cherche dans le journal applicatif de PostgreSQL alors qu'elle est dans le journal des erreurs de l'extension : deux endroits distincts. Soit le job a été exécuté par `CALL run_job()` en session : l'erreur est remontée au client et rien n'a été journalisé — seul l'ordonnanceur écrit dans `job_errors`. Rapprocher l'échéance et laisser le job échouer en arrière-plan.
 
 **Le job s'exécute avec succès mais la table reste vide.**
-Une configuration mal formée est souvent lue sans erreur et donne une valeur nulle : `ref - NULL` ne compare rien, et la clause `HAVING` ne retient personne. C'est pour cela que l'action journalise le paramètre reçu dès sa première ligne.
+Une configuration mal formée est souvent lue sans erreur et donne une valeur nulle : une soustraction avec `NULL` ne compare rien, et la clause `HAVING` ne retient personne. C'est pour cela que l'action journalise le paramètre reçu dès sa première ligne.
 
 **`run_job` échoue avec une erreur de transaction.**
 Comme `refresh_continuous_aggregate`, il ne peut pas s'exécuter dans une transaction explicite. Ne pas l'encadrer d'un `BEGIN`.
@@ -219,15 +216,3 @@ Un `alter_job(..., scheduled => false)` oublié ne produit aucune erreur : le tr
 | État de reprise | `mistral-M11` |
 
 **Vers la suite.** La cible est complète : schéma, dimensionnement, agrégats, compression, rétention, automatisation. Il reste à y amener la production — deux cents gigaoctets qui tournent encore sur `mistral_legacy`, avec un budget d'interruption à négocier. C'est M12.
-
----
-
-## Note de production
-
-`reprise/M11.sql` crée la table `alertes_qualite`, la procédure et son job — mais **ne simule pas la coupure de capteurs**. L'état de reprise doit rester déterministe, et le script de coupure modifie les données.
-
-Conséquence : un participant qui reprend sur `mistral-M11` dispose du job mais d'une table d'alertes vide. C'est cohérent, et l'énoncé du module suivant n'en dépend pas.
-
-`tests/M11.sql` vérifie l'existence du job, sa planification active, et le fait qu'une exécution forcée sur un jeu de capteurs coupés produise exactement trois lignes. Ce dernier contrôle impose que le script de coupure soit rejouable et déterministe.
-
-**Point ouvert** : le nom exact de la vue des erreurs de job et la liste des colonnes de la vue des statistiques ont évolué au fil des versions. Ce sont les deux requêtes centrales de l'étape 4, et elles fondent le jeu de diagnostic de M15 — à recouper sur l'instance de référence avant diffusion, et à corriger en un seul endroit si elles ont changé.

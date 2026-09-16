@@ -103,6 +103,14 @@ Charger ensuite le jeu complet dans l'hypertable — c'est le chargement par `CO
 
 La table de la ligne de base de M02 reste consultable sous le nom `mesures_avant` : le squelette l'a renommée avant de créer l'hypertable.
 
+**Enregistrer ensuite le squelette complété sous `schema.sql`, à la racine d'`atelier/`** — une copie, justifications comprises :
+
+```bash
+cp l02/schema-squelette.sql schema.sql
+```
+
+C'est ce fichier, et non le squelette, que les fiches suivantes citent : L03 y inscrit l'intervalle de chunk retenu, L14 y compare l'inventaire des index, et il fait partie de ce que vous emportez en fin de formation.
+
 ### Étape 3 — Charger le référentiel (5 min)
 
 ```sql
@@ -126,6 +134,8 @@ La jointure doit tenir compte de la période de validité de l'affectation, faut
 SELECT max(ts) AS fin, max(ts) - interval '1 hour' AS debut
 FROM   mesures \gset
 
+-- squelette : les colonnes de sortie sont le contrat, la jointure est à
+-- completer — une condition manque sur affectation_capteur
 SELECT m.ts,
        s.nom       AS site,
        a.machine_id,
@@ -135,8 +145,7 @@ SELECT m.ts,
 FROM   mesures m
 JOIN   affectation_capteur af
   ON   af.series_id = m.series_id
- AND   m.ts >= af.debut
- AND   (af.fin IS NULL OR m.ts < af.fin)
+  -- ... la periode de validite de l'affectation ?
 JOIN   actifs  a ON a.machine_id = af.machine_id
 JOIN   sites   s ON s.site_id    = a.site_id
 JOIN   signaux g ON g.signal_id  = af.signal_id
@@ -144,7 +153,9 @@ WHERE  m.ts >= :'debut' AND m.ts < :'fin'
 LIMIT  20;
 ```
 
-Consigner la requête dans `requetes/jointure-referentiel.sql`.
+Tel quel, ce squelette retourne 20 lignes correctes sur le jeu restauré, parce qu'aucun capteur n'y a encore été remplacé. Il est pourtant faux : trouver ce qui manque, et écrire en une phrase ce qui se passerait le jour d'un remplacement de capteur. L'extension E2 le fait constater.
+
+Consigner la requête complétée dans `requetes/jointure-referentiel.sql`.
 
 ### Étape 5 — Estimer le volume à 3 ans (8 min)
 
@@ -230,6 +241,9 @@ Comparer le volume au modèle retenu, ramené au même nombre de points. Puis r�
 
 ## Pièges et indices
 
+**Un capteur remplacé apparaît deux fois, ou sur la mauvaise machine.**
+La jointure sur `affectation_capteur` ne porte que sur la série. Une série a une affectation **par période** : les colonnes `debut` et `fin` (NULL pour l'affectation courante) font partie de la clé de jointure, pas seulement `series_id`. Sans elles, chaque mesure se joint à toutes les affectations passées de sa série.
+
 **La clé primaire est refusée.**
 Toute contrainte d'unicité sur une hypertable doit contenir la colonne de partitionnement. Un `PRIMARY KEY (series_id, ts)` fonctionne, un `PRIMARY KEY (series_id)` seul échoue. Ce n'est pas arbitraire : l'unicité globale ne peut pas être garantie sans lire tous les chunks.
 
@@ -263,13 +277,3 @@ C'est un choix défendable et fréquent en production, à condition d'en énonce
 | État de reprise | `mistral-M03` |
 
 **Vers la suite.** Les hypertables tournent sur l'intervalle de chunk par défaut du squelette, choisi sans aucune mesure. M04 pose la question que cet atelier a délibérément mise de côté : cet intervalle est-il le bon, et comment le prouver ? Les trois médianes de la ligne de base de M02 servent enfin de point de comparaison.
-
----
-
-## Note de production
-
-Le corrigé de ce socle **est** `reprise/M03.sql`, qui implémente la variante de référence — modèle intermédiaire par famille, `series_id` entier, `double precision`, colonne `qualite`, événements en JSONB, affectation datée. Ces six choix ne sont pas les seuls défendables ; ils sont ceux que la chaîne d'instantanés matérialise, et l'énoncé le dit aux participants.
-
-`tests/M03.sql` vérifie les six critères de réussite du socle. Le troisième — absorber un nouveau type de capteur sans `ALTER TABLE` — s'y traduit par l'insertion d'une série de `signal_id` inconnu suivie d'une lecture réussie : c'est un test fonctionnel, pas une inspection de schéma, ce qui laisse passer plusieurs modèles corrects.
-
-**Point ouvert** : la syntaxe `WITH (timescaledb.hypertable, timescaledb.partition_column, timescaledb.chunk_interval)` est récente et son vocabulaire a évolué entre versions mineures. Le squelette doit être exécuté sur l'instance 2.29 de référence avant diffusion, et une variante `create_hypertable()` conservée en commentaire pour les environnements plus anciens.

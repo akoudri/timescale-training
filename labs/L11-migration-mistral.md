@@ -239,14 +239,18 @@ C'est attendu sur ce volume et dans ce réseau. La valeur n'est pas transposable
 | `mesures.md` §`M12` | Interruption réelle, durée de la copie initiale, retard du dernier delta à la bascule |
 | `l11/ecarts.md` | Pour ceux qui ont fait E1 : les écarts entre le repli écrit et le repli exécuté |
 
-**Vers la suite.** La production tourne sur la cible. La question suivante est celle qu'on ne se pose jamais assez tôt : que se passe-t-il si cette instance disparaît ? M13 traite la sauvegarde, la restauration — et la montée de version, qui n'a pas de retour arrière.
+## Nettoyage
+
+À faire en fin d'atelier, extensions comprises : ce qui n'appartient pas à l'état de reprise part.
+
+Arrêter le simulateur de flux s'il tourne encore (`Ctrl-C` dans son terminal, ou `pkill -f simuler-flux`), et vérifier qu'il est bien arrêté par un comptage stable côté source — la leçon de l'étape 5 vaut aussi ici.
+
+La base cible `mistral_prod` (environ 3 Go) n'est pas utilisée par les modules suivants : la conserver le temps de la relecture de la checklist, puis la supprimer. Le fichier de borne `l11/.borne` peut partir avec elle.
+
+```sql
+DROP DATABASE mistral_prod;    -- depuis une session sur une autre base
+```
 
 ---
 
-## Note de production
-
-**Point de validation tranché au pilote (TimescaleDB 2.29.2, PostgreSQL 17).** La réplication logique **vers une hypertable** est inutilisable : la synchronisation initiale écrit dans la table racine sans routage vers les chunks (données invisibles, aucun message), et la source partitionnée exige `publish_via_partition_root = true`. Le socle repose donc sur la **variante B** — copie par plages sur l'identifiant monotone de la source, puis delta — qui n'a aucune dépendance de version ; la réplication logique est reléguée en extension E3, pour constater. La colonne `ingere_le` ajoutée en M05 joue le même rôle de borne de delta sur une source qui en dispose.
-
-`reprise/M12.sql` n'existe pas : M12 ne produit aucun état de fil rouge nouveau côté cible, seulement des fichiers. En revanche, l'environnement source `mistral_legacy` doit être **remis à zéro** entre deux sessions, et le script de construction de la chaîne doit le prévoir.
-
-`tests/M12.sql` vérifie que la checklist contient les rubriques attendues — y compris une section repli non vide — et que les séquences de la cible sont positionnées au-delà du maximum observé. Il ne vérifie pas la durée d'interruption.
+**Vers la suite.** La production tourne sur la cible. La question suivante est celle qu'on ne se pose jamais assez tôt : que se passe-t-il si cette instance disparaît ? M13 traite la sauvegarde, la restauration — et la montée de version, qui n'a pas de retour arrière.

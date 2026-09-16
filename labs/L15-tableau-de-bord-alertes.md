@@ -38,6 +38,16 @@ Vingt minutes, quatre alertes. C'est court, et c'est délibéré : une liste cou
 
 ## SOCLE — pour tous
 
+### Étape 0 — Démarrer Grafana et brancher la source (5 min)
+
+```bash
+docker compose --profile outils up -d grafana     # http://127.0.0.1:3000, admin / mistral
+```
+
+La source de données « PostgreSQL MISTRAL » est provisionnée sur le rôle `mistral_supervision`, **qui n'existe pas encore**. Le créer avec le strict nécessaire pour les huit requêtes de `l15/metriques.sql` — lecture des mesures et des agrégats, des vues d'information de l'extension, des statistiques de requêtes — et rien de plus : c'est la leçon de L13 appliquée à la supervision. Tant qu'il manque un droit, un panneau reste vide.
+
+Importer ensuite `l15/tableau-de-bord.json` (menu Dashboards, Import, fichier monté sous `/l15` dans le conteneur ou copié depuis le dépôt), en choisissant cette source quand l'import la demande.
+
 ### Étape 1 — Définir les quatre alertes (8 min)
 
 Compléter `l15/alertes-modele.md`. Chaque alerte comporte quatre rubriques, et **aucune ne peut rester vide**.
@@ -158,15 +168,3 @@ Le rôle utilisé par Grafana n'a pas les droits sur les vues d'information ni s
 **Vers la clôture.** Le jeu de requêtes de diagnostic et les quatre alertes sont les deux livrables qui servent dès le premier jour de production. `mesures.md`, ouvert au deuxième module de la formation, devient le premier document d'exploitation.
 
 La séquence de clôture reprend la carte des concepts, revient sur les six pathologies de M01 — et chacun écrit trois actions datées sur son propre contexte.
-
----
-
-## Note de production
-
-`l15/tableau-de-bord.json` est un livrable à part entière et doit être maintenu avec la même rigueur que les scripts de la chaîne. Il dépend de deux choses fragiles : les noms des vues d'information de l'extension, et le rôle utilisé par Grafana pour les interroger.
-
-Le script `l15/provoquer.sh` doit **remettre en état après chaque provocation**, et le vérifier plutôt que de le supposer. Une provocation laissée active fausse l'étape 3, et la salle conclut que ses alertes sont bruyantes alors qu'elles fonctionnent.
-
-`tests/M15.sql` ne teste pas les alertes elles-mêmes — elles vivent dans Grafana, pas dans la base. Il vérifie que les huit requêtes de métriques s'exécutent sans erreur sous le rôle de supervision, ce qui couvre le piège des panneaux vides.
-
-**Point tranché** : les seuils relatifs de A2 et A3 supposent de connaître, respectivement, la période de chaque job et la fréquence attendue de chaque flux. La première se lit dans le catalogue des jobs. La seconde se déduit de la **famille du signal** au catalogue `signaux` (10 s pour les signaux machine, 1 h pour la météo) : aucune colonne à ajouter, pas de rétroaction sur le schéma de M03. La requête de A3 fait la jointure `mesures → affectation_capteur → signaux` pour connaître le pas attendu de chaque flux.

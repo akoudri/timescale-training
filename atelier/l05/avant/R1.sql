@@ -1,7 +1,4 @@
--- R1 avant — production horaire par site, sur trente jours.
--- Trois défauts : date_trunc au lieu de time_bucket ; jointure au
--- référentiel non datée (debut/fin ignorés) ; il manque site et libellé
--- corrects quand un capteur a été remplacé.
+-- R1 avant — production horaire par site, sur trente jours (telle qu'elle tourne en production).
 SELECT a.site_id,
        date_trunc('hour', m.ts) AS heure,
        sum(m.valeur)            AS production

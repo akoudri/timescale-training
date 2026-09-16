@@ -146,7 +146,8 @@ Ce que la base attend :
 SELECT wait_event_type, wait_event, count(*)
 FROM   pg_stat_activity
 WHERE  state = 'active' AND pid <> pg_backend_pid()
-GROUP  BY 1, 2 ORDER BY 3 DESC;
+GROUP  BY 1, 2 ORDER BY 3 DESC
+\watch 0.5
 ```
 
 Ce que consomme le serveur, et ce que consomme le client :
@@ -194,6 +195,7 @@ Répondre enfin à la question qui sera posée en M08 : entre le p95, le p99 et 
 - [ ] Le point de rupture est relevé, et la ressource saturée est nommée **avec le diagnostic qui l'a révélée**
 - [ ] Le retard d'arrivée est mesuré en p50, p95, p99 et pire cas, avec le profil de décalage
 - [ ] La section `## M05 — retard d'arrivée` est marquée comme reprise en M08
+- [ ] `mesures_charge` est vidée en fin d'atelier
 
 ---
 
@@ -276,16 +278,18 @@ Une seule prise de mesure attrape mal un phénomène intermittent. Boucler la re
 | `l04/conclusion.md` | La phrase de diagnostic : « au-delà de N points/s, X sature, ce qui se lit sur Y » |
 | État de reprise | `mistral-M05` |
 
-**Vers la suite.** L'écriture est réglée. Les tableaux de bord de MISTRAL mettent toujours quarante secondes à s'ouvrir, et cette fois le partitionnement n'y changera rien : le problème est dans la façon dont les requêtes sont écrites. M06 reprend cinq requêtes de `mistral_legacy` — la base de l'amorce de M01 — et les réécrit.
+## Nettoyage
+
+À faire en fin d'atelier, extensions comprises : ce qui n'appartient pas à l'état de reprise part.
+
+`mesures_charge` fait partie de l'état de reprise `mistral-M05`, mais **vide** : le volume écrit en salle dépend du poste et ne doit pas se propager aux modules suivants. Vider la table, sans la supprimer :
+
+```sql
+TRUNCATE mesures_charge;
+```
+
+Le journal produit pendant l'atelier (plusieurs gigaoctets de WAL) est recyclé par PostgreSQL de lui-même ; rien à faire de ce côté.
 
 ---
 
-## Note de production
-
-`reprise/M05.sql` recrée `mesures_charge` **vide** et n'y injecte rien : le volume écrit en salle dépend du poste, et l'état de reprise doit rester déterministe. La valeur de retard d'arrivée utilisée par la chaîne est celle du profil `mistral`, fixée dans `l04/profils/mistral.json`, et non celle mesurée par un participant.
-
-Cela crée une dissymétrie à assumer : en salle, chaque participant dimensionne les fenêtres de M08 avec **sa** mesure ; la chaîne, elle, utilise la valeur de référence. Les deux doivent être du même ordre, faute de quoi le profil de décalage est mal calibré. C'est le premier test à faire tourner après avoir écrit `injecteur.py`.
-
-`tests/M05.sql` vérifie l'existence et la forme de la section `## M05 — retard d'arrivée`, pas ses valeurs : elles varient légitimement d'un environnement à l'autre.
-
-**Point ouvert** : `injecteur.py` est le seul outil de la formation qui doive tenir un débit cible. Sur un poste où le client sature avant la base, le point de rupture de l'étape 4 devient inatteignable. Prévoir dès l'écriture un mode multi-processus, et un contrôle qui refuse de conclure si le CPU client dépasse 80 %.
+**Vers la suite.** L'écriture est réglée. Les tableaux de bord de MISTRAL mettent toujours quarante secondes à s'ouvrir, et cette fois le partitionnement n'y changera rien : le problème est dans la façon dont les requêtes sont écrites. M06 reprend cinq requêtes de `mistral_legacy` — la base de l'amorce de M01 — et les réécrit.

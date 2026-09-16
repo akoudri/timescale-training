@@ -153,36 +153,3 @@ Sans journal, la restitution devient un récit reconstitué, et la requête déc
 | État de reprise | `mistral-M15` |
 
 **Vers la suite.** Les deux incidents sont corrigés, et deux requêtes de prévention existent. Il reste à les brancher : L15 construit les quatre alertes du premier jour de production, et vérifie qu'elles se taisent en régime normal.
-
----
-
-## Note de production — **document formateur, à ne pas distribuer**
-
-### Les incidents à injecter
-
-`l14/injecter.sh` applique les altérations à partir de `mistral-M14`. Il doit être **rejouable et déterministe**, et son contenu ne figure dans aucun support participant.
-
-**Incident 1 — famille « automatisation ».** Le job de rafraîchissement du niveau minute est suspendu, et l'horodatage de suspension est reculé de trois jours pour que le retard soit visible.
-
-Diagnostic attendu : les valeurs de l'agrégat n'évoluent plus, aucune erreur nulle part, et `next_start` est nul sur le job concerné. La discrimination se fait sur `scheduled` et `next_start`, pas sur `last_run_status` — c'est exactement le piège de la suspension du bloc 11.1.
-
-**Incident 2 — famille « structure ».** L'index `(series_id, ts DESC)` posé en L05 est supprimé.
-
-Diagnostic attendu : la requête de dernière valeur repasse à plusieurs secondes, et le plan n'utilise plus l'index. La discrimination se fait sur l'inventaire des index de l'hypertable, comparé à `schema.sql`. C'est le rappel direct de la leçon de L05 : c'est l'index qui fait le travail, pas la syntaxe.
-
-**Incident 3, pour l'extension E1 — famille « activité ».** Le nombre de workers d'arrière-plan est ramené à un seul.
-
-Rien n'échoue, rien ne s'arrête : les six jobs s'exécutent en file, chacun avec un retard croissant. Aucun symptôme utilisateur. Le seul moyen de le voir est de comparer les délais d'exécution à la référence consignée dans `mesures.md` — d'où l'intérêt d'avoir tenu ce fichier.
-
-### Conduite de l'atelier
-
-- Injecter pendant la pause, sur toutes les instances, en une seule commande
-- Ne rien confirmer avant la restitution, y compris à un binôme qui a trouvé en cinq minutes
-- Si un binôme reste bloqué à mi-temps sur un incident, donner **la famille de requêtes**, jamais l'hypothèse
-- Faire restituer d'abord le binôme qui a suivi la méthode le plus rigoureusement, pas le plus rapide
-
-### Chaîne d'instantanés
-
-`reprise/M15.sql` part de `mistral-M14` et applique les **corrections**, pas les incidents. L'état `mistral-M15` est l'état sain, augmenté du jeu de requêtes de diagnostic et des requêtes de prévention.
-
-`tests/M15.sql` vérifie la présence de l'index de L05, l'état actif des six jobs, et la valeur du paramètre de workers — c'est-à-dire l'absence des trois incidents.

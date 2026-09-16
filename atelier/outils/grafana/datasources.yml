@@ -1,0 +1,20 @@
+# Source de données provisionnée pour L15. Le rôle mistral_supervision n'existe
+# pas au départ : le créer avec le strict nécessaire est une étape de L15 —
+# tant qu'il manque, les panneaux sont vides (c'est un piège de la fiche).
+apiVersion: 1
+datasources:
+  - name: PostgreSQL MISTRAL
+    uid: mistral-supervision
+    type: grafana-postgresql-datasource
+    access: proxy
+    url: timescaledb:5432
+    user: mistral_supervision
+    isDefault: true
+    editable: true
+    secureJsonData:
+      password: supervision
+    jsonData:
+      database: mistral
+      sslmode: disable
+      timescaledb: true
+      postgresVersion: 1700

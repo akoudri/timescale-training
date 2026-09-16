@@ -51,9 +51,9 @@ Rejouer d'abord les trois requêtes de référence de M02 sur `mesures` devenue 
 ./mesure.sh requetes/R3-agregation-fenetre.sql
 ```
 
-**Premier constat, contre-intuitif et voulu** : par rapport à la ligne de base de M02, rien ne s'améliore — R2 et R3 se dégradent même légèrement, et R1 s'effondre. La ligne de base portait sur une table de **5 jours** : une table qui ne contient que la fenêtre interrogée n'a rien à exclure, et l'hypertable, elle, porte maintenant **neuf fois plus de données**. Savoir l'expliquer est le premier critère de l'atelier : le partitionnement ne rend pas une petite table plus rapide, il empêche une grande table de devenir lente.
+**Premier constat à faire, et à expliquer** : comparer ces trois médianes à la ligne de base de M02. Le rapport n'est pas celui qu'on attend d'un partitionnement, et R1 se distingue nettement. Avant de continuer, écrire en une phrase pourquoi — la réponse tient à ce que contenait la table de M02, et à ce que contient l'hypertable aujourd'hui. Savoir l'expliquer est le premier critère de l'atelier.
 
-La dette se mesure donc contre la table ordinaire **à l'échelle réelle** : `l03/creer-comparaison.sql` a créé `mesures_ord`, copie ordinaire éphémère des 45 jours. Rejouer les trois requêtes dessus :
+La dette se mesure ensuite contre la table ordinaire **à l'échelle réelle** : `l03/creer-comparaison.sql` a créé `mesures_ord`, copie ordinaire éphémère des 45 jours. Rejouer les trois requêtes dessus :
 
 ```bash
 for r in R1-dernier-point R2-fenetre-3j R3-agregation-fenetre; do
@@ -83,9 +83,14 @@ Un écart entre les trois invalide toute la comparaison qui suit. Vérifier avan
 
 ### Étape 3 — Les relevés et les neuf mesures (20 min)
 
-**Relevés structurels**, pour chacune des trois tables :
+**Relevés structurels**, pour chacune des trois tables. Les bornes se calculent d'abord depuis la table (mêmes jours que le harnais : 3 à 5 de la fenêtre), puis servent à l'`EXPLAIN` :
 
 ```sql
+-- bornes, calculees du jeu (a refaire pour chaque table)
+SELECT min(ts) + interval '2 days' AS fen3,
+       min(ts) + interval '5 days' AS fin
+FROM   mesures_7j \gset
+
 -- nombre de chunks
 SELECT count(*) FROM timescaledb_information.chunks
 WHERE  hypertable_name = 'mesures_7j';
@@ -95,15 +100,17 @@ SELECT pg_size_pretty(hypertable_size('mesures_7j'));
 
 -- temps de planification : lire la ligne Planning Time
 EXPLAIN SELECT avg(valeur) FROM mesures_7j
-WHERE  ts >= :'debut' AND ts < :'fin';
+WHERE  ts >= :'fen3' AND ts < :'fin';
 ```
+
+Le script `l03/releves.sql` regroupe les trois relevés pour une table passée en variable : `\set table mesures_7j` puis `\i l03/releves.sql`, après le `\gset` ci-dessus.
 
 **Neuf mesures** : les trois profils R1, R2, R3 sur chacune des trois tables.
 
 ```bash
 for t in 1j 7j 30j; do
-  for r in R1 R2 R3; do
-    ./mesure.sh l03/$r.sql --table mesures_$t
+  for r in R1-dernier-point R2-fenetre-3j R3-agregation-fenetre; do
+    ./mesure.sh requetes/$r.sql --table mesures_$t
   done
 done
 ```
@@ -147,11 +154,11 @@ Trois catégories, et une seule des cinq relève de la troisième :
 
 Corriger la requête de la troisième catégorie, mesurer le gain, et le consigner.
 
-**Le point à ne pas manquer sur Q2** : le prédicat `EXTRACT` n'est pas sargable, et pourtant l'exclusion fonctionne. Savoir dire pourquoi — c'est la différence entre appliquer une recette et comprendre le mécanisme.
+**Q2 mérite une attention particulière** : elle contient une fonction appliquée à la colonne de temps. Classer d'abord d'après le plan, expliquer ensuite — c'est la différence entre appliquer une recette et comprendre le mécanisme.
 
 ### Étape 5 — Trancher et inscrire (8 min)
 
-Écrire dans `schema.sql`, en commentaire au-dessus de la définition de `mesures`, l'intervalle retenu et **la mesure qui le justifie** — une phrase, un chiffre.
+Écrire dans `schema.sql` — le squelette complété en L02, copié à la racine d'`atelier/` ; s'il manque, `cp l02/schema-squelette.sql schema.sql` — en commentaire au-dessus de la définition de `mesures`, l'intervalle retenu et **la mesure qui le justifie** — une phrase, un chiffre.
 
 Si la mesure conduit à un intervalle différent de celui du squelette, l'appliquer :
 
@@ -170,6 +177,7 @@ Rappel : cet appel ne concerne que les chunks à venir. Les chunks existants gar
 - [ ] La requête sans exclusion est corrigée et son gain est mesuré
 - [ ] L'intervalle retenu figure dans `schema.sql` **avec le chiffre qui le justifie**
 - [ ] Le participant sait montrer l'exclusion de chunks dans un plan à un voisin
+- [ ] `mesures_ord` et les tables de comparaison sont supprimées
 
 ---
 
@@ -248,16 +256,19 @@ La ligne de base portait sur 5 jours ; l'hypertable en porte 45. Le rapport qui 
 | `l03/exclusion/classement.md` | Les cinq requêtes classées dans les trois catégories |
 | État de reprise | `mistral-M04` |
 
-**Vers la suite.** Cet atelier a mesuré des lectures. Il a délibérément laissé de côté l'effet du dimensionnement sur les **écritures**, qui suppose de saturer la mémoire à l'échelle réelle. C'est le premier objet de M05, avec une question à laquelle la ligne de base ne répond pas encore : combien de points par seconde cette instance accepte-t-elle réellement, et qu'est-ce qui l'en empêche ?
+## Nettoyage
+
+À faire en fin d'atelier, extensions comprises : ce qui n'appartient pas à l'état de reprise part.
+
+L'atelier a créé une copie ordinaire de 45 jours et trois hypertables de comparaison : plus de quinze gigaoctets qui n'entrent pas dans l'état de reprise `mistral-M04`.
+
+```sql
+DROP TABLE mesures_ord;                              -- 11 Go, plus aucun usage
+DROP TABLE mesures_1j, mesures_7j, mesures_30j;      -- à garder seulement pour l'extension E1
+```
+
+L'espace est rendu au système de fichiers immédiatement — c'est l'un des arguments de M10, constaté ici en passant. Vérifier avec `\dt+` ou `df -h` que le volume est bien redescendu.
 
 ---
 
-## Note de production
-
-`reprise/M04.sql` conserve l'intervalle de sept jours du squelette de M03 : la mesure le confirme sur l'environnement de référence. L'énoncé n'annonce pas ce résultat aux participants, et prévoit explicitement le cas où leur mesure conduirait ailleurs — la décision est alors consignée dans leur plan d'application, et la chaîne poursuit sur la référence.
-
-Ce choix évite une reconstruction de `mesures` en salle. Reconstruire une hypertable de 190 millions de lignes pour aligner rétroactivement ses chunks prend une quinzaine de minutes : c'est une opération de chaîne, pas d'atelier.
-
-`tests/M04.sql` vérifie les sept critères. Les deux qui portent sur des durées — le rapport avec la ligne de base sur R2, et le gain de la requête corrigée — sont exprimés en **rapport minimal** et non en durée cible, de sorte qu'un changement d'environnement de référence ne les invalide pas.
-
-**Point ouvert** : la taille de l'échantillon des trois tables de comparaison (cinquante séries) est un compromis entre durée de chargement et représentativité. Elle doit être calibrée sur l'environnement retenu — l'objectif est un chargement des trois tables en moins de dix minutes, marge comprise.
+**Vers la suite.** Cet atelier a mesuré des lectures. Il a délibérément laissé de côté l'effet du dimensionnement sur les **écritures**, qui suppose de saturer la mémoire à l'échelle réelle. C'est le premier objet de M05, avec une question à laquelle la ligne de base ne répond pas encore : combien de points par seconde cette instance accepte-t-elle réellement, et qu'est-ce qui l'en empêche ?

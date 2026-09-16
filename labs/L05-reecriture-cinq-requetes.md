@@ -60,9 +60,7 @@ WHERE  af.series_id = m.series_id
 GROUP  BY 1, 2;
 ```
 
-Trois défauts à identifier avant de réécrire. Le premier concerne le seau, le deuxième la jointure au référentiel, le troisième porte sur ce qui manque dans les résultats et que M03 avait pourtant traité.
-
-**Attendu** : `time_bucket`, bornes explicites, jointure datée sur `debut` et `fin`.
+Trois défauts à identifier avant de réécrire. Le premier concerne le seau, le deuxième la jointure au référentiel, le troisième porte sur ce qui manque dans les résultats et que M03 avait pourtant traité. Les nommer par écrit avant de toucher au SQL.
 
 **Le gain sera modeste.** La requête portait déjà un prédicat temporel, donc l'exclusion de chunks jouait déjà. C'est un résultat correct, pas un échec — le consigner tel quel.
 
@@ -87,8 +85,8 @@ Cette requête est rapide. Elle est fausse.
 SELECT j_utc.jour, j_utc.energie AS sans_fuseau,
        j_loc.energie AS avec_fuseau,
        j_loc.energie - j_utc.energie AS ecart
-FROM   ( ... time_bucket(INTERVAL '1 day', ts) ... )                  j_utc
-FULL   JOIN ( ... time_bucket(INTERVAL '1 day', ts, 'Europe/Paris') ... ) j_loc
+FROM   ( ... la requete d'origine ... )   j_utc
+FULL   JOIN ( ... votre variante corrigee ... ) j_loc
   ON   j_utc.jour = j_loc.jour;
 ```
 
@@ -110,11 +108,9 @@ La courbe présente des trous : les heures sans mesure n'apparaissent pas, et l'
 
 **Attendu** : `time_bucket_gapfill` avec ses bornes, pour que chaque heure de la fenêtre produise une ligne.
 
-**Puis la question qui compte** : faut-il remplir ces lignes ? Consulter le tableau du bloc 6.2. Pour une vitesse de vent, LOCF et interpolation sont **toutes deux des fautes** : la grandeur est trop volatile pour qu'une valeur inventée ait un sens.
+**Puis la question qui compte** : faut-il remplir ces lignes, et avec quoi ? Consulter le tableau du bloc 6.2 et trancher d'après la nature du signal, pas d'après le confort d'affichage : LOCF, interpolation, ou rien.
 
-La réécriture correcte génère donc les seaux et **laisse les valeurs à NULL**. L'axe devient régulier, le trou reste visible, et le tableau de bord affiche une interruption plutôt qu'une droite fictive.
-
-Écrire la justification dans `l05/apres/R3.sql`, en commentaire. Une réécriture qui remplit sans justifier ne passe pas le critère.
+Écrire la justification dans `l05/apres/R3.sql`, en commentaire. Une réécriture qui remplit sans justifier ne passe pas le critère — et une réécriture qui ne remplit pas doit le justifier tout autant.
 
 ### R4 — Comparaison d'un mois avec le mois précédent (10 min)
 
@@ -129,9 +125,7 @@ LEFT   JOIN ( SELECT date_trunc('month', ts) AS mois, sum(energie_kwh) AS energi
   ON   m2.mois = m1.mois - INTERVAL '1 month';
 ```
 
-Deux défauts : l'agrégation est calculée deux fois, et le découpage mensuel souffre du même problème de fuseau que R2.
-
-**Attendu** : une seule agrégation, un seau de largeur variable avec fuseau, et `lag()` pour le décalage.
+Deux défauts à trouver : l'un touche au coût, l'autre à la justesse — et R2 vient d'en montrer un des deux. Les fonctions de fenêtrage du bloc 6.3 sont le bon outil pour le premier.
 
 ### R5 — Dernière valeur de chaque capteur (13 min)
 
@@ -163,7 +157,7 @@ C'est l'index qui fait le travail, pas la syntaxe. L'ordre des étapes existe po
 - [ ] Pour chacune : mesure avant, mesure après, rapport consigné dans `mesures.md`
 - [ ] Pour chacune : le nœud responsable du gain est **désigné par écrit**
 - [ ] R2 : l'écart est chiffré en kWh sur la journée de bascule, et l'invariance du total annuel est expliquée
-- [ ] R3 : les seaux sont générés, les valeurs restent à NULL, et la justification est en commentaire
+- [ ] R3 : les seaux sont générés, et le traitement des trous est justifié en commentaire par la nature du signal
 - [ ] R5 : passe sous la seconde, et l'écart entre l'étape 1 et l'étape 2 est mesuré séparément
 - [ ] Le gain modeste de R1 est consigné comme un résultat, pas comme un échec
 
@@ -214,7 +208,7 @@ C'est attendu à l'étape 1, et c'est le but. Sans l'index `(series_id, ts DESC)
 Elle portait déjà un prédicat temporel : l'exclusion jouait déjà. Son gain viendra des agrégats continus de M08, pas de la réécriture. Consigner le rapport tel quel plutôt que de chercher une optimisation qui n'existe pas.
 
 **R3 est réécrite avec `locf()` par réflexe.**
-C'est la faute que l'atelier cherche à provoquer. Relire le tableau du bloc 6.2 : pour une vitesse de vent, LOCF fabrique une donnée fausse. La bonne réponse laisse les valeurs à NULL.
+C'est la faute que l'atelier cherche à provoquer. Relire le tableau du bloc 6.2 : la nature du signal décide de ce qu'on a le droit d'inventer, et une vitesse de vent n'est pas une consigne d'angle de pale.
 
 **Les plans avant et après ne sont pas comparables.**
 Le cache est chaud après la première exécution. Utiliser `mesure.sh`, qui applique le même protocole aux deux, plutôt que de chronométrer à la main.
@@ -234,15 +228,3 @@ Les bornes `debut` et `fin` de l'affectation ont été omises. Une série ayant 
 | État de reprise | `mistral-M06` |
 
 **Vers la suite.** Les cinq requêtes sont rapides et justes. Mais R1 calcule une somme, et R4 aussi — deux grandeurs qui se comportent bien. M07 pose la question suivante : que se passe-t-il quand l'indicateur demandé est une moyenne sur un pas irrégulier, un taux de disponibilité, ou un percentile ? Aucun des trois ne se calcule comme une somme, et aucun des trois ne remonte une hiérarchie de la même façon.
-
----
-
-## Note de production
-
-`reprise/M06.sql` contient les cinq réécritures de référence **et l'index `(series_id, ts DESC)`**. Cet index fait partie de l'état `mistral-M06` : les modules suivants s'appuient sur lui, notamment M09 où l'ordre de ses colonnes éclaire le choix de `orderby`.
-
-R2 impose une contrainte sur le générateur : la fenêtre de 45 jours du jeu d'atelier **doit couvrir un week-end de changement d'heure**, sans quoi la requête fausse ne peut pas être démontrée. C'est la seule contrainte de calendrier de toute la formation, et elle doit être fixée avant la génération du jeu — soit fin mars, soit fin octobre.
-
-`tests/M06.sql` vérifie la présence de l'index et l'existence des cinq fichiers `apres/`. Il ne vérifie pas les durées : les cinq rapports varient trop d'un environnement à l'autre. Le seul seuil testé est celui de R5, exprimé en rapport minimal avant et après création de l'index.
-
-**Point ouvert** : le tarif de rachat de `l05/tarifs.md`, utilisé par l'extension E1, doit être un ordre de grandeur plausible et daté, pas un chiffre inventé. Il sert à convertir une erreur technique en montant — c'est ce qui rend la démonstration mémorable, et c'est aussi ce qui la rend contestable si le chiffre est fantaisiste.

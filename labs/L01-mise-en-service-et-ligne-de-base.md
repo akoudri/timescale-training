@@ -189,6 +189,19 @@ WHERE  ts >= :'debut' AND ts < :'fin'
 GROUP  BY series_id;
 ```
 
+**Les `:'debut'`, `:'fin'`, `:'fen3'` sont des variables `psql`**, pas du SQL. Le client `psql` les remplace par leur valeur avant d'envoyer la requête au serveur ; les apostrophes autour du nom demandent d'insérer la valeur comme un littéral texte entre quotes, ce qui est nécessaire pour un horodatage. Deux façons de les définir, toutes deux utilisées dans la formation :
+
+- en ligne de commande, `psql -v debut='2026-09-15 00:00+02'` — c'est ce que fait `mesure.sh` après avoir calculé les bornes ;
+- dans la session, avec `\gset` à la place du point-virgule final : la requête s'exécute, et chaque colonne du résultat (une seule ligne attendue) devient une variable du même nom, sans rien afficher.
+
+```sql
+SELECT min(ts) AS debut, min(ts) + interval '5 days' AS fin FROM mesures \gset
+\echo :debut
+SELECT count(*) FROM mesures WHERE ts >= :'debut' AND ts < :'fin';
+```
+
+Le jeu MISTRAL étant daté, toutes les bornes de la formation se calculent ainsi depuis les données, jamais en dur ni depuis `now()`.
+
 Reporter les trois médianes et les trois écarts-types dans `mesures.md`. Un écart-type supérieur à 20 % de la médiane invalide la mesure : attendre et relancer.
 
 ### Étape 5 — Relever le volume de départ
@@ -318,11 +331,3 @@ Volume : heap … · index … · total …
 ```
 
 **Vers la suite.** M03 ouvre sur une question à laquelle cet atelier ne répond pas : ces trois requêtes portent sur un schéma qui n'a jamais été discuté. Le module suivant le reprend depuis le début, et le schéma qui en sortira est celui que tous les ateliers utiliseront jusqu'à la migration de M12.
-
----
-
-## Note de production
-
-Conformément à l'annexe B du plan, le corrigé de ce socle **est** le script `reprise/M02.sql` accompagné de `reprise/M02.sh` pour la partie conteneur. Ces fichiers ne sont pas une transcription du lab : ce sont les mêmes fichiers, commentés, qui construisent l'état `mistral-M02` de la chaîne d'instantanés.
-
-Le test d'état associé, `tests/M02.sql`, vérifie les six critères de réussite du socle. Les fourchettes de durée y sont exprimées en tolérance relative et non en valeurs absolues, faute de quoi tout changement d'environnement de référence les invalide.

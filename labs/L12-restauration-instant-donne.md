@@ -167,6 +167,7 @@ Reporter dans `mesures.md`, sous `## M13 — restauration` :
 - [ ] **Les quatre contrôles de l'étape 4 passent**, jobs et agrégats compris
 - [ ] Les cinq durées sont consignées, dont le rejeu séparément
 - [ ] La phrase d'extrapolation est écrite
+- [ ] Le répertoire mis de côté, la sauvegarde de base et les journaux archivés sont supprimés, et l'archivage est désactivé ou borné
 
 ---
 
@@ -236,16 +237,30 @@ C'est attendu et il faut le dire. La sauvegarde de base croît avec le volume, l
 | `l12/verification-post-restauration.md` | La checklist des quatre contrôles, réutilisable |
 | État de reprise | `mistral-M13` |
 
-**Vers la suite.** L'instance est sauvegardée et restaurable. Reste à décider qui peut voir quoi — et à répondre à une demande d'effacement portant sur des données compressées, agrégées, et présentes dans les sauvegardes qu'on vient de produire. C'est M14, et les trois obstacles s'y additionnent.
+## Nettoyage
+
+À faire en fin d'atelier, extensions comprises : ce qui n'appartient pas à l'état de reprise part.
+
+Cet atelier est celui qui laisse le plus de traces sur le disque, et deux d'entre elles grossissent toutes seules si on les oublie.
+
+1. **L'ancien répertoire de données**, `pgdata/data.incident`, mis de côté par le script de restauration : une copie complète de l'instance, plusieurs dizaines de gigaoctets. À supprimer une fois les quatre contrôles passés.
+2. **La sauvegarde de base**, `archives/base`, du même ordre de grandeur.
+3. **L'archivage des journaux**, activé à l'étape 1 : tant qu'il reste actif, chaque journal de 16 Mo est copié dans `archives/wal`, sans limite. Le désactiver, ou l'assumer avec une purge — en production, c'est la rétention des archives qui borne ce volume, et c'est un choix à écrire.
+
+```bash
+rm -rf pgdata/data.incident archives/base archives/wal
+```
+
+```sql
+ALTER SYSTEM SET archive_mode = off;   -- prend effet au prochain redémarrage
+```
+
+```bash
+docker compose restart timescaledb
+```
+
+Vérifier avec `df -h` que l'espace est revenu : sans ce nettoyage, le poste ne tient pas les trois ateliers suivants.
 
 ---
 
-## Note de production
-
-`reprise/M13.sql` ne restaure rien : l'état `mistral-M13` est identique à `mistral-M11` du point de vue du schéma et des données. Le module produit des fichiers et une mesure, pas un état.
-
-Le script `l12/incident.sql` **doit être rejouable et déterministe** : la fenêtre supprimée est calculée à partir de `max(ts)` du jeu, jamais à partir de `now()`, faute de quoi le comportement dépend de la date d'exécution de l'atelier.
-
-`tests/M13.sql` vérifie l'existence de la section de mesures et la présence des quatre contrôles dans le fichier de vérification. Il ne vérifie aucune durée.
-
-**Point ouvert** : l'atelier utilise une restauration physique avec rejeu de journaux, montée sur les outils de base de PostgreSQL. C'est le choix le plus neutre en versions et le plus pédagogique. Si l'environnement de référence retenu s'appuie sur un outil de sauvegarde dédié, l'étape 3 doit être réécrite avec cet outil — et l'étape 1 aussi, car la vérification de l'archivage n'y prend pas la même forme. Le reste de l'atelier, y compris les quatre contrôles de l'étape 4, reste inchangé.
+**Vers la suite.** L'instance est sauvegardée et restaurable. Reste à décider qui peut voir quoi — et à répondre à une demande d'effacement portant sur des données compressées, agrégées, et présentes dans les sauvegardes qu'on vient de produire. C'est M14, et les trois obstacles s'y additionnent.

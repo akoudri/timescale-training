@@ -1,0 +1,24 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "mistral (cible TimescaleDB)",
+      "Group": "MISTRAL",
+      "Host": "timescaledb",
+      "Port": 5432,
+      "MaintenanceDB": "mistral",
+      "Username": "postgres",
+      "SSLMode": "prefer",
+      "Comment": "mot de passe : mistral — outil d'exploration, jamais de mesure"
+    },
+    "2": {
+      "Name": "mistral_legacy (source PostgreSQL 16)",
+      "Group": "MISTRAL",
+      "Host": "legacy",
+      "Port": 5432,
+      "MaintenanceDB": "mistral_legacy",
+      "Username": "postgres",
+      "SSLMode": "prefer",
+      "Comment": "mot de passe : mistral"
+    }
+  }
+}

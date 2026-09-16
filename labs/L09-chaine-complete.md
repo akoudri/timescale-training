@@ -89,9 +89,7 @@ L'état attendu sur `mesures`, après exécution :
 | De 2 à 30 jours | chunks en columnstore |
 | Au-delà de 30 jours | chunks supprimés |
 
-**Le résultat ne sera pas exactement celui-là, et c'est normal.** La rétention ne supprime que les chunks **entièrement** antérieurs à la limite. Avec des chunks de sept jours, un chunk chevauchant la limite des 30 jours survit — jusqu'à sept jours de données au-delà de la limite affichée.
-
-Consigner le nombre de chunks dans chaque zone, et **écrire d'une phrase pourquoi la frontière n'est pas nette**. C'est une conséquence directe de l'intervalle tranché en M04.
+**Le résultat ne sera pas exactement celui-là, et c'est normal.** Consigner le nombre de chunks dans chaque zone, comparer aux bornes annoncées, et **écrire d'une phrase pourquoi la frontière n'est pas nette**. La réponse tient à la granularité de ce que la rétention supprime, et donc à une décision prise en M04.
 
 Vérifier ensuite que les agrégats, eux, n'ont rien perdu :
 
@@ -218,15 +216,3 @@ Comme `refresh_continuous_aggregate`, il ne peut pas s'exécuter dans une transa
 | État de reprise | `mistral-M10` |
 
 **Vers la suite.** Cinq travaux automatiques tournent désormais sur MISTRAL, et personne ne les a jamais regardés. M11 les met sous surveillance, et ajoute le premier travail qui ne soit pas une politique du produit mais une tâche métier.
-
----
-
-## Note de production
-
-`reprise/M10.sql` applique les **valeurs d'atelier** — 2 jours, 30 jours — parce que ce sont elles qui produisent un état de chunks reproductible sur le jeu de 45 jours. La cible de production figure en commentaire dans le même fichier, jamais exécutée.
-
-Cette dissymétrie doit être visible dans le corrigé remis aux participants : c'est le fichier qu'ils emporteront, et il ne doit y avoir aucune ambiguïté sur ce qui est applicable où.
-
-`tests/M10.sql` vérifie le nombre de chunks par zone avec une **tolérance d'un chunk**, à cause de l'effet de granularité qui dépend de la date de génération du jeu. Il vérifie aussi que `min(seau)` sur l'agrégat horaire est antérieur à `min(ts)` sur les mesures brutes — c'est la preuve la plus directe que le downsampling a fonctionné.
-
-**Point ouvert** : les valeurs d'atelier — 2 jours et 30 jours — dépendent de l'intervalle de chunk retenu en M04. Si celui-ci change, les zones de l'étape 2 doivent être recalculées pour rester observables sur 45 jours. C'est une dépendance à documenter dans le script de construction de la chaîne, sans quoi une modification en M04 casse silencieusement L09.

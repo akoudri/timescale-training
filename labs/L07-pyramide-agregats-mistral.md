@@ -78,21 +78,15 @@ CREATE MATERIALIZED VIEW mistral_1h
 WITH (timescaledb.continuous) AS
 SELECT time_bucket(INTERVAL '1 hour', seau) AS seau,
        series_id,
-       sum(somme)               AS somme,
-       sum(points)              AS points,
-       max(maximum)             AS maximum
+       -- a completer : les colonnes du niveau minute, reagregees —
+       -- chacune avec la fonction qui la fait remonter sans la fausser
+       ...
 FROM   mistral_1min
 GROUP  BY 1, 2
 WITH NO DATA;
 ```
 
-Le niveau bas ne stocke que somme, compte et maximum — l'énergie d'une
-série de puissance se **dérive** de la somme (kW × 10 s / 3600) à la
-lecture : une colonne `energie` au niveau minute serait redondante avec
-`somme` et se réagrégerait pareil.
-
-```sql
-```
+Si une des quatre expressions de l'étape 1 ne se laisse pas réagréger proprement ici, c'est l'étape 1 qu'il faut revoir, pas celle-ci.
 
 Le niveau jour se construit sur `mistral_1h`, avec le fuseau `Europe/Paris` — la leçon de R2 en M06 s'applique ici aussi.
 
@@ -250,15 +244,3 @@ Vérifier quel niveau chaque requête interroge. Un graphe mensuel lu sur le niv
 | État de reprise | `mistral-M08` |
 
 **Vers la suite.** Les requêtes sont rapides, justes et matérialisées. Mais les mesures brutes occupent toujours quinze gigaoctets pour quarante-cinq jours, et la pyramide en a ajouté. M09 s'attaque au stockage — et le délai de bascule vers le columnstore devra, une fois de plus, dépasser la fenêtre de données tardives mesurée en M05.
-
----
-
-## Note de production
-
-`reprise/M08.sql` définit les trois niveaux avec un `start_offset` de référence calé sur le **p99** du profil de retard `mistral`. Ce choix est celui de la chaîne, pas la bonne réponse : l'énoncé demande au participant de trancher lui-même et d'écrire ce qu'il accepte de perdre.
-
-La matérialisation initiale du niveau minute est l'opération la plus longue de toute la chaîne d'instantanés — compter quinze à trente minutes selon l'environnement. C'est elle qui domine le budget de reconstruction annoncé à l'annexe B.
-
-`tests/M08.sql` vérifie l'existence des trois niveaux, l'absence de moyenne stockée au niveau bas — par inspection de la définition — et l'écart nul du contrôle de somme. Il ne vérifie pas les valeurs de décalage, qui sont une décision légitime du participant.
-
-**Point tranché sur l'instance de référence (2.29.2)** : la propagation d'un rattrapage vers les niveaux supérieurs n'est pas automatique dès que la donnée tardive est plus ancienne que leur `start_offset`, et un `run_job` forcé ne suffit pas. Le corrigé enseigne la propagation manuelle bornée, niveau par niveau ; l'étape 5 fait constater le comportement avant de le corriger.

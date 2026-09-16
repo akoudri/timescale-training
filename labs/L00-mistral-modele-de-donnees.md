@@ -214,7 +214,32 @@ les fenêtres se recouvrent partiellement, les valeurs diffèrent. C'est la
 base des cinq requêtes « telles qu'elles tournent aujourd'hui » de L05, et
 la source de la migration de L11.
 
-## 7. Ce que ce document ne dit pas
+## 7. Outils optionnels : Grafana et pgAdmin
+
+Le compose porte un profil `outils`, jamais démarré par défaut :
+
+```bash
+docker compose --profile outils up -d      # depuis atelier/
+```
+
+- **Grafana**, sur `http://127.0.0.1:3000` (admin / mistral). Il ne sert
+  qu'en L15, où le tableau de bord fourni s'importe et où les quatre
+  alertes se définissent. Sa source de données est déjà déclarée ; le rôle
+  qu'elle utilise, lui, est à créer en L15.
+- **pgAdmin**, sur `http://127.0.0.1:5050`, sans écran de connexion, avec
+  les deux serveurs préenregistrés (mot de passe : mistral). Utile pour
+  parcourir le référentiel décrit ici et pour lire un plan d'exécution
+  graphiquement.
+
+**Aucun des deux ne sert à mesurer.** Toutes les mesures de la formation
+passent par `psql` et `mesure.sh` : une durée lue dans une interface
+graphique inclut le rendu, et sort du protocole du bloc 2.2.
+
+## 8. Espace disque et nettoyage
+
+Le poste doit disposer de 60 Go libres, et ce budget suppose que chaque atelier range derrière lui. Ceux qui créent des objets volumineux portent une section **Nettoyage** en toute fin de fiche, après les extensions : L03 (copie ordinaire et tables de comparaison, 15 Go), L04 (table de charge à vider), L08 (tables de comparaison), L11 (base cible de migration), L12 (ancien répertoire de données, sauvegarde de base, journaux archivés — le plus lourd, et le seul qui grossit tout seul si on l'oublie). Ce qui appartient à l'état de reprise reste ; le reste part. `df -h` avant et après est un réflexe à prendre.
+
+## 9. Ce que ce document ne dit pas
 
 Comment `mesures` doit être modélisée pour tenir trois ans à l'échelle de
 production, quelle clé identifie une série, où mettre le drapeau de

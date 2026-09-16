@@ -5,5 +5,5 @@ SELECT :'table' AS table_,
         WHERE hypertable_name = :'table')          AS chunks,
        pg_size_pretty(hypertable_size(:'table'))    AS volume;
 EXPLAIN (SUMMARY)
-SELECT avg(valeur) FROM {{table}}
+SELECT avg(valeur) FROM :"table"
 WHERE  ts >= :'fen3' AND ts < :'fin';

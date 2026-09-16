@@ -99,7 +99,7 @@ done
 
 R1 est le point le plus récent d'une série, R2 une fenêtre de trois jours filtrée sur une série, R3 une agrégation sur toute la fenêtre sans filtre de série.
 
-**Ce qu'il faut observer** : R2 est filtrée sur `series_id`. Sur `cmp_serie`, ce filtre élimine des lots entiers sans décompression. Sur `cmp_aucun`, il n'élimine rien. C'est là que l'écart est le plus spectaculaire, et c'est le mécanisme du slide 14.
+**Ce qu'il faut observer** : laquelle des trois requêtes creuse l'écart entre les configurations, et sur laquelle des trois tables. L'expliquer par le mécanisme du slide 14 — ce que le prédicat de la requête a le droit d'éliminer avant toute décompression.
 
 ### Étape 4 — Le coût d'une correction (5 min)
 
@@ -117,7 +117,7 @@ C'est ce chiffre, et non une intuition, qui doit décider du délai de bascule �
 
 Basculer `mesures_hc` avec la configuration `segmentby = 'series_id'` — la même que `cmp_serie` — et relever son ratio.
 
-Il sera nettement moins bon. **Il faut savoir pourquoi, et le chiffrer.**
+Comparer au ratio de `cmp_serie`, obtenu avec la même configuration. **L'écart doit être expliqué et chiffré**, pas constaté.
 
 ```sql
 -- nombre de lignes par segment et par chunk
@@ -128,9 +128,7 @@ SELECT 'mesures_hc', count(*) / count(DISTINCT series_id)
 FROM   mesures_hc WHERE ts >= '<jour 1>' AND ts < '<jour 1>'::date + 1;
 ```
 
-L'ordre de grandeur attendu est de plusieurs milliers de lignes par segment pour MISTRAL, contre quelques dizaines pour `mesures_hc`.
-
-**L'explication à écrire** : les lots de compression contiennent au maximum un millier de lignes environ. Avec plusieurs milliers de lignes par segment et par chunk, les lots sont pleins et la compression travaille. Avec quelques dizaines, chaque lot est minuscule : les métadonnées coûtent proportionnellement bien plus cher, et les algorithmes de compression n'ont pas de matière.
+**L'explication à écrire** rapproche ces deux nombres de la taille maximale d'un lot de compression, vue au bloc 9.2. Elle tient en trois phrases : ce qu'est un lot, ce qui se passe quand un segment en remplit plusieurs, et ce qui se passe quand il n'en remplit pas un.
 
 ### Étape 6 — Trancher (5 min)
 
@@ -159,6 +157,7 @@ SELECT add_compression_policy('mesures', INTERVAL '<retenu>');
 - [ ] Le ratio de `mesures_hc` est relevé, et **expliqué par le nombre de lignes par segment et par chunk**, calculé
 - [ ] Le coût d'un `UPDATE` avant et après bascule est chiffré
 - [ ] Le délai de bascule retenu est justifié, et sa marge sur le retard d'arrivée de M05 est explicite
+- [ ] Les trois tables `cmp_*` sont supprimées
 
 ---
 
@@ -226,16 +225,16 @@ C'est une faute de conception, pas un réglage agressif. Elle se paiera à chaqu
 | `l08/cardinalite.md` | L'explication écrite de l'écart de ratio, chiffres à l'appui |
 | État de reprise | `mistral-M09` |
 
-**Vers la suite.** Le volume est divisé. Il reste à décider ce qu'on garde, combien de temps, et sous quelle forme — et à articuler la compression avec la rétention et le rafraîchissement des agrégats, dans un ordre qui n'est pas indifférent. C'est M10.
+## Nettoyage
+
+À faire en fin d'atelier, extensions comprises : ce qui n'appartient pas à l'état de reprise part.
+
+Les trois tables de comparaison ne font pas partie de l'état de reprise `mistral-M09` ; `mesures_hc`, elle, reste — c'est elle qui porte la démonstration de cardinalité, et M15 la retrouvera.
+
+```sql
+DROP TABLE cmp_serie, cmp_machine, cmp_aucun;
+```
 
 ---
 
-## Note de production
-
-`reprise/M09.sql` applique la configuration de référence — `segmentby = 'series_id'`, `orderby = 'ts DESC'` — sur `mesures`, et bascule les chunks au-delà du délai retenu. Les trois tables de comparaison `cmp_*` **ne font pas partie** de l'état de reprise : elles sont recréées par le script d'atelier et supprimées ensuite.
-
-`mesures_hc`, en revanche, reste dans l'état : elle est petite, et c'est elle qui porte la démonstration reproductible.
-
-`tests/M09.sql` vérifie la configuration appliquée sur `mesures`, l'existence de chunks en columnstore, et un **ratio minimal exprimé en tolérance relative** — jamais en valeur exacte, le ratio dépendant de la génération des données.
-
-**Point ouvert** : la taille maximale d'un lot de compression, utilisée dans l'explication de l'étape 5, est un ordre de grandeur. Il faut la confirmer sur la version cible avant diffusion, parce que c'est le seul chiffre de tout l'atelier dont dépend la démonstration de cardinalité. Si elle a changé, l'explication reste valide mais les seuils de l'énoncé doivent être recalés.
+**Vers la suite.** Le volume est divisé. Il reste à décider ce qu'on garde, combien de temps, et sous quelle forme — et à articuler la compression avec la rétention et le rafraîchissement des agrégats, dans un ordre qui n'est pas indifférent. C'est M10.

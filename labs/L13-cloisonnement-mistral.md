@@ -105,7 +105,7 @@ Exécuter chacune, constater si elle réussit, et corriger.
 
 Sous `mistral_lecture` avec `mistral.site = 2`, interroger `mistral_1h` plutôt que `mesures`. Si les données des quatre sites remontent, l'agrégat est un canal de fuite complet — et il est plus rapide que la table qu'il contourne.
 
-*Correction attendue* : une vue barrière sur chacun des trois niveaux, et `REVOKE` de l'accès direct aux agrégats.
+*À corriger* : se demander ce que l'étape 2 a cloisonné, et ce qu'elle n'a pas touché — et par quel chemin ce rôle lit encore la pyramide.
 
 **T2 — utiliser le propriétaire**
 
@@ -115,7 +115,7 @@ Sous `mistral_lecture` avec `mistral.site = 2`, interroger `mistral_1h` plutôt 
 
 Se connecter sous le rôle propriétaire de la table et rejouer la requête sur `mesures` : les quatre sites remontent.
 
-*Correction attendue* : elle est structurelle, pas technique. Un propriétaire ou un superutilisateur échappe à tout cloisonnement posé au-dessus de sa table — c'est vrai des vues, et ce l'était déjà de la RLS. Le compte d'administration ne sert jamais à lire ; `mistral_admin` porte ce privilège de façon explicite et auditée, et aucun autre rôle ne conserve de `GRANT` direct sur `mesures` ni sur les tables de matérialisation. Vérifier ce dernier point par requête sur `information_schema.role_table_grants`, pas de mémoire.
+*À corriger* : se demander d'abord si cette tentative est corrigeable techniquement, ou si elle appelle une règle d'organisation à écrire. Puis vérifier par requête sur `information_schema.role_table_grants`, pas de mémoire, quels rôles conservent un accès direct à `mesures` et aux tables de matérialisation.
 
 **T3 — passer par un job**
 
@@ -125,7 +125,7 @@ Se connecter sous le rôle propriétaire de la table et rejouer la requête sur 
 
 Appeler l'action de contrôle qualité de M11, créée sous un compte d'administration. Elle lit toutes les séries, tous sites confondus, et consigne le résultat dans une table lisible par `mistral_lecture`.
 
-*Correction attendue* : recréer l'action sous un rôle dédié doté du strict nécessaire, et restreindre la lecture de la table d'alertes. C'est le sujet du slide 14.1 sur les jobs, et le fil laissé ouvert par M11.
+*À corriger* : deux surfaces à examiner — sous quel rôle l'action s'exécute, et qui peut lire la table qu'elle remplit. C'est le sujet du slide 14.1 sur les jobs, et le fil laissé ouvert par M11.
 
 Consigner pour chacune : réussie ou non avant correction, et la correction appliquée.
 
@@ -153,7 +153,7 @@ Puis produire les plans des deux versions de R2, et répondre :
 - le prédicat de cloisonnement apparaît-il comme un filtre appliqué tardivement, ou est-il poussé au plus près de la lecture ?
 - sur les chunks en columnstore, le nombre de lots traités change-t-il ?
 
-**Ce qu'il faut observer** : les trois rapports ne vont pas dans le même sens. Sur le motif « dernière valeur par série », la vue casse le parcours d'index par saut (la semi-jointure impose un balayage) et le surcoût se compte en ordres de grandeur ; sur les fenêtres, la sélectivité du site compense le coût du prédicat et le rapport peut passer sous 1. La conclusion d'exploitation s'écrit en une phrase : un tableau de bord cloisonné lit des agrégats cloisonnés, jamais la table brute à travers la vue.
+**Ce qu'il faut observer** : les trois rapports ne vont pas forcément dans le même sens. Pour chacun, comparer les deux plans et dire ce que la vue a changé — puis en tirer une règle d'exploitation, en une phrase, pour un tableau de bord cloisonné.
 
 Consigner dans `mesures.md`, sous `## M14 — coût du cloisonnement`.
 
@@ -206,7 +206,7 @@ C'est un exercice de rédaction, pas de SQL. Il est plus difficile qu'il n'y par
 ## Pièges et indices
 
 **Le cloisonnement fonctionne sur les mesures, pas sur les agrégats.**
-C'est T1, et c'est le piège central de l'atelier. Les agrégats continus sont des objets distincts, et leurs tables de matérialisation refusent la RLS : sans vue barrière propre à chaque niveau et sans retrait de l'accès direct, la pyramide est un canal de fuite complet — et plus rapide que la table qu'elle contourne.
+C'est T1, et c'est le piège central de l'atelier. Les agrégats continus sont des objets distincts, et leurs tables de matérialisation refusent la RLS : ce qui a été fait pour `mesures` à l'étape 2 reste à faire pour chaque niveau, faute de quoi la pyramide est un canal de fuite complet — et plus rapide que la table qu'elle contourne.
 
 **Le propriétaire de la table passe à côté de la vue.**
 C'est T2, et c'est structurel : il lit la table, pas la vue. Tester systématiquement avec un rôle dédié, jamais avec le compte qui a créé les tables — et vérifier qu'aucun rôle de lecture ne conserve de `GRANT` direct.
@@ -241,15 +241,3 @@ Le rôle de lecture n'a pas reçu les droits sur les agrégats continus. C'est l
 | État de reprise | `mistral-M14` |
 
 **Vers la suite.** L'instance est cloisonnée, sauvegardée, automatisée. Un agrégat continu ne se rafraîchit plus depuis onze jours, et personne ne l'a vu. M15 rassemble le jeu de requêtes de diagnostic construit depuis M02, et met la salle face à deux pannes injectées à son insu.
-
----
-
-## Note de production
-
-`reprise/M14.sql` crée les trois rôles et applique les politiques **après correction** des trois contournements. L'état de reprise est donc l'état sain : un participant qui reprend ici n'a pas à rejouer les tentatives.
-
-Le fichier `l13/contournements/T3.sql` dépend de l'action créée en M11. Si un participant reprend directement sur `mistral-M13` sans avoir joué L10, l'action existe malgré tout — elle fait partie de l'état `mistral-M11`. Le script doit néanmoins vérifier sa présence et échouer proprement plutôt que de laisser croire que le contournement a échoué.
-
-`tests/M14.sql` vérifie l'existence des trois rôles, l'échec effectif d'une lecture par `mistral_ingestion`, et — c'est le contrôle qui compte — que les trois niveaux d'agrégats sont servis par une vue cloisonnée, l'accès direct étant retiré.
-
-**Point tranché sur l'instance de référence (2.29.2)** : la question de l'interaction entre RLS et élimination de lots ne se pose pas — la RLS est refusée sur une hypertable compressée et sur les tables de matérialisation. Le cloisonnement passe par des vues `security_barrier` avec retrait des accès directs. Le surcoût mesuré est très contrasté : massif sur le motif dernière-valeur (la vue casse le parcours d'index par saut), nul ou négatif sur les fenêtres (la sélectivité du site compense). L'étape 4 fait constater ce contraste ; le corrigé en tire la règle d'exploitation.

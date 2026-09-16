@@ -58,12 +58,13 @@ FROM   mesures_production
 GROUP  BY 1, 2;
 ```
 
-Version pondérée par le temps :
+Version pondérée par le temps, à écrire avec les hyperfonctions du bloc 7.1 (`time_weight`, puis `average`) :
 
 ```sql
 SELECT machine_id,
        time_bucket(INTERVAL '1 month', ts, 'Europe/Paris') AS mois,
-       average(time_weight('LOCF', ts, puissance_kw)) AS moyenne_ponderee
+       -- a completer : la moyenne ponderee par le temps de puissance_kw
+       ...
 FROM   mesures_production
 GROUP  BY 1, 2;
 ```
@@ -194,15 +195,3 @@ La fonction suppose que les points lui parviennent triés par temps au sein de c
 | État de reprise | `mistral-M07` |
 
 **Vers la suite.** Ces trois indicateurs sont justes, et recalculés à chaque exécution. M08 les matérialise — mais seulement ceux qui ont le droit de monter dans une hiérarchie. Le tableau du bloc 7.2 devient alors une décision d'architecture : le niveau horaire de la pyramide stockera-t-il des moyennes, ou des états intermédiaires ?
-
----
-
-## Note de production
-
-**Contrainte sur le générateur.** Le jeu MISTRAL doit contenir au moins trois machines dont le pas d'échantillonnage devient irrégulier pendant une période identifiable — un arrêt de maintenance avec remontée horaire au lieu de dix secondes. Sans cela, la version naïve de l'indicateur 1 donne le même résultat que la version pondérée, et tout l'atelier s'effondre.
-
-C'est la deuxième contrainte de génération de la formation, après celle du changement d'heure de L05. Les deux doivent être posées **avant** la génération du jeu, et vérifiées par `tests/M07.sql`.
-
-`reprise/M07.sql` contient les trois indicateurs de référence. Ils ne créent aucun objet persistant : l'état `mistral-M07` diffère de `mistral-M06` par des fichiers, pas par le schéma. C'est le seul module de la chaîne dans ce cas, et le script de construction doit l'accepter sans le signaler comme une anomalie.
-
-**Point ouvert** : les signatures exactes de `time_weight`, `state_agg`, `duration_in`, `percentile_agg` et `approx_percentile` sont à vérifier sur l'instance de référence avant diffusion. Elles ont évolué entre versions du Toolkit, et ce lab en fait un usage plus dense que tous les autres.

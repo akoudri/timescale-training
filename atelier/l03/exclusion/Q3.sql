@@ -1,4 +1,4 @@
--- Q3 — requête préparée : plan générique, l'élimination se joue à l'exécution
+-- Q3 — requête préparée ; plan générique forcé, comme le ferait un pool applicatif
 PREPARE p(timestamptz, timestamptz) AS
 SELECT avg(valeur) FROM mesures_1j WHERE ts >= $1 AND ts < $2;
 -- forcer le plan générique (comportement d'un pool applicatif)
