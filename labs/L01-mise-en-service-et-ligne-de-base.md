@@ -86,8 +86,10 @@ Trois extensions, pas une. La première porte le produit ; les deux autres sont 
 Se connecter à la base `mistral` — **une extension se crée par base** : le parcours amont n'y a créé que `timescaledb`, les deux autres sont à votre charge, et une extension créée dans la base `postgres` ne sert à rien ici.
 
 ```bash
-docker compose exec timescaledb psql -U postgres -d mistral
+docker compose exec -w /atelier timescaledb psql -U postgres -d mistral
 ```
+
+C'est **la** commande de connexion pour toute la formation : `psql` s'exécute dans le conteneur, où le dossier `atelier/` est monté sous `/atelier`. L'option `-w /atelier` en fait le répertoire courant, ce qui rend valables les `\i l02/...` des fiches et les chemins `/jeux/...` des scripts de chargement. Un `psql` installé sur le poste verrait les fichiers du dépôt mais pas les jeux.
 
 La première bibliothèque et la troisième doivent être **préchargées au démarrage** : c'est le paramètre `shared_preload_libraries`, qui ne se modifie qu'avec un redémarrage. Dans le kit, il n'est pas à écrire dans `postgresql.conf` (le fichier de configuration du serveur, dans le conteneur) : le `docker-compose.yml` le passe sur la ligne de commande du serveur (`command: postgres -c shared_preload_libraries=…`). Le vérifier avant de créer les extensions :
 

@@ -29,6 +29,7 @@ services:
       - ../generateur/output:/jeux:ro
       - ./conf:/conf:ro
       - ./archives:/archives          # archivage des journaux (L12)
+      - .:/atelier:ro                 # les fichiers des labs, pour \i depuis psql
 
   legacy:
     image: postgres:16
