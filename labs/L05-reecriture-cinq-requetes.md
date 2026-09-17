@@ -41,9 +41,11 @@ L'atelier ne consiste pas à appliquer des recettes. Pour chaque requête, il fa
 Protocole identique pour les cinq : mesurer avant, produire le plan avant, réécrire, mesurer après, produire le plan après, désigner le nœud responsable, consigner le rapport.
 
 ```bash
-./mesure.sh l05/avant/R1.sql
-./mesure.sh l05/apres/R1.sql
+./mesure.sh l05/avant/R1.sql --bornes complet
+./mesure.sh l05/apres/R1.sql --bornes complet
 ```
+
+`--bornes complet` reproduit `l05/bornes.sql` (fenêtre entière du jeu). Les bornes par défaut du harnais (jours 1 à 5) ne couvrent ni la semaine de bascule de R2, ni deux mois pour R4.
 
 ### R1 — Production horaire par site, sur trente jours (10 min)
 
@@ -70,7 +72,7 @@ Trois défauts à identifier avant de réécrire. Le premier concerne le seau, l
 
 ```sql
 SELECT time_bucket(INTERVAL '1 day', ts) AS jour,
-       sum(energie_kwh)                  AS energie
+       sum(puissance_kw) / 360.0         AS energie_kwh  -- énergie dérivée de la puissance (pas 10 s)
 FROM   mesures_production
 WHERE  ts >= :'debut' AND ts < :'fin'
 GROUP  BY 1 ORDER BY 1;
@@ -99,7 +101,7 @@ FULL   JOIN ( ... votre variante corrigee ... ) j_loc
 ```sql
 SELECT date_trunc('hour', ts) AS heure, avg(valeur) AS vitesse
 FROM   mesures
-WHERE  series_id = 137
+WHERE  series_id = :serie_vent   -- première série vitesse_vent_ms, calculée par l05/bornes.sql
   AND  ts >= :'debut' AND ts < :'fin'
 GROUP  BY 1 ORDER BY 1;
 ```
@@ -118,9 +120,9 @@ La courbe présente des trous : les heures sans mesure n'apparaissent pas, et l'
 
 ```sql
 SELECT m1.mois, m1.energie, m2.energie AS mois_precedent
-FROM   ( SELECT date_trunc('month', ts) AS mois, sum(energie_kwh) AS energie
+FROM   ( SELECT date_trunc('month', ts) AS mois, sum(puissance_kw) / 360.0 AS energie
          FROM mesures_production GROUP BY 1 ) m1
-LEFT   JOIN ( SELECT date_trunc('month', ts) AS mois, sum(energie_kwh) AS energie
+LEFT   JOIN ( SELECT date_trunc('month', ts) AS mois, sum(puissance_kw) / 360.0 AS energie
               FROM mesures_production GROUP BY 1 ) m2
   ON   m2.mois = m1.mois - INTERVAL '1 month';
 ```
@@ -199,7 +201,7 @@ Chiffrer l'écart sur douze mois et répondre : dans quel cas la largeur fixe es
 Les bornes temporelles doivent figurer explicitement dans le `WHERE`, ou être passées en arguments `start` et `finish`. Sans elles, la fonction ne sait pas quels seaux engendrer, et le message ne le dit pas clairement.
 
 **R2 semble correcte.**
-Elle l'est sur les totaux annuels, et sur toutes les journées sauf deux. Ne pas chercher l'erreur sur une fenêtre quelconque : aller directement sur la semaine de changement d'heure. C'est là, et seulement là, que l'écart apparaît.
+Elle l'est sur les totaux annuels. Le découpage en UTC décale la fenêtre de chaque jour de deux heures : l'écart existe tous les jours, mais c'est sur la semaine du changement d'heure qu'il devient indiscutable, avec une journée de 25 heures découpée en 24. Aller directement sur cette semaine, et comparer jour par jour.
 
 **La réécriture de R5 n'apporte presque rien.**
 C'est attendu à l'étape 1, et c'est le but. Sans l'index `(series_id, ts DESC)`, aucune des trois réécritures ne peut gagner. Ne pas créer l'index avant d'avoir mesuré sans lui.

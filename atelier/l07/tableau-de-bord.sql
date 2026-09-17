@@ -1,5 +1,6 @@
 -- Les quatre requêtes du tableau de bord MISTRAL, telles qu'elles tournent
--- sur le brut (L07 étape 3 : mesurer avant, puis rejouer sur la pyramide).
+-- sur le brut (L07 étape 4 : mesurer, puis écrire l07/tableau-de-bord-pyramide.sql
+-- — les mêmes requêtes servies par le bon niveau — et mesurer à nouveau).
 -- Bornes :debut / :fin : \i l05/bornes.sql au préalable.
 
 -- Q1 — puissance moyenne du parc par heure, 7 derniers jours
@@ -27,8 +28,8 @@ JOIN   signaux g ON g.signal_id = af.signal_id AND g.libelle = 'puissance_kw'
 WHERE  m.ts >= :'fin'::timestamptz - interval '30 days' AND m.ts < :'fin'
 GROUP  BY 1 ORDER BY 2 DESC LIMIT 10;
 
--- Q4 — volumétrie : points reçus par jour, toutes séries
-SELECT time_bucket(INTERVAL '1 day', ts) AS jour, count(*) AS points
+-- Q4 — volumétrie : points reçus par jour (Europe/Paris), toutes séries
+SELECT time_bucket(INTERVAL '1 day', ts, 'Europe/Paris') AS jour, count(*) AS points
 FROM   mesures
 WHERE  ts >= :'debut' AND ts < :'fin'
 GROUP  BY 1 ORDER BY 1;

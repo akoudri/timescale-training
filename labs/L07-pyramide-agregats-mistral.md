@@ -36,8 +36,8 @@ WHERE  application_name LIKE 'TimescaleDB%';
 
 | Fichier | Rôle |
 |---|---|
-| `l07/tableau-de-bord.sql` | Les quatre requêtes du tableau de bord MISTRAL |
-| `l07/controle-somme.sql` | Le contrôle de cohérence aux trois niveaux |
+| `l07/tableau-de-bord.sql` | Les quatre requêtes du tableau de bord MISTRAL, sur le brut |
+| `l07/controle-somme.sql` | Le contrôle de cohérence : brut et les trois niveaux, sur une journée civile |
 | `l07/injecter-tardif.sh` | Injecte un lot daté de J-3 |
 | `mesures.md` | Journal de bord |
 
@@ -122,9 +122,11 @@ WHERE  application_name LIKE '%Continuous Aggregate%';
 
 ### Étape 4 — Mesurer le gain (8 min)
 
+Écrire d'abord `l07/tableau-de-bord-pyramide.sql` : les quatre requêtes de `l07/tableau-de-bord.sql`, chacune servie par le niveau adapté à sa granularité. Les deux fichiers doivent retourner les mêmes lignes.
+
 ```bash
-./mesure.sh l07/tableau-de-bord.sql --source brut
-./mesure.sh l07/tableau-de-bord.sql --source pyramide
+./mesure.sh l07/tableau-de-bord.sql          --bornes complet
+./mesure.sh l07/tableau-de-bord-pyramide.sql --bornes complet
 ```
 
 Consigner les quatre gains dans `mesures.md`, sous `## M08 — pyramide d'agrégats`.
@@ -137,7 +139,7 @@ Suivre exactement les cinq étapes du slide 21, dans l'ordre.
 
 ```sql
 -- 1. relever la reference, avant toute injection
-\i l07/controle-somme.sql   -- noter les trois sommes sur J-3
+\i l07/controle-somme.sql   -- noter les quatre comptes sur J-3
 ```
 
 ```bash
@@ -239,6 +241,7 @@ Vérifier quel niveau chaque requête interroge. Un graphe mensuel lu sur le niv
 | Élément | Contenu |
 |---|---|
 | `agregats.sql` | Les trois niveaux et leurs politiques, décalages justifiés en commentaires |
+| `l07/tableau-de-bord-pyramide.sql` | Les quatre requêtes servies par le bon niveau |
 | `mesures.md` §`M08` | Quatre gains du tableau de bord, résultats du protocole de donnée tardive |
 | `l07/tardif-observations.md` | Réponses aux deux questions de l'étape 5 |
 | État de reprise | `mistral-M08` |

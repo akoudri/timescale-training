@@ -12,8 +12,9 @@ esac; done
 
 docker compose exec -T timescaledb psql -U postgres -d mistral -v ON_ERROR_STOP=1 <<SQL
 SELECT setseed(0.42);          -- rejouable : même lot à chaque exécution
-WITH j3 AS (
-  SELECT date_trunc('day', max(ts)) - interval '3 days' AS debut FROM mesures
+WITH j3 AS (   -- J-3 au sens du jour civil de Paris, comme controle-somme.sql
+  SELECT (date_trunc('day', max(ts) AT TIME ZONE 'Europe/Paris') - interval '3 days')
+         AT TIME ZONE 'Europe/Paris' AS debut FROM mesures
 )
 INSERT INTO mesures (ts, series_id, valeur, qualite)
 SELECT (SELECT debut FROM j3)

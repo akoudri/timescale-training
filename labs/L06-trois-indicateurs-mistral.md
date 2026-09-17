@@ -40,6 +40,8 @@ Aucune ligne signifie que les trois fonctions de l'atelier n'existent pas. L'ins
 | `l06/indicateurs/` | Répertoire vide, à remplir |
 | `mesures.md` | Journal de bord |
 
+Les bornes `:debut` et `:fin` se calculent comme en L05 : `\i l05/bornes.sql` en session psql.
+
 ---
 
 ## SOCLE — pour tous
@@ -79,11 +81,12 @@ Choisir ensuite **une machine et un mois comportant un arrêt de maintenance** �
 
 ```sql
 SELECT machine_id,
-       duration_in(state_agg(ts, etat), 'production') AS temps_production,
-       duration_in(state_agg(ts, etat), 'arret')      AS temps_arret,
-       duration_in(state_agg(ts, etat), 'maintenance') AS temps_maintenance
+       duration_in(state_agg(ts, attributs->>'etat'), 'production')  AS temps_production,
+       duration_in(state_agg(ts, attributs->>'etat'), 'arret')       AS temps_arret,
+       duration_in(state_agg(ts, attributs->>'etat'), 'maintenance') AS temps_maintenance
 FROM   evenements
-WHERE  ts >= :'debut' AND ts < :'fin'
+WHERE  type = 'changement_etat'          -- les alarmes ne portent pas d'état
+  AND  ts >= :'debut' AND ts < :'fin'
 GROUP  BY 1;
 ```
 
@@ -173,8 +176,8 @@ La machine ou le mois choisis ne comportent pas d'arrêt : le pas est régulier,
 **Le taux de disponibilité dépasse cent pour cent.**
 Le dénominateur retenu est la durée de la fenêtre alors que les états n'en couvrent qu'une partie. C'est le même piège qu'au bloc 6.2, transposé sur un autre indicateur : une absence d'information n'est pas un état.
 
-**`state_agg` retourne une erreur sur les valeurs NULL.**
-Un état non renseigné n'est pas un état. Filtrer en amont, ou décider explicitement de le traiter comme un état nommé — mais le décider, pas le subir.
+**`state_agg` ignore les valeurs NULL en silence.**
+Un état non renseigné n'est pas un état, et la fonction ne le signale pas : la ligne est sautée et l'état précédent court jusqu'au changement suivant. Filtrer en amont, ou décider explicitement de le traiter comme un état nommé — mais le décider, pas le subir.
 
 **Le percentile approché et le percentile exact diffèrent.**
 C'est attendu. Ce qui compte n'est pas qu'ils soient égaux, mais que l'écart soit borné et mesuré. Le relever plutôt que de le constater : c'est cette mesure qui rend l'approximation défendable devant un métier.
