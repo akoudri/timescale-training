@@ -1,6 +1,6 @@
 # L00 — MISTRAL : le métier et le modèle de données
 
-**À lire après le parcours amont, avant L02.** Ce document décrit ce que les
+**À lire après le parcours amont (fiche `AMONT-installation-du-poste.md`), avant L02.** Ce document décrit ce que les
 quinze ateliers manipulent : l'exploitant fictif MISTRAL, son parc, ses
 capteurs, et les tables que le parcours amont a restaurées dans la base
 `mistral`. Il ne prend aucune des décisions de modélisation de L02 : il

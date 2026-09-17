@@ -2,7 +2,7 @@
 
 **Module** : M02 · Déploiement, mise en service, méthode de mesure
 **Durée** : 45 min — socle 30 min, extension en auto-rythme
-**État de fil rouge en entrée** : jeux restaurés (parcours amont)
+**État de fil rouge en entrée** : jeux restaurés (fiche `AMONT-installation-du-poste.md`)
 **État de fil rouge en sortie** : `mistral-M02`
 
 ---
@@ -17,24 +17,31 @@ C'est le seul atelier de la formation dont le livrable n'est pas une décision t
 
 ---
 
-## Prérequis
+## Point de départ
 
-**Outils**
+**Le parcours amont est joué** (fiche `AMONT-installation-du-poste.md`) et
+`verifier-poste.sh` répond « poste conforme ». Si ce n'est pas le cas, jouer
+la fiche amont maintenant : elle installe les outils, génère les jeux et
+lance `./amont/restaurer.sh`. Rien de cette fiche-ci ne fonctionne sans.
 
-- Docker et Docker Compose fonctionnels, `verifier-poste.sh` retournant « poste conforme »
-- `psql` en ligne de commande
-- 60 Go d'espace disque libre
+Ce que le poste contient donc déjà, et que **cet atelier ne refait pas** :
 
-**Livrables des étapes précédentes**
+- les deux instances démarrées, `timescaledb` épinglée à 2 vCPU / 8 Go ;
+- la base `mistral` avec l'extension `timescaledb` seule ;
+- `mesures` en **table ordinaire de 5 jours** (21 168 000 lignes). C'est
+  délibéré : la ligne de base se mesure sur table non partitionnée, et
+  restaurer deux fois les 190 millions de lignes coûterait cher pour rien. Le
+  jeu complet (`mesures.bin`, 45 jours) sera chargé en M03, par
+  `COPY ... FORMAT binary`, dans l'hypertable — c'est le mode de chargement
+  que la formation enseigne ;
+- le référentiel, `mesures_hc` (qui ne servira qu'en M09) et, sur l'instance
+  PostgreSQL 16, la base `mistral_legacy` ;
+- le point d'inclusion `conf.d/` dans `postgresql.conf`, encore vide.
 
-- `mesures-avant.dump` restauré : la table `mesures` est une **table ordinaire
-  de 5 jours** (21 168 000 lignes). C'est délibéré : la ligne de base se
-  mesure sur table non partitionnée, et restaurer deux fois les 190 millions
-  de lignes coûterait cher pour rien. Le jeu complet (`mesures.bin`,
-  45 jours) sera chargé en M03, par `COPY ... FORMAT binary`, dans
-  l'hypertable — c'est le mode de chargement que la formation enseigne.
-- `mistral-legacy.dump` restauré sur l'instance PostgreSQL 16
-- `mesures-hc.bin` chargé (il ne servira qu'en M09, mais son chargement se vérifie ici)
+Ce que cet atelier fait, dans l'ordre : vérifier l'épinglage (étape 1), créer
+les deux extensions manquantes (étape 2), appliquer la configuration
+d'atelier et redémarrer (étape 3), mesurer (étapes 4 et 5). Le tableau
+« parcours amont / L01 » de la fiche amont fixe cette frontière.
 
 **Lecture recommandée** : `L00-mistral-modele-de-donnees.md` décrit le parc MISTRAL, le référentiel et les tables restaurées. Il est indispensable avant L02, utile dès maintenant pour savoir ce que mesurent R1, R2 et R3.
 
@@ -52,24 +59,17 @@ C'est le seul atelier de la formation dont le livrable n'est pas une décision t
 
 ## SOCLE — pour tous
 
-**Avant l'étape 1 : le parcours amont doit avoir été joué.** Il crée les répertoires de données, démarre les deux instances, crée la base `mistral` et y restaure les trois jeux. Toutes les étapes ci-dessous se font **dans la base `mistral`**. Si `verifier-poste.sh` ne répond pas « poste conforme », le jouer maintenant, depuis `atelier/` :
+Toutes les commandes se lancent depuis `atelier/`, et tout le SQL s'exécute **dans la base `mistral`**.
+
+### Étape 1 — Vérifier l'épinglage de l'instance
+
+L'instance tourne déjà. Cette étape ne démarre rien : elle vérifie que l'épinglage demandé par le compose est effectif, parce que sans lui les mesures d'un participant ne sont pas comparables à celles d'un autre, et la règle du rapport plutôt que de la durée absolue perd son sens.
 
 ```bash
-./amont/restaurer.sh && ./verifier-poste.sh
-```
-
-### Étape 1 — Démarrer l'instance épinglée
-
-L'épinglage n'est pas un détail de confort : sans lui, les mesures d'un participant ne sont pas comparables à celles d'un autre, et la règle du rapport plutôt que de la durée absolue perd son sens.
-
-```bash
-docker compose up -d timescaledb      # sans effet si le parcours amont l'a déjà démarrée
 docker stats --no-stream timescaledb
 ```
 
-Les répertoires de données (`pgdata/`, `pgdata-legacy/`, `archives/`) sont montés depuis le disque hôte. Le parcours amont les a créés à votre nom ; s'ils n'existent pas au premier `up`, Docker les crée lui-même, propriété de root, et l'instance ne démarre pas (voir les pièges).
-
-Vérifier que la sortie de `docker stats` affiche bien une limite mémoire de 8 Go et non la mémoire totale du poste.
+Vérifier que la sortie affiche bien une limite mémoire de 8 Go et non la mémoire totale du poste.
 
 Vérifier également que le swap est désactivé côté conteneur :
 
@@ -121,18 +121,14 @@ Deux fichiers sont en jeu, à ne pas confondre :
 - `conf/timescaledb-mistral.conf`, dans le dépôt, monté dans le conteneur sous `/conf` : la configuration d'atelier (mémoire, workers, suivi des requêtes) ;
 - `postgresql.conf`, dans le conteneur, créé par l'image au premier démarrage : la configuration du serveur. Il ne lit la première que si on la lui fait **inclure**.
 
-Le parcours amont a préparé le point d'inclusion (un répertoire `conf.d/` et la ligne `include_dir` dans `postgresql.conf`). Il reste à y copier la configuration d'atelier et à redémarrer, depuis `atelier/` :
+Le parcours amont a préparé le point d'inclusion (un répertoire `conf.d/` et la ligne `include_dir` dans `postgresql.conf`), et l'a laissé vide. Deux commandes : copier la configuration d'atelier dans ce répertoire, puis redémarrer.
 
 ```bash
-D=/home/postgres/pgdata/data
-docker compose exec timescaledb mkdir -p $D/conf.d
-docker compose exec timescaledb sh -c "grep -q '^include_dir' $D/postgresql.conf \
-  || echo \"include_dir = 'conf.d'\" >> $D/postgresql.conf"
-docker compose exec timescaledb cp /conf/timescaledb-mistral.conf $D/conf.d/
+docker compose exec timescaledb cp /conf/timescaledb-mistral.conf /home/postgres/pgdata/data/conf.d/
 docker compose restart timescaledb
 ```
 
-Les deux premières commandes ne font rien si le parcours amont est passé ; elles rendent l'étape rejouable sur une instance démarrée sans lui. Un redémarrage complet est obligatoire : ces paramètres ne se rechargent pas à chaud.
+Un redémarrage complet est obligatoire : ces paramètres ne se rechargent pas à chaud, un `pg_reload_conf()` ne suffit pas.
 
 Puis, une fois l'instance revenue :
 
@@ -262,7 +258,17 @@ Modifier `mesure.sh` pour qu'il consigne également, à chaque exécution, le no
 ## Pièges et indices
 
 **Le conteneur s'arrête aussitôt : « mkdir: cannot create directory '/home/postgres/pgdata/data': Permission denied ».**
-Le répertoire `pgdata/` a été créé par Docker (donc par root) parce qu'il n'existait pas au premier `up`. L'image tourne sous l'uid 1000 et ne peut pas y écrire. Supprimer le répertoire vide (`rmdir pgdata`), le recréer à votre nom (`mkdir pgdata`), relancer. `./amont/restaurer.sh` fait cette création correctement ; c'est une raison de plus de ne pas sauter le parcours amont.
+Le répertoire `pgdata/` appartient à root : soit Docker l'a créé lui-même lors d'un `up` lancé à la main avant le parcours amont, soit le parcours amont a été joué avec `sudo`. L'image tourne sous l'uid 1000 et ne peut pas y écrire. La correction est dans les pièges de la fiche amont (reprendre la propriété du dépôt, relancer `restaurer.sh` sans `sudo`). Si `docker` exige `sudo` sur ce poste, c'est le groupe `docker` qui manque, étape 1 de la fiche amont.
+
+**L'étape 3 échoue : « cp: cannot create regular file '…/conf.d/' : No such file or directory ».**
+L'instance a été démarrée sans le parcours amont, qui crée le point d'inclusion. Le préparer à la main, puis reprendre l'étape 3 :
+
+```bash
+D=/home/postgres/pgdata/data
+docker compose exec timescaledb mkdir -p $D/conf.d
+docker compose exec timescaledb sh -c "grep -q '^include_dir' $D/postgresql.conf \
+  || echo \"include_dir = 'conf.d'\" >> $D/postgresql.conf"
+```
 
 **`ERROR: relation "mesures" does not exist`, alors que le parcours amont est passé.**
 La session `psql` n'est pas connectée à la bonne base. Sans option `-d`, `psql` ouvre la base `postgres`, qui est vide ; tout le travail des quinze labs se fait dans `mistral`. Le prompt le dit : il doit afficher `mistral=#`, pas `postgres=#`. Corriger avec `\c mistral`, ou se connecter par `docker compose exec timescaledb psql -U postgres -d mistral`. `mesure.sh` n'a pas ce problème, il nomme la base lui-même — c'est pour cela que l'étape 4 passe et que l'étape 5, tapée à la main, échoue.

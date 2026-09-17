@@ -19,6 +19,11 @@ identiques (vérifié par empreinte).
 
 ## Utilisation
 
+Prérequis : [`uv`](https://docs.astral.sh/uv/) (`curl -LsSf https://astral.sh/uv/install.sh | sh`,
+sans `sudo`) et Docker pour l'étape des dumps. Python 3.12 est téléchargé par
+`uv` si le poste n'en a pas. La séquence complète, du poste vide à
+l'environnement d'atelier, est dans `labs/AMONT-installation-du-poste.md`.
+
 ```bash
 uv sync
 
@@ -50,6 +55,12 @@ uv run pytest -m chargement                      # docker pg17, ~10 min
 | `machines-avec-arret.json` | Les trois arrêts de maintenance de la contrainte 6.2 | — |
 | `referentiel.sql`, `evenements.csv`, `meteo.csv` | Sources des dumps, rechargeables directement | 77 Mo |
 | `MANIFESTE.json` | Empreintes SHA-256, comptages, graine, attribution | — |
+
+Une livraison peut en plus contenir `mesures.bin.zst`, `mesures-avant.bin.zst`
+et `mesures-hc.bin.zst` : copies compressées des trois COPY binaires pour le
+transfert (2 Go au lieu de 8,5). `mistral-gen generer` ne les écrit pas ;
+`zstd -d <fichier>.zst` les décompresse en place. Le script de restauration
+lit les `.bin`, jamais les `.zst`.
 
 Chargement des `.bin` :
 
