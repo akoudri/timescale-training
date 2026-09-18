@@ -50,6 +50,19 @@ Tout ce qui est coché « parcours amont » est fait par un script et n'est **pa
   instances et les copies des ateliers
 - Accès réseau pour tirer les images Docker et les paquets Python
 
+## Prérequis calendaire : la session précède la fenêtre du jeu
+
+Le jeu MISTRAL couvre 45 jours datés (dans la configuration livrée : du
+15 septembre au 30 octobre 2026). Plusieurs politiques posées pendant la
+formation sont relatives à l'horloge murale — bascule en columnstore
+après 7 jours, rétention à 30 jours, rafraîchissement des agrégats — et
+elles agissent pour de vrai dès que la date de la session dépasse le début
+de la fenêtre : compression prématurée, purge du jeu, agrégats vidés. Les
+fiches raisonnent donc avec **une session antérieure à la fenêtre**, et
+`verifier-poste.sh` refuse un poste dont la date est dans ou après la
+fenêtre. Si la formation a lieu plus tard, régénérer le jeu avec une
+fenêtre future (étape 4, « choisir la fenêtre »).
+
 ---
 
 ## Étape 1 — Docker et Docker Compose, sans `sudo`
@@ -136,6 +149,18 @@ empreintes et les comptages.
 | `mistral-legacy.dump` | la production actuelle de MISTRAL, PostgreSQL 16 (restauré maintenant) | 0,6 Go |
 | `mesures.bin` | le jeu complet, 45 jours, 190 M lignes (**chargé en L02**, pas maintenant) | 7,2 Go |
 | `machines-avec-arret.json` | les trois arrêts de maintenance, utilisé en L10 | — |
+
+**Choisir la fenêtre.** Si la session est postérieure au 15 septembre 2026,
+modifier `fenetre.debut` dans `generateur/config.yaml` avant de générer :
+la fenêtre doit commencer **après le dernier jour de la session** et
+contenir un changement d'heure Europe/Paris, faute de quoi le générateur
+refuse (contrainte 6.1). Par exemple `"2027-10-01T00:00:00+02:00"` couvre
+le 31 octobre 2027 (jour de 25 heures, comme dans les fiches) ;
+`"2027-03-01T00:00:00+01:00"` couvre le 28 mars 2027 (jour de 23 heures :
+le piège du fuseau de L05 change de sens). Les dates absolues citées dans
+les fiches et les corrigés (25 et 26 octobre, jour de 25 h) se lisent alors
+en relatif au jeu. La copie `mistral_legacy` suit la même règle
+(`legacy.debut`).
 
 Si le dépôt a été livré avec des fichiers `.zst` déjà générés (transfert par
 clé USB, par exemple), les décompresser en place avec `zstd -d` remplace

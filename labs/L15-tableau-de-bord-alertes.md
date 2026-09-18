@@ -33,6 +33,7 @@ Vingt minutes, quatre alertes. C'est court, et c'est délibéré : une liste cou
 | `l15/metriques.sql` | Les huit requêtes qui alimentent les panneaux |
 | `l15/provoquer.sh` | Provoque chacune des quatre situations d'alerte |
 | `l15/alertes-modele.md` | La fiche par alerte, à compléter |
+| `l15/supervision-taille.sql` | L'historique de taille en base et son job de relevé horaire, pour la tendance de A4 |
 
 ---
 
@@ -44,7 +45,7 @@ Vingt minutes, quatre alertes. C'est court, et c'est délibéré : une liste cou
 docker compose --profile outils up -d grafana     # http://127.0.0.1:3000, admin / mistral
 ```
 
-La source de données « PostgreSQL MISTRAL » est provisionnée sur le rôle `mistral_supervision`, **qui n'existe pas encore**. Le créer avec le strict nécessaire pour les huit requêtes de `l15/metriques.sql` — lecture des mesures et des agrégats, des vues d'information de l'extension, des statistiques de requêtes — et rien de plus : c'est la leçon de L13 appliquée à la supervision. Tant qu'il manque un droit, un panneau reste vide.
+La source de données « PostgreSQL MISTRAL » est provisionnée sur le rôle `mistral_supervision`, **qui n'existe pas encore**. Le créer avec le strict nécessaire pour les huit requêtes de `l15/metriques.sql` — lecture des mesures et des agrégats, des vues d'information de l'extension, des statistiques de requêtes, de l'historique de taille `supervision_taille` — et rien de plus : c'est la leçon de L13 appliquée à la supervision. Tant qu'il manque un droit, un panneau reste vide.
 
 Importer ensuite `l15/tableau-de-bord.json` (menu Dashboards, Import, fichier monté sous `/l15` dans le conteneur ou copié depuis le dépôt), en choisissant cette source quand l'import la demande.
 
@@ -65,6 +66,14 @@ Les quatre rubriques par alerte :
 2. **Ce que fait celui qui la reçoit** — une phrase, une action concrète
 3. **Le propriétaire nommé**, qui peut décider de la retirer
 4. **La raison de la retenir** dans une liste de quatre, plutôt qu'une autre
+
+**A4 exige un historique.** Une source de données SQL n'a pas de mémoire : Grafana affiche la taille de la base au moment de la requête et n'en garde rien. La tendance — combien de jours restent au rythme actuel — se calcule sur des relevés tenus **dans la base** par un job horaire, fourni :
+
+```sql
+\i l15/supervision-taille.sql
+```
+
+Il crée la table `supervision_taille`, l'action `relever_taille` au contrat de M11, le job, et donne SELECT au rôle de supervision. La tendance reste indéterminée tant qu'il y a moins de deux relevés sur vingt-quatre heures, et négative juste après une purge de rétention : une pente négative n'est pas un danger, l'expression le prévoit.
 
 **A2 et A3 doivent être exprimées en relatif.** Un seuil absolu sur A2 devient faux dès qu'on change la période d'un job — ce qui arrivera, et personne ne pensera à ajuster l'alerte. **Et A2 se limite aux jobs déjà échus** : une politique jamais exécutée affiche `last_successful_finish = -infinity`, faux positif garanti si l'alerte compare cette valeur à la période.
 
@@ -146,7 +155,7 @@ La condition de retour n'est pas l'inverse de la condition de déclenchement. Su
 La fréquence attendue est exprimée globalement alors qu'elle diffère par flux : les mesures arrivent à 0,1 Hz, la météo au pas horaire. Le seuil doit être relatif à la fréquence du flux concerné.
 
 **A4 se déclenche trop tard.**
-Un seuil seul se franchit au moment où il est déjà trop tard pour agir. La tendance — combien de jours restent au rythme actuel — donne le délai d'action.
+Un seuil seul se franchit au moment où il est déjà trop tard pour agir. La tendance — combien de jours restent au rythme actuel — donne le délai d'action. Elle suppose un historique de la taille : c'est le job de `l15/supervision-taille.sql`, et il n'est pas facultatif — sans lui, le panneau M7 n'a qu'un point.
 
 **L'instantané de statistiques est vide.**
 Le module de suivi des requêtes doit être actif **avant** l'incident. C'est une ligne à ajouter à la checklist de mise en service de M02, et l'occasion de le faire.
@@ -163,7 +172,7 @@ Le rôle utilisé par Grafana n'a pas les droits sur les vues d'information ni s
 | `l15/alertes.md` | Les quatre alertes, quatre rubriques chacune |
 | `l15/tableau-de-bord.json` | Exporté avec les alertes configurées |
 | `l15/silence.md` | Pour chaque alerte, la situation normale envisagée et pourquoi elle ne la franchit pas |
-| État de reprise | `mistral-M15` complet |
+| État de reprise | `mistral-M15` complet, job de relevé de taille inclus |
 
 **Vers la clôture.** Le jeu de requêtes de diagnostic et les quatre alertes sont les deux livrables qui servent dès le premier jour de production. `mesures.md`, ouvert au deuxième module de la formation, devient le premier document d'exploitation.
 

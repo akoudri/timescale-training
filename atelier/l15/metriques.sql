@@ -40,9 +40,18 @@ SELECT j.job_id, j.proc_name, j.scheduled, s.total_failures,
 FROM   timescaledb_information.jobs j
 LEFT   JOIN timescaledb_information.job_stats s USING (job_id);
 
--- M7 · espace disque : taille de la base et sa croissance (tendance à
---      calculer côté tableau de bord sur l'historique de cette métrique)
+-- M7 · espace disque : taille de la base (valeur instantanée, celle du
+--      panneau) et sa tendance, calculée sur l'historique que le job de
+--      relevé tient en base (l15/supervision-taille.sql) — une source SQL
+--      n'a pas de mémoire, Grafana n'archive rien
 SELECT pg_database_size(current_database()) AS octets_base;
+
+SELECT o.octets                                                  AS dernier_releve,
+       round(t.pente_par_jour / 1024^2)                          AS mo_par_jour,
+       round(((200.0 * 1024^3) - o.octets) / nullif(t.pente_par_jour, 0)) AS jours_restants
+FROM  (SELECT octets FROM supervision_taille ORDER BY ts DESC LIMIT 1) o,
+      (SELECT regr_slope(octets, extract(epoch FROM ts)) * 86400 AS pente_par_jour
+       FROM   supervision_taille WHERE ts >= now() - interval '24 hours') t;
 
 -- M8 · taux de succès du cache
 SELECT round(100.0 * blks_hit / nullif(blks_hit + blks_read, 0), 2)

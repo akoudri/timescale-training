@@ -14,7 +14,7 @@ Un exploitant supprime par erreur trois semaines de mesures un mardi à 14 h 32.
 Cet atelier exécute cette restauration de bout en bout. Il produit deux résultats, et le second compte davantage que le premier :
 
 1. **Une durée mesurée.** Personne ne sait combien de temps prend une restauration tant qu'il ne l'a pas fait. Une estimation n'est pas une mesure, et c'est ce chiffre qu'on donne au métier quand il demande un engagement.
-2. **Une checklist de vérification post-restauration.** Retrouver les données ne suffit pas : il faut que les hypertables soient encore des hypertables, que les six jobs soient replanifiés, et que les agrégats repartent. C'est l'étape que tout le monde saute.
+2. **Une checklist de vérification post-restauration.** Retrouver les données ne suffit pas : il faut que les hypertables soient encore des hypertables, que tous les jobs soient replanifiés, et que les agrégats repartent. C'est l'étape que tout le monde saute.
 
 ---
 
@@ -22,7 +22,7 @@ Cet atelier exécute cette restauration de bout en bout. Il produit deux résult
 
 **État attendu**
 
-- `mistral-M11` atteint : six jobs planifiés, pyramide et politiques en place
+- `mistral-M11` atteint : tous les jobs planifiés (huit sur le poste de référence : deux politiques par défaut, trois rafraîchissements, compression, rétention, contrôle qualité), pyramide et politiques en place
 - L'instance dispose d'un répertoire d'archivage des journaux, monté et accessible en écriture
 - Espace disque disponible pour une copie complète de l'instance
 
@@ -134,7 +134,7 @@ SELECT hypertable_name, num_dimensions
 FROM   timescaledb_information.hypertables ORDER BY 1;
 ```
 
-**Les six jobs sont replanifiés, et ont une prochaine échéance.**
+**Tous les jobs sont replanifiés, et ont une prochaine échéance.**
 
 ```sql
 SELECT job_id, proc_name, scheduled, next_start
@@ -247,17 +247,19 @@ Cet atelier est celui qui laisse le plus de traces sur le disque, et deux d'entr
 2. **La sauvegarde de base**, `archives/base`, du même ordre de grandeur.
 3. **L'archivage des journaux**, activé à l'étape 1 : tant qu'il reste actif, chaque journal de 16 Mo est copié dans `archives/wal`, sans limite. Le désactiver, ou l'assumer avec une purge — en production, c'est la rétention des archives qui borne ce volume, et c'est un choix à écrire.
 
-```bash
-rm -rf pgdata/data.incident archives/base archives/wal
-```
+**Dans cet ordre** : désactiver l'archivage et redémarrer d'abord, supprimer le répertoire d'archives ensuite. Fait dans l'autre sens, l'archiveur tente de copier le segment suivant vers un répertoire qui n'existe plus, `failed_count` s'incrémente et le segment reste retenu dans `pg_wal` jusqu'au redémarrage — le piège de l'étape 1, provoqué par le nettoyage.
 
 ```sql
 ALTER SYSTEM SET archive_mode = off;   -- prend effet au prochain redémarrage
+ALTER SYSTEM RESET archive_command;    -- un ALTER SYSTEM par instruction : il refuse le bloc de transaction d'un `psql -c` multiple
 ```
 
 ```bash
 docker compose restart timescaledb
+rm -rf pgdata/data.incident archives/base archives/wal
 ```
+
+Le script de restauration a en outre laissé `restore_command` et la cible de rejeu dans `postgresql.auto.conf` ; ils sont ignorés hors restauration, mais il les retire lui-même après la promotion (étape 6 du script) pour ne pas polluer la prochaine restauration.
 
 Vérifier avec `df -h` que l'espace est revenu : sans ce nettoyage, le poste ne tient pas les trois ateliers suivants.
 

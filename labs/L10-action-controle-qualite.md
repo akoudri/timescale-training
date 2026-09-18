@@ -125,7 +125,7 @@ SELECT alter_job(<job_id>, config     => '{"seuil": "une heure"}'::jsonb,
                            next_start => now() + INTERVAL '10 seconds');
 ```
 
-Puis **attendre l'échéance** : c'est l'ordonnanceur qui doit exécuter le job. Un `CALL run_job()` en session renverrait l'erreur au client et n'écrirait **rien** dans le journal des erreurs — seules les exécutions lancées par l'ordonnanceur y sont journalisées. Retrouver ensuite la trace de l'échec :
+Puis **attendre l'échéance** : c'est l'ordonnanceur qui doit exécuter le job. Un `CALL run_job()` en session renverrait l'erreur au client et n'écrirait **rien** dans le journal des erreurs — seules les exécutions lancées par l'ordonnanceur y sont journalisées. Après un échec, l'ordonnanceur ne réessaie qu'au bout de `retry_period` (cinq minutes par défaut) : pour voir plusieurs échecs s'enchaîner dans le temps de l'étape, raccourcir ce délai dans le même `alter_job` (`retry_period => INTERVAL '15 seconds'`), et le remettre à sa valeur en restaurant la configuration. Retrouver ensuite la trace de l'échec :
 
 ```sql
 SELECT job_id, start_time, err_message
@@ -200,6 +200,9 @@ Comme `refresh_continuous_aggregate`, il ne peut pas s'exécuter dans une transa
 
 **Les trois capteurs coupés n'apparaissent pas.**
 Vérifier que le script de coupure a bien agi sur `mesures` et non sur une table de travail, et que le seuil de la configuration est inférieur à l'ancienneté simulée.
+
+**La table d'alertes contient deux fois les trois capteurs dès l'étape 3.**
+Ce n'est pas un défaut de l'action : `add_job` planifie la première exécution immédiatement, et l'ordonnanceur l'a lancée pendant que le `CALL run_job()` forcé s'exécutait en session. Deux exécutions, deux détections. Les exécutions en session n'apparaissent d'ailleurs ni dans `job_stats` (`total_runs` reste à 0) ni dans `job_history` : `run_job` teste le code de l'action, pas sa supervision.
 
 **Le job est resté suspendu après un test.**
 Un `alter_job(..., scheduled => false)` oublié ne produit aucune erreur : le travail cesse simplement d'exister pour l'ordonnanceur. Vérifier `scheduled` et `next_start`, pas seulement `last_run_status`.

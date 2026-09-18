@@ -164,16 +164,22 @@ L'estimation porte sur l'**échelle de production**, pas sur l'échelle d'atelie
 Mesurer d'abord le coût réel d'une ligne du schéma retenu :
 
 ```sql
--- taille utile d'une ligne, hors en-tête de tuple
+-- coût d'une ligne du schéma retenu, en-tête de tuple compris
 SELECT pg_column_size(row(now(), 1::integer, 1.0::float8, 0::smallint))
-       AS octets_utiles;
+       AS octets_ligne;
 ```
+
+Le résultat est le coût d'un **tuple complet** : les données alignées
+(8 + 4 + 4 de remplissage + 8 + 2 = 26 octets pour ce schéma) plus les
+24 octets d'en-tête que PostgreSQL met devant chaque ligne. Le pointeur de
+ligne (4 octets) et l'espace inutilisé en fin de page s'y ajoutent sur
+disque ; ils restent dans la marge de l'estimation.
 
 Puis appliquer la méthode, en écrivant chaque hypothèse :
 
 1. Points par jour : `4 000 signaux × 0,1 Hz × 86 400 s`
 2. Points sur 3 ans : `points/jour × 1 095`
-3. Octets par ligne : `octets_utiles + 24` (en-tête de tuple et pointeur de ligne)
+3. Octets par ligne : `octets_ligne` tel que mesuré (l'en-tête de tuple y est déjà)
 4. Volume heap : `points × octets/ligne`
 5. Volume d'index : compter environ 30 octets par entrée pour un index sur `(series_id, ts)`
 
@@ -258,6 +264,9 @@ Les options `WITH` ont été écrites sur une table déjà créée, ou mal ortho
 
 **L'estimation à 3 ans donne un résultat improbable.**
 Vérifier l'échelle utilisée. 190 millions de points sur 45 jours est l'échelle d'atelier ; l'estimation porte sur 4 000 signaux à 0,1 Hz, soit environ 34,5 millions de points **par jour**. Un écart d'un facteur 20 entre deux sous-groupes vient presque toujours de là.
+
+**Deux sous-groupes diffèrent de 50 % sur le heap.**
+L'un a ajouté 24 octets d'en-tête à la valeur de `pg_column_size(row(...))`, qui les contient déjà. Le contrôle est simple une fois le jeu complet chargé : diviser `table_bytes` de `hypertable_detailed_size('mesures')` par le nombre de lignes donne le coût réel par ligne sur disque, à comparer à l'hypothèse 3. Il est un peu supérieur (pointeurs de ligne, en-têtes et fins de page), jamais de 24 octets.
 
 **La jointure au référentiel retourne trop de lignes.**
 Les bornes `debut` et `fin` de l'affectation ont été omises. Sans elles, une série ayant eu deux affectations produit deux lignes par point. C'est le mode de défaillance qui rend l'historique faux sans rien signaler.

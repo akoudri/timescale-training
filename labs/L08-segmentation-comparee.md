@@ -71,21 +71,27 @@ Vérifier que les trois contiennent le même nombre de lignes et le même nombre
 ### Étape 2 — Basculer et relever les ratios (12 min)
 
 ```sql
-\i l08/basculer.sql cmp_serie
-\i l08/basculer.sql cmp_machine
-\i l08/basculer.sql cmp_aucun
+\set table cmp_serie
+\i l08/basculer.sql
+\set table cmp_machine
+\i l08/basculer.sql
+\set table cmp_aucun
+\i l08/basculer.sql
 ```
+
+`\i` ne prend pas d'argument : le script lit le nom de la table dans la variable psql `table`, comme `l08/ratios.sql`.
 
 Ne basculer que les **chunks pleins**. Un chunk partiel donne un ratio flatteur et non représentatif — le script filtre déjà sur ce critère, mais il faut savoir pourquoi.
 
 ```sql
-SELECT hypertable_name,
-       pg_size_pretty(before_compression_total_bytes) AS avant,
+SELECT pg_size_pretty(before_compression_total_bytes) AS avant,
        pg_size_pretty(after_compression_total_bytes)  AS apres,
        round(before_compression_total_bytes::numeric
              / after_compression_total_bytes, 1)      AS ratio
 FROM   hypertable_compression_stats('cmp_serie');
 ```
+
+Le ratio chunk par chunk, qui seul permet de vérifier que les chunks comparés sont pleins, est dans `l08/ratios.sql` (même convention `\set table`).
 
 Reporter les trois ratios dans `mesures.md`.
 

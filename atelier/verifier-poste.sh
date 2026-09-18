@@ -70,7 +70,25 @@ for e in timescaledb timescaledb_toolkit pg_stat_statements; do
   fi
 done
 
-# 8. Espace disque
+# 8. Date de la session et fenêtre du jeu : la session doit PRÉCÉDER la fenêtre
+#    (les politiques relatives à now() — bascule 7 j, rétention 30 j,
+#    rafraîchissements — agiraient sinon sur le jeu pendant la formation)
+cfg=../generateur/config.yaml
+if [ -f "$cfg" ]; then
+  debut=$(grep -E '^\s*debut:' "$cfg" | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+  jours=$(grep -E '^\s*jours:' "$cfg" | head -1 | sed -E 's/[^0-9]*([0-9]+).*/\1/')
+  d0=$(date -d "$debut" +%s 2>/dev/null || echo 0)
+  if [ "$d0" -gt 0 ]; then
+    maintenant=$(date +%s)
+    if [ "$maintenant" -lt "$d0" ]; then
+      dire "session avant la fenêtre du jeu (${debut:0:10} + ${jours} j)" "ok"
+    else
+      dire "session DANS ou APRÈS la fenêtre du jeu (${debut:0:10} + ${jours} j)" "NON CONFORME — régénérer avec une fenêtre future (fiche AMONT, étape 4)"; ko=1
+    fi
+  fi
+fi
+
+# 9. Espace disque
 libre=$(df --output=avail -BG "$(pwd)" | tail -1 | tr -dc 0-9)
 [ "$libre" -ge 60 ] && dire "espace disque libre (${libre} Go)" "ok" \
   || { dire "espace disque libre (${libre} Go < 60)" "INSUFFISANT"; ko=1; }

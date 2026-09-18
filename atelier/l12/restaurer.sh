@@ -3,7 +3,7 @@
 #   ./l12/restaurer.sh --instant "2026-08-31 18:55:00+00"
 # 1. arrête l'instance   2. remplace PGDATA par la sauvegarde de base
 # 3. positionne cible et rejeu   4. redémarre et laisse rejouer
-# 5. attend la fin du rejeu avant d'ouvrir en écriture
+# 5. attend la fin du rejeu avant d'ouvrir en écriture   6. retire les paramètres de rejeu
 set -euo pipefail
 cd "$(dirname "$0")/.."
 INSTANT=""
@@ -42,7 +42,14 @@ echo "== 5. attendre la fin du rejeu (sortie de recovery) =="
 for i in $(seq 1 180); do
   encore=$(docker compose exec -T timescaledb psql -U postgres -At \
            -c "SELECT pg_is_in_recovery();" 2>/dev/null || echo t)
-  [ "$encore" = "f" ] && { echo "instance promue, ouverte en écriture"; exit 0; }
+  if [ "$encore" = "f" ]; then
+    echo "instance promue, ouverte en écriture"
+    echo "== 6. retrait des paramètres de rejeu (ignorés hors restauration, mais pollueraient la prochaine) =="
+    for p in restore_command recovery_target_time recovery_target_action; do
+      docker compose exec -T timescaledb psql -U postgres -q -c "ALTER SYSTEM RESET $p;"
+    done
+    exit 0
+  fi
   sleep 2
 done
 echo "le rejeu ne se termine pas — vérifier les journaux" >&2

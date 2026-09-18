@@ -10,6 +10,10 @@ while [ $# -gt 0 ]; do case "$1" in
   *) shift;;
 esac; done
 LOT=$((DEBIT / 4))
+# le PID est écrit pour que l'arrêt (étape 5) se fasse par identifiant, jamais
+# par motif de ligne de commande (un pkill -f peut viser le mauvais processus)
+echo $$ > l11/.flux.pid
+trap 'rm -f l11/.flux.pid' EXIT
 
 echo "flux d'écriture : ${DEBIT} lignes/s (lots de ${LOT}, 4/s) — Ctrl-C pour arrêter"
 while true; do

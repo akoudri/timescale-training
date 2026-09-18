@@ -30,6 +30,7 @@ L'atelier applique donc des **valeurs réduites** — 2 jours, 30 jours — pour
 | Fichier | Rôle |
 |---|---|
 | `l09/etat-chunks.sql` | Nombre et état des chunks, par hypertable |
+| `l09/bornes.sql` | Les bornes d'atelier de la bascule et de la rétention, calculées depuis le jeu, avec le garde-fou des deux horloges |
 | `l09/coherence-fenetres.sql` | Le contrôle de l'étape 3 |
 | `l09/economie.sql` | Volumes avant et après, et extrapolation |
 | `politiques.sql` | Produit en M09, à compléter ici |
@@ -53,7 +54,7 @@ Puis compléter la chaîne. Le rafraîchissement est en place depuis M08, la bas
 SELECT add_retention_policy('mesures', INTERVAL '30 days');
 ```
 
-Vérifier que la bascule de M09 est bien réglée sur la valeur d'atelier correspondante — 2 jours plutôt que 7 — faute de quoi les deux politiques se marchent dessus sur une fenêtre aussi courte :
+Relever les deux politiques côte à côte, et noter que la bascule tranchée en M09 (7 jours) reste enregistrée telle quelle : c'est une valeur de production, elle ne bouge pas. La valeur d'atelier de la bascule — 2 jours — n'est pas un réglage de la politique mais la **borne explicite** appliquée ci-dessous ; les deux valeurs seront étiquetées dans `politiques.sql`.
 
 ```sql
 SELECT job_id, proc_name, config
@@ -61,19 +62,17 @@ FROM   timescaledb_information.jobs
 WHERE  proc_name LIKE '%compression%' OR proc_name LIKE '%retention%';
 ```
 
-**Le jeu est daté.** Une politique relative à `now()` — c'est le cas de la bascule et de la rétention — ne trouve aucun chunk à traiter en salle : elle s'exécute, réussit, et ne fait rien. Les politiques restent enregistrées (c'est leur structure et leur supervision que M11 étudie) ; l'effet, lui, se déclenche à borne explicite, calculée depuis le dernier point du jeu :
+**Le jeu est daté.** Une politique relative à `now()` — c'est le cas de la bascule et de la rétention — ne trouve aucun chunk à traiter tant que la session précède la fenêtre du jeu : elle s'exécute, réussit, et ne fait rien. Les politiques restent enregistrées (c'est leur structure et leur supervision que M11 étudie) ; l'effet, lui, se déclenche à borne explicite, calculée depuis le dernier point du jeu :
 
 ```sql
-SELECT max(ts) - INTERVAL '2 days'  AS borne_bascule,
-       max(ts) - INTERVAL '30 days' AS borne_retention
-FROM   mesures \gset
+\i l09/bornes.sql        -- borne_bascule = max(ts) − 2 j, borne_retention = max(ts) − 30 j
 
 SELECT compress_chunk(c)
 FROM   show_chunks('mesures', older_than => :'borne_bascule'::timestamptz) c;
 SELECT drop_chunks('mesures', older_than => :'borne_retention'::timestamptz);
 ```
 
-Règle générale, valable pour tout l'atelier : tout énoncé qui dépend de l'horloge murale se raisonne en temps relatif au jeu (`max(ts)`), jamais en `now()`.
+Règle générale, valable pour tout l'atelier : tout énoncé qui dépend de l'horloge murale se raisonne en temps relatif au jeu (`max(ts)`), jamais en `now()`. Le script de bornes applique une exception, et l'affiche quand elle joue : si la date de la session tombe dans la fenêtre du jeu, la rétention d'atelier ne doit pas emporter les chunks où se trouve `now()`, parce que les politiques de rafraîchissement de M08, elles, y regardent — voir le piège « les deux horloges ».
 
 ### Étape 2 — Vérifier l'état des chunks (8 min)
 
@@ -185,6 +184,9 @@ Relever trois grandeurs pour chacun : la durée, le volume de journal produit, e
 ---
 
 ## Pièges et indices
+
+**Les deux horloges : la session tombe dans la fenêtre du jeu.**
+Le jeu se lit à l'horloge de `max(ts)`, les politiques de rafraîchissement des agrégats à l'horloge murale. Tant que la session précède la fenêtre, les deux ne se rencontrent pas. Si elle tombe dedans, une purge bornée sur le jeu qui emporte les chunks où se trouve `now()` déclenche exactement l'erreur du bloc 10.2 : à chaque passage, la politique matérialise du vide sur sa fenêtre et efface, sans erreur, des valeurs qui étaient justes — d'abord au niveau minute, puis à l'heure et au jour, de proche en proche. `l09/bornes.sql` plafonne la borne de rétention pour l'éviter et le signale ; la purge observée à l'étape 2 est alors plus courte que les trente jours annoncés, et il faut le dire plutôt que forcer la borne. Si la session est postérieure à la fenêtre, aucune borne ne protège : bascule et rétention relatives à `now()` agissent pour de vrai, et le jeu doit être régénéré avec une fenêtre future (fiche AMONT, étape 4). Le contrôle de l'étape 3 vérifie ce point en plus de la règle rétention > portée.
 
 **La rétention ne supprime rien.**
 Deux causes possibles. Soit le seuil est plus large que la fenêtre du jeu — vérifier qu'on utilise bien les valeurs d'atelier et non celles de production. Soit aucun chunk n'est **entièrement** antérieur à la limite : c'est l'effet de granularité, et il faut le comprendre plutôt que d'élargir le seuil au hasard.

@@ -30,11 +30,19 @@ case "$ALERTE" in
     echo "faite en salle sur l'instance du binôme, pas automatisée ici."
     ;;
   A2)
+    # le job suspendu est celui du rafraîchissement de mistral_1min : son
+    # identifiant dépend du poste (ordre de création des politiques) — il
+    # se résout par requête, jamais codé en dur
+    job=$("${PSQL[@]}" -c "SELECT job_id FROM timescaledb_information.jobs
+                           WHERE proc_name = 'policy_refresh_continuous_aggregate'
+                             AND hypertable_name = 'mistral_1min';")
+    [ -n "$job" ] || { echo "A2 : aucune politique de rafraîchissement sur mistral_1min" >&2; exit 1; }
     avant=$(etat_a2)
-    "${PSQL[@]}" -c "SELECT alter_job(1002, scheduled => false);" > /dev/null
+    "${PSQL[@]}" -c "SELECT alter_job($job, scheduled => false);" > /dev/null
     pendant=$(etat_a2)
-    "${PSQL[@]}" -c "SELECT alter_job(1002, scheduled => true);" > /dev/null
+    "${PSQL[@]}" -c "SELECT alter_job($job, scheduled => true);" > /dev/null
     apres=$(etat_a2)
+    echo "A2 · job suspendu puis réactivé : $job"
     echo "A2 · anomalies : avant=$avant pendant=$pendant apres=$apres (attendu 0/≥1/0)"
     ;;
   A3)
@@ -53,9 +61,24 @@ case "$ALERTE" in
       SELECT round(100.0 * pg_database_size(current_database())
                    / (1024.0*1024*1024*200), 1)
              || ' % d''un volume de 200 Go (déclenche si > 85 %)';"
-    echo "A4 · la tendance se calcule sur l'historique de M7 dans le tableau"
-    echo "de bord ; provocation réelle = remplissage disque, PROSCRITE sur un"
-    echo "poste partagé — vérification par l'expression, documentée."
+    # la tendance se lit dans l'historique tenu en base par le job de
+    # relevé (l15/supervision-taille.sql) : Grafana n'archive rien
+    "${PSQL[@]}" -c "
+      SELECT 'A4 · ' || count(*) || ' relevé(s) sur 24 h, dernier : '
+             || pg_size_pretty(max(octets)) || ', pente : '
+             || coalesce(round(regr_slope(octets, extract(epoch FROM ts)) * 86400 / 1024^2)::text
+                         || ' Mo/jour', 'NULL (moins de 2 relevés)')
+      FROM   supervision_taille WHERE ts >= now() - interval '24 hours';"
+    "${PSQL[@]}" -c "
+      SELECT 'A4 · jours restants au rythme des 24 h : '
+             || coalesce(round(((200.0*1024^3) - o.octets) / nullif(t.pente, 0))::text,
+                         'indéterminé (pente nulle ou NULL)')
+             || ' (déclenche si entre 0 et 7)'
+      FROM (SELECT octets FROM supervision_taille ORDER BY ts DESC LIMIT 1) o,
+           (SELECT regr_slope(octets, extract(epoch FROM ts)) * 86400 AS pente
+            FROM supervision_taille WHERE ts >= now() - interval '24 hours') t;"
+    echo "A4 · provocation réelle = remplissage disque, PROSCRITE sur un poste"
+    echo "partagé — vérification par l'expression (seuil ET tendance), documentée."
     ;;
   *) echo "usage: $0 --alerte A1|A2|A3|A4" >&2; exit 2;;
 esac

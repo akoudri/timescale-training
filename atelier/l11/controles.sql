@@ -10,9 +10,20 @@ SELECT count(*) AS lignes FROM mesures;
 SELECT date_trunc('day', ts) AS jour, count(*) AS n, sum(series_id) AS somme_sid
 FROM   mesures GROUP BY 1 ORDER BY 1;
 
--- Contrôle 3 — échantillonnage : cent lignes comparées champ par champ
--- (l'échantillon est déterministe : mêmes id des deux côtés)
+-- Contrôle 3 — échantillonnage : une centaine de lignes comparées champ
+-- par champ. L'échantillon est déterministe (même hachage des deux côtés,
+-- hashint8 est identique en PG 16 et 17) et RÉPARTI sur toute la fenêtre.
+-- Pourquoi un hachage et pas `id % N = 1` : l'identifiant de la legacy est
+-- structuré (un bloc de 103 680 minutes par série) ; un modulo proche
+-- d'un multiple de la taille de bloc tombe toujours sur les mêmes
+-- séries et les mêmes minutes — cent lignes des deux dernières heures du
+-- dernier jour, et rien de juillet ni d'août. Un échantillon « au hasard »
+-- se vérifie : plage de ts et nombre de séries couvertes.
 SELECT id, ts, series_id, valeur, qualite
 FROM   mesures
-WHERE  id % 414719 = 1
-ORDER  BY id LIMIT 100;
+WHERE  mod(hashint8(id), 414719) = 0
+ORDER  BY id;
+-- couverture de l'échantillon (à lire avant de comparer)
+SELECT count(*) AS lignes, count(DISTINCT series_id) AS series,
+       min(ts), max(ts)
+FROM   mesures WHERE mod(hashint8(id), 414719) = 0;

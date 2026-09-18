@@ -17,11 +17,14 @@ CREATE TABLE mesures (
     series_id INTEGER NOT NULL,
     valeur    DOUBLE PRECISION NOT NULL,
     qualite   SMALLINT NOT NULL DEFAULT 0
-) WITH (
-    tsdb.hypertable,
-    tsdb.partition_column = 'ts',
-    tsdb.chunk_interval   = '7 days'
 );
+-- create_hypertable() et non CREATE TABLE ... WITH (tsdb.hypertable) :
+-- cette dernière forme active la compression ET pose une politique
+-- columnstore par défaut (compress_after 7 jours, relative à now()), qui
+-- basculerait des chunks PENDANT la copie — le piège n° 1 de la fiche.
+SELECT create_hypertable('mesures', by_range('ts', INTERVAL '7 days'));
+-- l'index de M06 : la cible reçoit le schéma complet
+CREATE INDEX mesures_series_id_ts_idx ON mesures (series_id, ts DESC);
 
 CREATE TABLE evenements (
     id         BIGSERIAL,
@@ -34,4 +37,9 @@ CREATE TABLE evenements (
 SELECT create_hypertable('evenements', by_range('ts', INTERVAL '7 days'),
                          migrate_data => true);
 
--- la compression n'est PAS activée : toujours après la bascule (étape 6)
+-- la compression n'est PAS activée : toujours après la bascule (étape 6).
+-- Vérification : les deux requêtes doivent retourner « f » et « 0 ».
+SELECT hypertable_name, compression_enabled
+FROM   timescaledb_information.hypertables ORDER BY 1;
+SELECT count(*) AS politiques_actives
+FROM   timescaledb_information.jobs WHERE job_id >= 1000;
