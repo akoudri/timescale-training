@@ -1,0 +1,114 @@
+L10 — ACTION DE CONTRÔLE QUALITÉ (JOBS) — PROTOCOLE COMMUN (corrigé formateur)
+===============================================================================
+
+Fichiers : l10s1 (étape 1, table de consignation et coupure des capteurs),
+l10s2 (étape 2, l'action et son contrat), l10s3 (étape 3, enregistrer,
+planifier, vérifier), l10s4 (étape 4, l'erreur volontaire et où la
+retrouver + les deux pièges), l10s5 (extensions E1-E4).
+
+-------------------------------------------------------------------------
+1. Ce que l'atelier vérifie
+-------------------------------------------------------------------------
+La tâche métier (détecter les capteurs muets) est un prétexte. Les trois
+choses qui comptent :
+  a) le CONTRAT de signature d'une action — (job_id int, config jsonb) —
+     et le fait que la configuration vit dans la base, pas dans le code :
+     un alter_job change le comportement sans redéploiement ;
+  b) une action se teste par run_job, jamais par CALL direct : le contexte
+     d'exécution d'un job (rôle, search_path, privilèges) n'est pas celui
+     de la session ; et run_job lui-même ne prouve que le CODE, pas la
+     SUPERVISION (voir c) ;
+  c) un job qui échoue NE DIT RIEN : ni journal applicatif, ni table
+     métier. L'échec n'existe que dans timescaledb_information.job_errors
+     — et seulement s'il a été lancé par l'ORDONNANCEUR. Le motif à
+     retenir pour M15 : last_successful_finish figé pendant que
+     last_run_started_at avance.
+
+-------------------------------------------------------------------------
+2. État du poste vérifié le 17/09/2026 (avant L10)
+-------------------------------------------------------------------------
+- Workers : timescaledb.max_background_workers = 8, max_worker_processes
+  = 16 ; 3 processus TimescaleDB actifs (lanceur + un ordonnanceur par
+  base : postgres et mistral). Les jobs peuvent démarrer.
+- Jobs recensés (sortie de L09) : 1000 policy_compression mesures_avant
+  (table de l'utilisateur, hors kit), 1001 policy_compression
+  mesures_charge (vide), 1003/1004/1005 rafraîchissements mistral_1min /
+  1h / 1j (1 min / 10 min / 1 h, tous Success), 1006 policy_compression
+  mesures (7 j, 1 exécution sans effet : jeu daté), 1007 policy_retention
+  mesures (30 j, idem). Sept jobs — la fiche en annonce cinq parce
+  qu'elle ne compte pas les deux politiques par défaut des tables créées
+  avec `tsdb.hypertable` (voir l8s0).
+- `mesures` : 151 612 534 lignes, 24/09 → 29/10 21:59:50 UTC, chunks
+  24/09-22/10 en columnstore, 22/10-05/11 en rowstore. Les 3 dernières
+  heures du jeu sont donc en rowstore : le script de coupure y fait un
+  DELETE ordinaire (en columnstore il compterait dans la limite DML).
+- now() = 17/09/2026 18:11 UTC, 42 jours AVANT max(ts). Conséquence
+  connue de L09 (l9s3) : la politique 1min érode mistral_1min sur la
+  zone purgée ; à 18:15 le niveau 1h avait commencé à en hériter
+  (seau 17/09 17:00 : 174 points au lieu de 360 pour la série 1). Sans
+  effet sur L10 ; à ne pas confondre avec un symptôme de l'atelier.
+- Vues de supervision en 2.29.2 (point ouvert des notes de production,
+  tranché) : timescaledb_information.job_errors (job_id, proc_schema,
+  proc_name, pid, start_time, finish_time, sqlerrcode, err_message) ;
+  job_stats (last_run_started_at, last_successful_finish,
+  last_run_status, job_status, last_run_duration, next_start,
+  total_runs, total_successes, total_failures) ; et job_history (id,
+  job_id, succeeded, config, sqlerrcode, err_message…), qui ne
+  journalise par défaut QUE les échecs (timescaledb.enable_job_execution_
+  logging = off). Les requêtes de la fiche et de l10/inspecter-jobs.sql
+  sont exactes.
+
+-------------------------------------------------------------------------
+3. Corrections du kit apprenant faites le 17/09 (à connaître)
+-------------------------------------------------------------------------
+- Fiche, étape 4 : ajout du `retry_period => INTERVAL '15 seconds'` dans
+  l'alter_job de l'erreur volontaire. Sans lui, l'ordonnanceur ne
+  réessaie qu'au bout de 5 minutes (valeur par défaut) et l'observation
+  « last_run_started_at avance, last_successful_finish non » n'est pas
+  faisable dans les 7 minutes de l'étape. Mesuré : avec 15 s, trois
+  échecs en 45 s (réessais à +13 s, +27 s, puis +50 s : le délai croît).
+- Fiche, pièges : ajout de « la table d'alertes contient deux fois les
+  trois capteurs dès l'étape 3 » — add_job planifie une exécution
+  immédiate, l'ordonnanceur et le run_job forcé détectent tous deux
+  (deux detecte_le à 0,3 s d'écart sur le poste) ; et run_job en session
+  n'incrémente ni total_runs ni job_history.
+- Aucun fichier fourni modifié : alertes-qualite.sql, couper-capteurs.sh
+  (borne en littéral via \gset, commentaire exact) et inspecter-jobs.sql
+  sont corrects.
+
+-------------------------------------------------------------------------
+4. Mesures de référence (env. 2 vCPU / 8 Go) vs poste (17/09/2026)
+-------------------------------------------------------------------------
+                                   référence          poste
+  coupure des capteurs             —                  DELETE 3 240 lignes, 0,1 s
+  job controle_qualite             1006               1008
+  exécution forcée (run_job)       3 capteurs         3 capteurs (137, 208,
+                                                      451), ancienneté 3 h, 25 ms
+  dernier point par série          GROUP BY max(ts)   DISTINCT ON + SkipScan :
+                                                      504 ms vs 3 020 ms (× 6)
+  erreur volontaire                job_errors × 3     job_errors × 3, sqlerrcode
+                                                      22007, total_failures 3,
+                                                      last_successful_finish figé
+  run_job avec config invalide     remonte au client  idem : 0 ligne job_errors
+  reprise après restauration       oui                oui : Success, total_
+                                                      successes 2, échéance
+                                                      recalée sur le pas d'origine
+  E2 (saturation des workers)      non mesurée        5 actions longues saturent
+                                                      (retard 78-90 s sur la
+                                                      politique 1min), 4 non
+
+-------------------------------------------------------------------------
+5. État de sortie mistral-M11 (vérifié)
+-------------------------------------------------------------------------
+- Table alertes_qualite : 3 lignes (137, 208, 451 ; dernier point 29/10
+  18:59:50 ; ancienneté 03:00:00) — ramenée à une seule détection.
+- Procédure controle_qualite(int, jsonb), version socle (non
+  instrumentée : E3 retirée) ; job 1008, scheduled = true, config
+  {"seuil": "1 hour"}, pas 1 h, next_start 19:14 UTC, total_runs 5,
+  total_failures 3 (l'historique de l'étape 4 reste visible dans
+  job_errors — c'est voulu, M15 s'en servira).
+- Les capteurs 137/208/451 restent coupés (3 h manquantes en fin de jeu) :
+  ce sont les « 3 capteurs muets permanents » que L15 retrouve.
+- Jobs 1000-1007 inchangés ; aucun objet des extensions (e1_mesures,
+  purge_site, journal_actions, ecarts_coherence, controle_coherence,
+  dormir) ; index de L05 et les 3 agrégats en place ; 128 Go libres.

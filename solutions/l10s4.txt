@@ -1,0 +1,136 @@
+L10 — ÉTAPE 4 : PROVOQUER UNE ERREUR, ET LA RETROUVER
+======================================================
+
+Fiche : « Introduire une faute volontaire — un seuil qui n'est pas un
+intervalle valide — via alter_job, puis ATTENDRE L'ÉCHÉANCE : c'est
+l'ordonnanceur qui doit exécuter le job. Retrouver la trace dans
+job_errors et job_stats. Deux observations à consigner : rien n'a été
+journalisé côté applicatif, et last_successful_finish ne bouge plus alors
+que last_run_started_at continue d'avancer. Restaurer ensuite une
+configuration valide et vérifier que le job repart. »
+
+-------------------------------------------------------------------------
+1. Contre-exemple d'abord : run_job avec la config invalide
+-------------------------------------------------------------------------
+  SELECT alter_job(1008, config => '{"seuil": "une heure"}'::jsonb,
+                         next_start => now() + INTERVAL '1 hour');  -- loin
+  SELECT count(*) FROM job_errors WHERE job_id = 1008;   → 0
+  CALL run_job(1008);
+    ERROR:  invalid input syntax for type interval: "une heure"
+    CONTEXT: PL/pgSQL function controle_qualite(integer,jsonb) line 3
+             during statement block local variable initialization
+  SELECT count(*) FROM job_errors WHERE job_id = 1008;   → 0
+  job_stats : total_runs 1, total_failures 0, Success  (inchangés)
+
+L'erreur est remontée AU CLIENT, et nulle part ailleurs : ni job_errors,
+ni job_history, ni les compteurs. Un participant qui teste ainsi conclut
+« l'erreur volontaire n'apparaît nulle part » (troisième piège de la
+fiche) — alors qu'elle n'a simplement pas eu lieu dans le contexte qui
+journalise. C'est la troisième observation de la référence
+(l10/observations.md), non documentée dans le support.
+
+-------------------------------------------------------------------------
+2. L'erreur laissée à l'ordonnanceur (résultat du poste)
+-------------------------------------------------------------------------
+  SELECT alter_job(1008, retry_period => INTERVAL '15 seconds',
+                         next_start   => now() + INTERVAL '5 seconds');
+  -- t0 = 18:12:32
+    t+5 s   total_failures 1
+    t+20 s  total_failures 2
+    t+45 s  total_failures 3
+
+  job_errors (job 1008) :
+    start_time  18:12:37.19 | finish 18:12:37.21 | 22007 | invalid input
+    start_time  18:12:50.92 | finish 18:12:50.93 | 22007 |   syntax for type
+    start_time  18:13:17.89 | finish 18:13:17.90 | 22007 |   interval: "une heure"
+  job_history : 3 lignes, succeeded = f, avec la CONFIG fautive en clair
+    ({"seuil": "une heure"}) — utile : on voit ce que le job a reçu.
+  job_stats :
+    last_run_started_at    18:13:17.887   ← avance à chaque essai
+    last_successful_finish 18:12:08.023   ← FIGÉ depuis l'étape 3
+    last_run_status Failed · job_status Scheduled · total_runs 4 ·
+    total_successes 1 · total_failures 3 · next_start 18:14:08
+  alertes_qualite : toujours 6 lignes — rien n'y a été écrit.
+
+Les deux observations attendues, écrites :
+  1. RIEN CÔTÉ APPLICATIF. Les journaux PostgreSQL du conteneur (docker
+     compose logs timescaledb) reçoivent bien la ligne ERROR du worker,
+     mais aucune table métier, aucune notification, aucun état visible
+     depuis l'application ne change. L'échec n'existe, pour qui interroge
+     la base, QUE dans timescaledb_information.job_errors / job_history.
+     C'est là — et pas dans le journal serveur, qu'on ne lit pas en
+     production — qu'il faut savoir chercher sans hésiter.
+  2. last_successful_finish NE BOUGE PLUS (18:12:08) pendant que
+     last_run_started_at AVANCE (18:12:37 → 18:12:50 → 18:13:17) et que
+     total_failures compte. job_status dit toujours « Scheduled » et
+     scheduled = true : le job n'est ni suspendu ni en erreur d'un point
+     de vue catalogue — il « tourne » sans jamais réussir. C'est le motif
+     que l'alerte A2 de M15 (« job sans succès depuis plus de N fois sa
+     période ») détecte, et le SEUL qui le détecte : last_run_status
+     redevient Success au premier essai réussi, et total_failures ne
+     redescend jamais.
+
+Détail utile : les réessais ne sont pas espacés de retry_period mais
+d'un délai croissant (+13 s, +27 s, +50 s ici) — l'ordonnanceur applique
+un recul exponentiel à partir de retry_period. Avec la valeur par défaut
+(5 min), le deuxième échec n'arriverait qu'à t+5 min et le troisième bien
+plus tard : d'où l'ajout du retry_period dans la fiche (l10s0 §3).
+
+-------------------------------------------------------------------------
+3. Réparer, et deux pièges à montrer dans la foulée
+-------------------------------------------------------------------------
+  SELECT alter_job(1008, config => '{"seuil": "1 hour"}'::jsonb,
+                         retry_period => INTERVAL '5 minutes',
+                         next_start => now() + INTERVAL '3 seconds');
+  8 s plus tard : last_run_started_at 18:14:03, last_successful_finish
+  18:14:03 (repart), Success, total_runs 5, total_successes 2,
+  total_failures 3 (n'est jamais remis à zéro), next_start 19:12:07 —
+  l'échéance est RECALÉE SUR LE PAS D'ORIGINE (18:12:07 + 1 h), pas sur
+  l'heure de la réparation : le job reprend sa grille.
+
+Piège « le job s'exécute avec succès mais la table reste vide » :
+  SELECT alter_job(1008, config => '{"seuill": "1 hour"}'::jsonb);  -- clé fautive
+  CALL run_job(1008);
+    NOTICE: controle_qualite job=1008 seuil=<NULL>
+    NOTICE: controle_qualite : 0 capteurs muets       ← Success, 0 ligne
+  `config->>'seuill'` n'existe pas → NULL → `(NULL)::interval` est NULL
+  sans erreur → `d.dernier < reference - NULL` est NULL → personne. Aucun
+  échec, aucune trace : seul le RAISE NOTICE de la première ligne le
+  révèle, et seule une alerte métier (« 0 détection depuis N passages
+  alors qu'on en attend ») le verrait en production. Une action
+  défensive lève une exception si un paramètre obligatoire manque (E1 le
+  fait : `RAISE EXCEPTION 'config incomplète'`).
+
+Piège « le job est resté suspendu après un test » :
+  SELECT alter_job(1008, scheduled => false);
+  jobs      : scheduled f, next_start 19:12:07   ← le catalogue garde la date !
+  job_stats : job_status Paused, next_start NULL, last_run_status Success
+  Aucune erreur, aucun échec : le job cesse d'exister pour l'ordonnanceur.
+  Discriminer sur `scheduled` (jobs) et `next_start` (job_stats), jamais
+  sur last_run_status — c'est le commentaire d'en-tête de
+  l10/inspecter-jobs.sql, et l'incident 1 de L14.
+  SELECT alter_job(1008, scheduled => true, next_start => now() + INTERVAL '1 hour');
+
+-------------------------------------------------------------------------
+4. Formulation attendue au livrable (l10/observations.md)
+-------------------------------------------------------------------------
+Trois phrases, avec les valeurs du poste : (1) l'erreur n'est visible
+que dans job_errors, avec son sqlerrcode et son message, rien côté
+applicatif ; (2) last_successful_finish figé à <h> pendant que
+last_run_started_at avance et total_failures monte, job « Scheduled » —
+le motif de supervision de M15 ; (3) run_job en session remonte l'erreur
+au client et ne journalise rien : la supervision se teste avec
+l'ordonnanceur.
+
+-------------------------------------------------------------------------
+5. Erreurs fréquentes
+-------------------------------------------------------------------------
+- Chercher l'erreur dans `docker compose logs` et conclure « elle y est
+  donc tout va bien » : le journal serveur n'est pas un outil de
+  supervision, la fiche demande OÙ un opérateur SQL la retrouve.
+- Provoquer l'erreur puis lancer run_job « pour aller plus vite » :
+  contre-exemple du §1.
+- Ne pas raccourcir retry_period et conclure au bout de 2 minutes que
+  « le job ne réessaie pas ».
+- Après réparation, s'étonner que total_failures reste à 3 : c'est un
+  cumul, pas un état.

@@ -1,0 +1,121 @@
+L05 — R1 : PRODUCTION HORAIRE PAR SITE, SUR TRENTE JOURS (corrigé)
+====================================================================
+
+Fiche : « Trois défauts à identifier avant de réécrire. Le premier
+concerne le seau, le deuxième la jointure au référentiel, le troisième
+porte sur ce qui manque dans les résultats et que M03 avait pourtant
+traité. Les nommer par écrit avant de toucher au SQL. »
+
+-------------------------------------------------------------------------
+1. Les trois défauts (à écrire AVANT le SQL)
+-------------------------------------------------------------------------
+D1 — LE SEAU : `date_trunc('hour', ts)` au lieu de `time_bucket`.
+  Sur un timestamptz, date_trunc dépend du fuseau de SESSION (ici
+  Etc/UTC dans le conteneur, Europe/Paris sur un poste client configuré
+  autrement) : deux clients obtiennent deux découpages différents de la
+  même table. time_bucket est explicite (largeur, origine, fuseau
+  optionnel), composable (gapfill, agrégats continus de M08) et
+  l'exclusion de chunks le reconnaît. À l'heure, les deux découpages
+  coïncident (les fuseaux entiers sont alignés sur l'heure) : ce défaut ne
+  change ni le résultat ni la durée ICI ; c'est un défaut de forme qui
+  devient un défaut de fond au jour (R2) et au mois (R4).
+
+D2 — LA JOINTURE AU RÉFÉRENTIEL N'EST PAS DATÉE.
+  `af.series_id = m.series_id` ignore `debut` et `fin` de
+  affectation_capteur. Une série réaffectée (capteur remplacé, machine
+  changée — le cas du 12 octobre de L02-E2) produit DEUX lignes par point
+  et l'historique est compté deux fois pour deux machines. Le prédicat
+  correct :
+    m.ts >= af.debut AND (af.fin IS NULL OR m.ts < af.fin)
+  C'est exactement celui de la vue `mesures_production` de M03.
+  Sur ce poste : aucune ligne de affectation_capteur n'a de `fin`
+  (l'extension E2 de L02 n'a pas été jouée) → le prédicat daté ne change
+  pas le nombre de lignes. Le dire dans le rapport : « sans effet sur ce
+  jeu, obligatoire en production ».
+
+D3 — CE QUI MANQUE : LE FILTRE SUR LE SIGNAL.
+  `sum(m.valeur)` additionne TOUTES les séries de la machine : puissance
+  (kW), énergie cumulée (kWh), températures (°C), vitesse rotor (tr/min),
+  angle de pale (°), tension (V)… La « production » est une somme
+  d'unités incompatibles, physiquement absurde. M03 avait traité ce point
+  par la vue `mesures_production` (famille de signaux via `signaux`).
+  Réécriture : joindre `signaux` et filtrer `libelle = 'puissance_kw'`
+  (ou lire la vue). C'est ce filtre — 42 séries sur 490 — qui apporte
+  l'essentiel du gain : 11 fois moins de lignes à agréger après la
+  jointure.
+
+-------------------------------------------------------------------------
+2. Requête après (l05/apres/R1.sql)
+-------------------------------------------------------------------------
+-- Nœud responsable du gain : Hash Join sur (affectation_capteur ⋈
+-- signaux[puissance_kw] ⋈ actifs) — la table de hachage ne contient plus
+-- que 42 séries, le HashAggregate reçoit 11 × moins de lignes. L'exclusion
+-- de chunks jouait déjà (ChunkAppend, 5-6 chunks sur 8) : gain modeste.
+SELECT a.site_id,
+       time_bucket(INTERVAL '1 hour', m.ts) AS heure,
+       sum(m.valeur)                        AS production_kw
+FROM   mesures m
+JOIN   affectation_capteur af
+  ON   af.series_id = m.series_id
+ AND   m.ts >= af.debut AND (af.fin IS NULL OR m.ts < af.fin)
+JOIN   signaux g ON g.signal_id = af.signal_id AND g.libelle = 'puissance_kw'
+JOIN   actifs  a ON a.machine_id = af.machine_id
+WHERE  m.ts >= :'fin'::timestamptz - INTERVAL '30 days' AND m.ts < :'fin'
+GROUP  BY 1, 2;
+
+Variante acceptable : `FROM mesures_production mp JOIN actifs a USING
+(machine_id) … sum(mp.puissance_kw)` — même plan, même résultat ; la vue
+est faite pour ça. Nommer la colonne `production_kw` (ou diviser par 360
+pour des kWh) : le résultat est une somme de puissances instantanées,
+pas une énergie.
+
+-------------------------------------------------------------------------
+3. Les plans, et pourquoi le gain est modeste
+-------------------------------------------------------------------------
+AVANT (plan relevé sur ce poste, 8 chunks de 7 j) :
+  Finalize GroupAggregate
+    InitPlan : max(ts) par ChunkAppend + Index Only Scan (ts DESC) — rapide
+    Gather Merge → Sort → Partial HashAggregate
+      Hash Join (m.series_id = af.series_id)        ← 490 séries, pas de filtre
+        Parallel ChunkAppend on mesures
+          « Chunks excluded during startup: 0 »… mais seuls les chunks
+          couvrant les 30 derniers jours sont lus (Bitmap Heap Scan sur
+          l'index ts) : l'EXCLUSION JOUE DÉJÀ, via le sous-plan max(ts).
+        Hash ← affectation_capteur ⋈ actifs
+
+APRÈS :
+  même squelette ; deux différences à pointer :
+  - la borne est une CONSTANTE (:'fin' - 30 days) : les chunks hors
+    fenêtre sont exclus à la PLANIFICATION (6 chunks listés sur 8, plus de
+    sous-plan max(ts)) au lieu du démarrage ;
+  - la table de hachage vient de affectation_capteur ⋈ signaux
+    (Filter: libelle = 'puissance_kw') ⋈ actifs : 42 lignes ; le Hash Join
+    ne laisse passer que les points de puissance.
+  Le Join Filter daté (ts >= debut AND …) apparaît dans le plan : le
+  montrer, c'est prouver D2.
+
+Pourquoi × 3,6 seulement : la lecture des chunks (Bitmap/Seq Scan sur
+~130 M de lignes de 30 jours) domine et ne change pas ; on économise
+l'agrégation de 448 séries sur 490, pas la lecture. Le vrai gain de R1
+viendra de M08 : un agrégat continu horaire par site lit 720 lignes par
+site au lieu de 130 M. Le consigner comme un résultat, pas un échec.
+
+-------------------------------------------------------------------------
+4. Formulation attendue dans mesures.md §M06 (exemple)
+-------------------------------------------------------------------------
+  R1 : 36 224 → 10 011 ms, × 3,6. Nœud : le Hash Join ne reçoit plus que
+  42 séries (filtre puissance_kw) ; exclusion de chunks déjà active avant
+  (borne max(ts) − 30 j). Jointure datée sans effet sur ce jeu (aucune
+  réaffectation), obligatoire en production. Résultat AVANT faux
+  (somme kW + kWh + °C + tr/min) : le gain de vitesse est un
+  sous-produit de la correction de justesse.
+
+Erreurs fréquentes :
+- mettre le gain sur le compte de time_bucket (aucun effet à l'heure) ;
+- « l'exclusion de chunks a fait le gain » : elle jouait déjà avant, le
+  plan avant le montre (chunks lus = ceux des 30 derniers jours) ;
+- oublier D3 et livrer une somme d'unités mélangées, plus vite ;
+- écrire `m.ts > max(ts) - 30 days` avec now() ou current_date : le jeu
+  est daté, la requête ne retourne rien ;
+- borner avec `:'debut'` au lieu de `:'fin' - 30 days` : la fenêtre
+  devient 45 jours et les rapports ne sont plus comparables.

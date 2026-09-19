@@ -1,0 +1,96 @@
+L07 — ÉTAPE 1 : LE NIVEAU MINUTE, ET LA DÉCISION QUI ENGAGE LA SUITE
+======================================================================
+
+Fiche : « Les quatre indicateurs à porter dans la pyramide sont
+l'énergie produite, la puissance moyenne, la puissance maximale et le
+nombre de points. Pour chacun, décider ce qui est stocké au niveau
+minute. »
+
+-------------------------------------------------------------------------
+1. La décision, indicateur par indicateur (à écrire AVANT le SQL)
+-------------------------------------------------------------------------
+  Indicateur demandé        Stocké au niveau minute     Lu / réagrégé par
+  Énergie produite          sum(valeur) → somme         sum(somme) / 360
+                            (kW × 10 s / 3600 : l'énergie SE DÉRIVE de la
+                            somme ; une colonne energie serait redondante
+                            et se réagrégerait pareil)
+  Puissance moyenne         somme ET count(*) → points  sum(somme) / sum(points)
+                            (JAMAIS avg : une moyenne ne remonte pas)
+  Puissance maximale        max(valeur) → maximum       max(maximum)
+  Nombre de points          count(*) → points           sum(points)
+
+Trois colonnes stockées (somme, points, maximum) servent les quatre
+indicateurs. Règle du bloc 7.2 : au niveau bas on stocke l'ÉTAT dont
+l'indicateur se déduit (somme et compte pour une moyenne, max pour un
+max, sketch pour un percentile — E4), pas l'indicateur.
+
+Pourquoi avg() condamne la pyramide : le niveau heure ne disposerait que
+de 60 moyennes de minute. avg(moyenne) donne le même poids à une minute
+de 6 points et à une minute de 1 point (arrêt de maintenance de L06,
+retard de L04, interruption de L05 R3) : c'est la moyenne de moyennes
+d'E1 de L06, fausse dès que le pas n'est pas régulier — et rien ne le
+signale, le chiffre est plausible. Avec somme et points, l'heure
+recalcule EXACTEMENT la moyenne sur les points bruts.
+
+-------------------------------------------------------------------------
+2. Requête attendue (agregats.sql, partie 1)
+-------------------------------------------------------------------------
+-- Aucune moyenne stockée : somme, compte, maximum sont réagrégeables ;
+-- moyenne = somme/points à la lecture, énergie = somme/360.
+CREATE MATERIALIZED VIEW mistral_1min
+WITH (timescaledb.continuous) AS
+SELECT time_bucket(INTERVAL '1 minute', ts) AS seau,
+       series_id,
+       sum(valeur)  AS somme,
+       count(*)     AS points,
+       max(valeur)  AS maximum
+FROM   mesures
+GROUP  BY 1, 2
+WITH NO DATA;
+
+CALL refresh_continuous_aggregate('mistral_1min', NULL, NULL);
+
+Pas de jointure au référentiel dans l'agrégat : `series_id` suffit, le
+libellé du signal et la machine se joignent à la lecture (les quatre
+requêtes du tableau de bord le font). Une jointure dans la définition
+figerait le référentiel dans la matérialisation.
+
+Pourquoi WITH NO DATA puis CALL : la création avec données matérialise
+dans la transaction du CREATE (verrou, pas de reprise) ; le CALL hors
+transaction fait la même chose par lots. Sur la référence : 4 min 07
+pour 31,7 M de lignes (190 M lues). Le lancer, puis lire l'étape 2.
+
+-------------------------------------------------------------------------
+3. Ce qu'il faut vérifier après la matérialisation
+-------------------------------------------------------------------------
+  SELECT count(*), min(seau), max(seau) FROM mistral_1min;
+  -- ≈ 31,7 M lignes (490 séries × 45 j × 1 440 min, moins les trous et
+  -- les arrêts à pas horaire), 14/09 22:00 → 29/10 21:59 UTC.
+  SELECT view_name, materialized_only
+  FROM   timescaledb_information.continuous_aggregates;
+  -- materialized_only = true par défaut en 2.29 : PAS d'agrégation temps
+  -- réel. Le même réglage sur les trois niveaux (piège « le temps réel
+  -- fausse la comparaison »).
+
+Interroger `mistral_1min` directement : c'est une vue sur la table de
+matérialisation interne (`_timescaledb_internal._materialized_hypertable_N`),
+elle-même une hypertable (chunks, politiques possibles — M09/M10).
+
+-------------------------------------------------------------------------
+4. Erreurs fréquentes
+-------------------------------------------------------------------------
+- `avg(valeur) AS moyenne` : la faute cible. Se voit à l'étape 2 quand
+  le niveau heure ne peut que faire avg(moyenne), et au contrôle de
+  somme si le participant a stocké la moyenne SANS le compte.
+- `sum(valeur) / 360 AS energie` en plus de `somme` : pas faux, redondant
+  (errata du support : l'exemple `mistral_1h` référençait une colonne
+  `energie` jamais définie).
+- `count(valeur)` au lieu de `count(*)` : identique ici (valeur NOT
+  NULL), à savoir en général.
+- Créer l'agrégat WITH DATA sur 190 M de lignes : plusieurs minutes dans
+  une transaction, interruption = tout à refaire.
+- Interrompre le CALL parce qu'il « semble bloqué » (piège) : il
+  traite les 190 M de lignes en lots, compter 4 à 6 minutes sur ce poste.
+- time_bucket avec fuseau au niveau minute : inutile (seau ≤ 1 h) et
+  interdit au niveau bas si les niveaux hauts n'utilisent pas le même
+  fuseau (alignement des seaux).

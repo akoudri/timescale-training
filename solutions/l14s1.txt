@@ -1,0 +1,87 @@
+L14 — ÉTAPE 1 : LIRE LES SYMPTÔMES, LES REFORMULER SANS HYPOTHÈSE
+===================================================================
+
+Fiche : « Reformuler chacun en symptôme exploitable : ce qui est observé,
+sur quel périmètre, depuis quand — sans encore supposer de cause. »
+
+-------------------------------------------------------------------------
+1. Ce que l'étape vérifie
+-------------------------------------------------------------------------
+Que le binôme sépare l'OBSERVATION de l'INTERPRÉTATION avant de toucher à
+quoi que ce soit. Un ticket d'utilisateur mélange les deux (« depuis ce
+matin », « avant-hier c'était instantané », « rien n'a été déployé ») ;
+la reformulation garde les faits et jette les suppositions — y compris
+celles de l'utilisateur, qui sont souvent fausses (« rien n'a été
+déployé » est une affirmation, pas un fait vérifié).
+
+Le piège de la fiche : « le symptôme reformulé contient déjà la cause ».
+« Le job de rafraîchissement ne tourne plus » N'EST PAS un symptôme,
+c'est l'hypothèse 1. Le symptôme est « les valeurs affichées n'évoluent
+plus depuis N heures sur le périmètre P ».
+
+-------------------------------------------------------------------------
+2. Les deux tickets (l14/symptomes.md)
+-------------------------------------------------------------------------
+Ticket 1 — « Le tableau de bord du site 2 n'a pas bougé depuis ce matin.
+             Les autres écrans ont l'air normaux. »
+Ticket 2 — « L'écran "état du parc" met sept ou huit secondes à
+             s'afficher. Avant-hier c'était instantané. Rien n'a été
+             déployé. »
+
+-------------------------------------------------------------------------
+3. Reformulation attendue
+-------------------------------------------------------------------------
+INCIDENT 1
+  Observé   : les valeurs affichées par le tableau de bord du site 2
+              n'évoluent plus (elles sont figées, elles ne sont pas
+              fausses ni absentes).
+  Périmètre : l'écran du site 2 — c'est-à-dire, en L15, les panneaux
+              alimentés par les agrégats cloisonnés (mistral_1min_site /
+              1h_site) sous mistral.site = 2. « Les autres écrans ont
+              l'air normaux » est un ressenti, pas une mesure : le
+              périmètre RÉEL est à établir par requête (un écran qui
+              n'affiche que des totaux journaliers peut paraître normal
+              alors que le niveau minute est figé pour tous les sites).
+  Depuis    : « ce matin » — quelques heures ; l'heure du dernier
+              rafraîchissement visible est le premier chiffre à relever.
+  Ce qu'on NE dit PAS : « le job est arrêté », « le collecteur du site 2
+  est en panne », « c'est le cloisonnement de L13 ». Ce sont les trois
+  hypothèses de l'étape 2, dans cet ordre de coût.
+
+INCIDENT 2
+  Observé   : l'écran « état du parc » — la dernière valeur de chaque
+              capteur, la requête R5 de M06 — répond en 7 à 8 s au lieu
+              d'un temps sub-seconde (référence tenue : ~120 ms en M06).
+  Périmètre : cette requête seulement ; les autres écrans ne sont pas
+              cités comme lents (à vérifier : R2/R3 répondent-elles
+              normalement ? si oui, ce n'est pas une saturation globale).
+  Depuis    : « avant-hier » — deux jours ; c'est compatible avec un
+              changement de structure, pas avec un pic de charge ponctuel.
+  Ce qu'on NE dit PAS : « c'est la compression » (l'hypothèse réflexe
+  dès qu'une lecture ralentit), « il manque un index », « la base a
+  grossi ». « Rien n'a été déployé » se vérifie (inventaire), il ne se
+  croit pas.
+
+-------------------------------------------------------------------------
+4. Sur ce poste (jeu daté) — ce que les tickets recouvrent réellement
+-------------------------------------------------------------------------
+Le jeu MISTRAL est daté (dernier point 29/10/2026 21:59:50 UTC, séance
+le 17/09/2026). Pour que « n'a pas bougé depuis ce matin » soit
+observable, le formateur a injecté une heure de points « du matin »
+(1 800 points, cinq séries du site 2, qualite 2, 22:00 → 22:59:50 UTC le
+29/10) APRÈS avoir suspendu le rafraîchissement : le brut avance, le
+niveau minute reste à 21:59. C'est exactement le symptôme du ticket 1, à
+l'échelle du jeu. Voir l14s0 §2 pour l'injection complète.
+
+-------------------------------------------------------------------------
+5. Erreurs fréquentes
+-------------------------------------------------------------------------
+- Reformuler le ticket 1 en « les agrégats du site 2 ne se rafraîchissent
+  plus » : c'est déjà la cause. Le ticket parle d'un ÉCRAN.
+- Prendre « les autres écrans ont l'air normaux » pour un fait établi et
+  restreindre le périmètre au site 2 : la suspension du job touche tous
+  les sites ; le ticket dit « site 2 » parce que c'est l'écran que
+  l'utilisateur regarde.
+- Sauter l'étape et lancer directement six requêtes : la fiche l'interdit
+  (« Six requêtes sont lancées d'affilée ») — chaque hypothèse s'écrit
+  AVANT sa requête.

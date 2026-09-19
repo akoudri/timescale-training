@@ -1,0 +1,175 @@
+L12 — EXTENSIONS E1 À E4
+=========================
+
+-------------------------------------------------------------------------
+E1 — Le dump logique face aux chunks compressés (fait, base jetable)
+-------------------------------------------------------------------------
+Montage : base `e1_src` — hypertable `m` (chunks d'un jour, 3 jours,
+25 920 lignes), 2 chunks compressés (segmentby series_id), politique de
+compression 7 j, agrégat continu `m_1h` (72 lignes) avec sa politique.
+`pg_dump -Fc` : 257 Ko (avertissement pg_dump sur des clés étrangères
+circulaires dans `continuous_agg` — bénin, mais à connaître).
+
+a) Restauration SANS `timescaledb_pre_restore()` / `post_restore()` :
+   pg_restore: error: COPY failed for table "_hyper_1_3_chunk":
+     ERROR: could not find hypertable with id 1
+   pg_restore: warning: errors ignored on restore: 1
+   Résultat : `m` est TOUJOURS une hypertable, 3 chunks, 2 compressés
+   lisibles (17 280 lignes < 03/01), politiques présentes (2 jobs),
+   agrégat présent (72 lignes)… et 17 280 lignes sur 25 920. Le chunk
+   ROWSTORE est vide : 8 640 lignes perdues, UNE ligne d'erreur
+   « ignorée » dans un flot de sortie, aucune erreur SQL ensuite.
+   Pourquoi : le catalogue de l'extension (_timescaledb_catalog.*) est
+   dans le dump — c'est pour cela que hypertables, jobs et agrégats
+   reviennent — mais pendant le COPY du chunk, le déclencheur d'insertion
+   de l'hypertable est actif et consulte un catalogue pas encore chargé
+   (ordre du TOC : les données des chunks avant celles du catalogue).
+   Les chunks compressés passent parce que leur table interne n'a pas ce
+   déclencheur. Ce n'est PAS le symptôme décrit par le slide 13.1
+   (« les hypertables deviennent des tables ordinaires ») : en 2.29 le
+   mode de défaillance est plus sournois — tout est là sauf une partie
+   des données.
+
+b) Avec les deux appels :
+     SELECT timescaledb_pre_restore();   -- désactive les déclencheurs
+     pg_restore -d e1_avec /tmp/e1.dump
+     SELECT timescaledb_post_restore();  -- les réactive, relance l'ordonnanceur
+   → 25 920 lignes, 3 chunks, jobs, agrégat : tout est intact.
+   Deux détails vécus : sur l'image timescaledb-ha, `timescaledb` est
+   déjà dans template1 — un `CREATE EXTENSION timescaledb` avant
+   pre_restore échoue (« already exists ») et, enchaîné dans le même
+   `-c`, empêche pre_restore de s'exécuter : on retombe dans le cas a)
+   sans s'en apercevoir. Et la politique de compression restaurée (7 j,
+   données de janvier) s'est exécutée dans la minute : après restauration
+   le 3ᵉ chunk est compressé aussi (3/3). Les politiques repartent telles
+   quelles, avec leur horloge — à anticiper.
+
+Leçon à formuler : la restauration physique (socle) ramène tout parce
+qu'elle ignore ce que sont les objets ; la restauration logique doit être
+encadrée parce que l'extension a un catalogue ET des déclencheurs. Le
+contrôle n° 1 de la checklist (count exact) est le seul qui aurait vu la
+perte de a).
+
+-------------------------------------------------------------------------
+E2 — Monter l'extension (fait, base jetable dans la même instance)
+-------------------------------------------------------------------------
+L'image timescaledb-ha:pg17 embarque les bibliothèques 2.17.0 → 2.29.2
+(timescaledb-<v>.so, -tsl-<v>.so) et 2 094 scripts d'extension : le
+chargeur `timescaledb.so` préchargé choisit la bibliothèque de la version
+INSTALLÉE DANS LA BASE. Pas besoin d'un conteneur jetable.
+
+  CREATE DATABASE e2 TEMPLATE template0;   -- template1 contient déjà 2.29.2
+  CREATE EXTENSION timescaledb VERSION '2.28.3';
+  → pg_available_extensions : default_version 2.29.2, installed_version 2.28.3
+  hypertable + politique de compression créées en 2.28.3.
+
+Session A (a déjà interrogé une hypertable) :
+  ALTER EXTENSION timescaledb UPDATE;
+  ERROR: extension "timescaledb" cannot be updated after the old version
+         has already been loaded
+  HINT: Start a new session and execute ALTER EXTENSION as the first
+        command. Make sure to pass the "-X" flag to psql.
+  (-X : ne pas lire ~/.psqlrc, qui pourrait toucher l'extension avant.)
+Session B (neuve, UPDATE en première commande) : OK ; dans la même
+  session, pg_extension dit 2.29.2, hypertables et jobs visibles.
+Session C (reconnexion) : installed_version 2.29.2, 1 hypertable, job
+  1000 policy_compression, 1 440 lignes.
+
+Ce que la fiche veut faire observer « après reconnexion » : une session
+ouverte AVANT la mise à jour garde l'ancienne bibliothèque chargée
+jusqu'à sa fermeture — elle voit le nouveau catalogue avec l'ancien code.
+D'où la règle : montée de version de l'extension = fenêtre où toutes les
+sessions (pool applicatif compris) sont recyclées. `\dx` lit
+pg_extension, `installed_version` aussi ; ce qui change à la reconnexion,
+c'est le code chargé, pas ce que disent les vues.
+
+-------------------------------------------------------------------------
+E3 — Le chemin de montée : 2.21 / PG 15 → 2.29 / PG 17 (procédure)
+-------------------------------------------------------------------------
+Règles qui dictent l'ordre :
+  R1  pg_upgrade exige la MÊME version d'extension installée dans l'ancien
+      et le nouveau cluster (les scripts de l'extension ne s'exécutent pas
+      pendant pg_upgrade).
+  R2  Une version d'extension n'est supportée que sur certaines majeures
+      de PostgreSQL : 2.21 supporte PG 15/16/17 ; 2.29 supporte PG 16/17/18
+      (à vérifier sur la matrice de compatibilité de la version cible le
+      jour J — c'est la ligne qui change).
+  R3  Le chargeur (shared_preload_libraries) et les bibliothèques de la
+      version cible doivent être installés sur l'hôte AVANT tout ALTER
+      EXTENSION ; l'UPDATE se fait en première commande d'une session
+      neuve (E2).
+  R4  Chaque étape irréversible est précédée d'une sauvegarde de base
+      (physique) — un dump logique ne suffit pas comme repli d'une
+      montée de majeure (E1) ; on ne descend pas de version.
+
+Chemin (une page) :
+  0. Inventaire : `SELECT extversion`, `SHOW server_version`,
+     `pg_available_extension_versions`, liste des hypertables, jobs,
+     agrégats ; contrôle de somme L07 ; instantané pg_stat_statements (E4).
+  1. Sauvegarde de base + archivage vérifié (étape 1 de ce lab).
+  2. Montée de l'extension SUR PG 15 : installer les paquets 2.29 pour
+     PG 15 — si 2.29 n'est pas supporté sur PG 15 (R2), monter d'abord
+     vers la version la plus haute commune à PG 15 et PG 17 (ex. 2.2x),
+     par ALTER EXTENSION UPDATE TO '<v>' de proche en proche (chaque
+     script intermédiaire existe et s'enchaîne : 2 094 scripts dans
+     l'image). Pourquoi pas sauter : pg_upgrade (étape 4) exige la même
+     version des deux côtés (R1), et le nouveau cluster ne peut pas
+     recevoir une version que PG 15 ne supporte pas.
+     Sauvegarder avant : oui (R4). Vérifier après reconnexion.
+  3. Préparer le cluster PG 17 : paquets PostgreSQL 17 + timescaledb de la
+     MÊME version qu'en 2, shared_preload_libraries, conf.d, `pg_upgrade
+     --check`. Pourquoi pas sauter : --check détecte les extensions
+     manquantes et les incompatibilités de tablespace/locale avant
+     l'arrêt de service.
+  4. pg_upgrade (--link si même système de fichiers : minutes ; sinon
+     copie : proportionnel au volume, cf. étape 5). Arrêt de service.
+     Pourquoi pas sauter : c'est la montée de majeure elle-même ; les
+     chunks columnstore sont des tables ordinaires pour pg_upgrade, ils
+     passent tels quels. Sauvegarde avant : la sauvegarde de base de 1
+     est encore valable si aucune écriture n'a eu lieu ; sinon la
+     reprendre. Après : `vacuumdb --analyze-in-stages`, les statistiques
+     ne sont pas migrées.
+  5. Montée de l'extension SUR PG 17 vers 2.29 : ALTER EXTENSION UPDATE
+     en session neuve, puis recyclage de toutes les sessions. Pourquoi
+     pas sauter : les nouveautés (columnstore, invalidations) ne sont
+     actives qu'après ; et la version installée doit être supportée par
+     PG 17 (R2) — 2.2x l'est encore, on n'est pas pressé.
+  6. Vérification : catalogue (extversion = 2.29.x), hypertables
+     intactes, jobs planifiés avec next_start, contrôle de somme L07,
+     comparaison des plans (E4), nouvelle sauvegarde de base (nouvelle
+     timeline et nouveau cluster : l'ancienne ne vaut plus rien).
+  Repli : jusqu'à 4 inclus, remettre l'ancien cluster (pg_upgrade sans
+  --link le laisse intact ; avec --link, seule la sauvegarde de 1 permet
+  de revenir). Après 5, pas de retour : les scripts de descente existent
+  pour les mineures (2.29.2→2.29.1 est dans l'image) mais pas entre
+  majeures de l'extension.
+
+-------------------------------------------------------------------------
+E4 — Les plans avant et après (fait, autour du redémarrage du nettoyage)
+-------------------------------------------------------------------------
+Méthode : `pg_stat_statements_reset()`, exécuter 3 fois R1 (dernier point,
+DISTINCT ON) et R2 (fenêtre 3 jours, agrégation horaire), relever
+queryid, calls, mean/min, blocs ; `EXPLAIN (COSTS OFF)` de R1. Redémarrer
+(ici : le redémarrage du nettoyage tient lieu de « montée de version »).
+Refaire.
+
+                      avant redémarrage        après
+  R1 queryid -678024341323882254 : 3 appels, moy 233,6 ms (min 23,0)
+                                              moy 39,1 ms (min 22,3)
+     blocs lus 59 900                          59 900
+  R2 queryid -451982181114438450 : moy 2 712 ms (min 2 392)
+                                              moy 2 397 ms (min 2 292)
+     blocs 38 479 725                          38 479 725
+  Plan R1 : identique — Unique → Merge Append → SkipScan sur chaque chunk ;
+  ColumnarScan + index `_compressed_series_id__ts_meta_v2_first_ts_idx`
+  sur les 4 chunks columnstore, index (series_id, ts DESC) sur les 2
+  chunks rowstore.
+
+Lecture : les moyennes bougent (cache froid après restauration puis
+chaud), les blocs lus et les plans ne bougent pas — donc pas de
+régression. C'est le critère à retenir pour M15 : comparer les PLANS et
+les BLOCS (grandeurs stables), pas les durées (bruit de cache). Le
+queryid, stable entre sessions, est la clé de jointure entre les deux
+instantanés ; un plan qui change après une montée de version avec les
+mêmes blocs… ne se voit que par l'EXPLAIN, d'où l'intérêt de le capturer
+pour les requêtes critiques (celles de M06) avant chaque montée.

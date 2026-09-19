@@ -1,0 +1,119 @@
+L07 — ÉTAPE 4 : MESURER LE GAIN (+ E1, E2)
+============================================
+
+Fiche : « Consigner les quatre gains. Réussi si le tableau de bord passe
+sous la seconde. Sinon, vérifier d'abord si les quatre requêtes lisent
+réellement le bon niveau. »
+
+-------------------------------------------------------------------------
+1. Protocole (kit corrigé le 17/09)
+-------------------------------------------------------------------------
+  ./mesure.sh l07/tableau-de-bord.sql          --bornes complet   # brut
+  ./mesure.sh l07/tableau-de-bord-pyramide.sql --bornes complet   # à écrire
+Le fichier pyramide est à ÉCRIRE par le participant : brancher chaque
+requête sur le niveau adapté à sa granularité. Les deux fichiers doivent
+retourner les MÊMES lignes (vérifier sur Q2 et Q4 avant de mesurer : un
+gain sur un résultat différent n'est pas un gain).
+
+-------------------------------------------------------------------------
+2. Le branchement attendu (l07/tableau-de-bord-pyramide.sql)
+-------------------------------------------------------------------------
+  Requête                              Niveau   Pourquoi
+  Q1 puissance moyenne / heure, 7 j    1h       granularité heure ; sum(somme)/sum(points)
+  Q2 énergie / jour Paris, 45 j        1j       granularité jour, fuseau déjà porté ; sum(somme)/360
+  Q3 max par machine, 30 j             1h       max(maximum) ; 1j irait aussi (30 j = 30 seaux),
+                                                1h reste exact et plus fin pour une fenêtre glissante
+  Q4 points / jour, toutes séries      1j       sum(points), pas count(*)
+
+-- Q1 (1h)
+SELECT a.seau AS heure, sum(a.somme) / sum(a.points) AS kw
+FROM   mistral_1h a
+JOIN   affectation_capteur af ON af.series_id = a.series_id
+JOIN   signaux g ON g.signal_id = af.signal_id AND g.libelle = 'puissance_kw'
+WHERE  a.seau >= :'fin'::timestamptz - interval '7 days' AND a.seau < :'fin'
+GROUP  BY 1 ORDER BY 1;
+-- Q2 (1j) : SELECT a.seau AS jour, sum(a.somme) / 360.0 AS kwh FROM mistral_1j a
+--           JOIN … puissance_kw GROUP BY 1 ORDER BY 1;
+-- Q3 (1h) : SELECT af.machine_id, max(a.maximum) AS kw_max FROM mistral_1h a
+--           JOIN … puissance_kw WHERE a.seau >= :'fin'::timestamptz - interval '30 days'
+--           AND a.seau < :'fin' GROUP BY 1 ORDER BY 2 DESC LIMIT 10;
+-- Q4 (1j) : SELECT seau AS jour, sum(points) AS points FROM mistral_1j GROUP BY 1 ORDER BY 1;
+
+Pièges de branchement :
+- Q1 avec `avg(somme / points)` : moyenne des moyennes horaires par
+  série — fausse dès qu'une série a moins de points qu'une autre
+  (arrêts) ; sum/sum est exacte ;
+- Q1 sur mistral_1min : 490 × 10 080 lignes au lieu de 490 × 168 —
+  juste, mais 60 × plus lent ; Q2 sur 1min ou 1h : 60 à 1 440 × ;
+- Q4 avec `count(*)` sur 1j : compte des séries (490), pas des points ;
+- Q2 en recalculant time_bucket('1 day', seau, 'Europe/Paris') sur 1j :
+  inutile, seau EST le jour de Paris.
+
+-------------------------------------------------------------------------
+3. Lecture des mesures
+-------------------------------------------------------------------------
+Référence : brut 26 099 ms → pyramide 109 ms, × 239. Sur le brut, Q2
+(190 M de lignes) domine ; sur la pyramide, la jointure au référentiel
+et la lecture de 22 050 lignes (1j) + 82 320 (1h, 7 j) dominent : tout
+est en cache, ~100 ms pour les quatre. Le nœud responsable : les Seq
+Scan / ChunkAppend sur `mesures` ont disparu, remplacés par des
+parcours des tables de matérialisation (_materialized_hypertable_N),
+190 M → 100 000 lignes lues.
+
+Mesures du poste de l'utilisateur : à reporter (brut et pyramide, puis
+si possible les quatre requêtes séparément : Q2 brut vaut à elle seule
+la majorité du temps).
+
+Dans mesures.md §M08 :
+  Tableau de bord : brut 26 099 ms → pyramide 109 ms (× 239, sous la
+  seconde ✓). Q1/Q3 sur 1h, Q2/Q4 sur 1j. Lignes identiques vérifiées.
+
+-------------------------------------------------------------------------
+4. E1 — la pyramide en vaut-elle le coût ?
+-------------------------------------------------------------------------
+  CREATE MATERIALIZED VIEW cmp_1j_direct WITH (timescaledb.continuous) AS
+  SELECT time_bucket('1 day', ts, 'Europe/Paris') AS seau, series_id,
+         sum(valeur) AS somme, count(*) AS points, max(valeur) AS maximum
+  FROM mesures GROUP BY 1, 2 WITH NO DATA;
+  CALL refresh_continuous_aggregate('cmp_1j_direct', NULL, NULL);   -- chronométrer
+
+Trois grandeurs à comparer :
+  Rafraîchissement complet : direct ≈ le temps de lire 190 M de lignes
+    (≈ 3-4 min, comme le 1min : la lecture domine, la sortie est
+    négligeable) ; pyramide = 4 min 07 + 18 s + 0,6 s. Équivalent.
+  Incrémental après 1 h de données (4,2 M de points) : direct relit
+    4,2 M de lignes ; pyramide : 1min relit 4,2 M, puis 1h lit 29 400
+    lignes de 1min, 1j en lit 490. Équivalent aussi : le coût est
+    toujours la lecture du brut par le niveau bas.
+  Volume : pyramide ≈ 4 Go (1min : 31,7 M lignes non compressées) + 1h
+    + 1j négligeables ; direct : 22 050 lignes, quelques Mo.
+Le critère qui décide n'est donc PAS le coût de rafraîchissement, c'est
+l'USAGE : un niveau ne se justifie que s'il est LU à sa granularité
+(Q1 et Q3 ont besoin de 1h ; personne ne lit 1min dans le tableau de
+bord → sur MISTRAL, le niveau minute existe pour servir le 1h, et son
+coût en volume est le prix d'un rattrapage borné et d'une matérialisation
+incrémentale rapide du 1h). La pyramide cesse d'être rentable dès qu'un
+niveau n'a pas de lecteur ; à volume constant, la parade est de
+compresser le niveau bas (M10 : le 1min compressé, sujet de L08 E2).
+Réponse courte : « autant de niveaux qu'il y a de granularités LUES,
+pas un de plus ; le niveau bas se compresse. »
+
+-------------------------------------------------------------------------
+5. E2 — le coût du temps réel
+-------------------------------------------------------------------------
+En 2.29, materialized_only = true par défaut : le temps réel est DÉJÀ
+désactivé. L'expérience est donc à l'envers de la fiche : l'ACTIVER sur
+le jour, mesurer, puis le désactiver.
+  ALTER MATERIALIZED VIEW mistral_1j SET (timescaledb.materialized_only = false);
+Sans écriture nouvelle : aucune différence mesurable. Le temps réel
+ajoute au résultat matérialisé l'agrégation À LA VOLÉE du brut situé
+APRÈS le seuil de matérialisation (watermark = fin du dernier refresh) ;
+sur un jeu daté et entièrement matérialisé, cette partie est vide.
+Avec l'injecteur de M05 en arrière-plan (points au-delà de max(ts)) :
+chaque exécution de Q2/Q4 doit agréger le brut arrivé depuis le dernier
+refresh — quelques secondes de données à 60 000 pts/s, puis des minutes
+: l'écart se creuse linéairement avec le retard de rafraîchissement du
+niveau, et il est payé par CHAQUE lecteur. Le temps réel est un service
+pour les tableaux de bord à la minute, un coût pour les rapports
+journaliers : désactivé sur 1j, à discuter sur 1min.
+Remettre materialized_only = true avant tout contrôle de somme.

@@ -1,0 +1,61 @@
+L08 — ÉTAPE 1 : PRÉPARER LES TROIS CONFIGURATIONS
+=================================================
+
+Fiche : « Le script crée trois hypertables au schéma identique, à chunks
+journaliers, et y charge les deux mêmes jours de MISTRAL. Vérifier que
+les trois contiennent le même nombre de lignes et le même nombre de
+chunks AVANT de basculer. »
+
+-------------------------------------------------------------------------
+1. Ce que fait l08/creer-configurations.sql, et pourquoi
+-------------------------------------------------------------------------
+  \i l08/creer-configurations.sql        (≈ 20 s sur le poste)
+
+- Trois tables (ts, series_id, machine_id, valeur, qualite), hypertables
+  à chunks d'UN JOUR, create_default_indexes => false : aucun index,
+  pour que la comparaison ne porte que sur le columnstore.
+- machine_id est MATÉRIALISÉ par la jointure datée à affectation_capteur
+  (la leçon de L02 étape 4) : c'est le candidat segmentby « de
+  cardinalité bien plus faible » — 46 machines contre 490 séries.
+- Deux jours UTC entiers, 25 et 26 septembre 2026, AVANT les arrêts de
+  maintenance d'octobre : des chunks pleins et nominaux, sans trou.
+- Puis les trois ALTER TABLE … SET (timescaledb.compress, …) : la
+  configuration est posée MAIS rien n'est basculé — compress_chunk
+  n'a pas été appelé. C'est l'étape 2.
+
+Résultat attendu (identique sur les trois lignes, sinon tout est faux) :
+      t      |  count  | chunks
+ cmp_serie   | 8458836 |      2
+ cmp_machine | 8458836 |      2
+ cmp_aucun   | 8458836 |      2
+
+Pourquoi 8 458 836 et pas 2 × 490 × 8 640 = 8 467 200 : les trous
+naturels de la génération (0,1 % environ) — le jeu n'est pas parfait,
+c'est voulu. Chaque chunk fait 243 Mo, soit 57,5 octets par ligne
+(50 de tuple, 4 de pointeur, en-têtes de page) : c'est le « avant ».
+
+-------------------------------------------------------------------------
+2. Ce que le participant doit relever avant de basculer
+-------------------------------------------------------------------------
+  SELECT hypertable_name, pg_size_pretty(hypertable_size(hypertable_name::regclass))
+  FROM timescaledb_information.hypertables WHERE hypertable_name LIKE 'cmp_%';
+  → 486 MB × 3.
+
+  SELECT hypertable_name, attname, segmentby_column_index, orderby_column_index, orderby_asc
+  FROM timescaledb_information.compression_settings WHERE hypertable_name LIKE 'cmp_%';
+  → cmp_serie : series_id seg 1, ts ord 1 desc ; cmp_machine : machine_id
+    seg 1 ; cmp_aucun : ts ord 1 seulement.
+
+Point à faire dire : les trois tables sont BYTE POUR BYTE la même chose
+en rowstore. La différence n'existe encore que dans le catalogue.
+
+-------------------------------------------------------------------------
+3. Erreurs fréquentes
+-------------------------------------------------------------------------
+- Lancer le script depuis un psql du poste et non du conteneur : les
+  chemins `l08/…` ne se résolvent qu'avec `-w /atelier`.
+- Vérifier le nombre de chunks avec show_chunks() sur une seule table et
+  supposer les autres identiques : la fiche exige les trois comptages.
+- Croire que `ALTER TABLE … SET (timescaledb.compress)` compresse : il
+  ne fait que déclarer. `hypertable_compression_stats` retourne NULL
+  tant qu'aucun chunk n'est basculé.

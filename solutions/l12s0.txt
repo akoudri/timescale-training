@@ -1,0 +1,110 @@
+L12 — RESTAURATION À UN INSTANT DONNÉ — PROTOCOLE COMMUN (corrigé formateur)
+=============================================================================
+
+Fichiers : l12s1 (étape 1, archivage et sauvegarde de base), l12s2 (étape 2,
+incident), l12s3 (étape 3, restauration et lecture du rejeu), l12s4 (étape 4,
+les quatre contrôles + checklist verification-post-restauration.md), l12s5
+(étape 5, chiffres, extrapolation, nettoyage), l12s6 (extensions E1-E4, dont
+la procédure d'une page de E3).
+
+-------------------------------------------------------------------------
+1. Ce que l'atelier vérifie
+-------------------------------------------------------------------------
+Deux choses, et la seconde compte davantage :
+  a) une DURÉE MESURÉE de restauration, avec ses deux composantes qui ne
+     grandissent pas de la même façon : la sauvegarde de base croît avec le
+     VOLUME de l'instance, le rejeu croît avec la FENÊTRE de journaux entre
+     la sauvegarde et l'instant cible ;
+  b) une CHECKLIST post-restauration : les données revenues ne suffisent
+     pas. Hypertables encore hypertables, jobs replanifiés avec échéance,
+     agrégats cohérents. Le comptage rassure, et c'est pour cela qu'on
+     s'arrête là — à tort.
+
+Le mécanisme sous-jacent (à faire redire) : la sauvegarde de base est une
+copie physique de PGDATA prise à chaud, cohérente grâce aux journaux
+(backup_label note le LSN de départ) ; l'archivage copie chaque segment de
+16 Mo ailleurs ; la restauration remet la copie en place, rejoue les
+segments archivés depuis le LSN de départ et S'ARRÊTE AVANT le premier
+commit postérieur à l'instant demandé. Tout ce qui est validé avant revient,
+rien de ce qui est validé après.
+
+-------------------------------------------------------------------------
+2. État du poste vérifié le 17/09/2026 (avant L12)
+-------------------------------------------------------------------------
+- État mistral-M11 en entrée (L08-L11 déroulés le 17/09) : `mesures`
+  151 609 294 lignes, 24/09 00:00 → 29/10 21:59:50 UTC, 6 chunks
+  (4 columnstore 24/09→22/10, 2 rowstore 22/10→05/11) ; 3 agrégats
+  continus ; index (series_id, ts DESC) ; alertes_qualite 3 lignes.
+  Coïncidence utile : le compte est IDENTIQUE à celui de la référence.
+- Jobs (8 utilisateur) : 1000/1001 columnstore par défaut (mesures_avant,
+  mesures_charge — hors kit, hérités de `CREATE TABLE … WITH
+  (tsdb.hypertable)`), 1003/1004/1005 rafraîchissements 1min/1h/1j,
+  1006 compression 7 j, 1007 rétention 30 j, 1008 controle_qualite. Plus
+  les jobs système 1 (télémétrie) et 3 (purge de l'historique des jobs).
+  La fiche disait « six jobs » : corrigé en « tous les jobs ».
+- `pgdata/data` = 22 Go (base `mistral` 21 Go : `mesures` ≈ 4 Go
+  compressée, pyramide 1min ≈ 4 Go, et `mesures_avant` 12 Go — une
+  hypertable de 190 M lignes créée par le participant en L02, hors kit,
+  laissée en place). 128 Go libres. archive_mode = off, archive_command
+  vide ; `archives/` vide (créé par le parcours amont, monté sous
+  /archives).
+- Prérequis manquant : `pg_stat_statements` n'avait jamais été créée dans
+  `mistral` (L01 étape 2 sautée ; la bibliothèque est préchargée) —
+  créée avant la sauvegarde (`CREATE EXTENSION IF NOT EXISTS
+  pg_stat_statements`, version 1.11). Elle sert à E4 et à L15 E1.
+- Érosion connue de mistral_1min/1h sur 14-24 sept (politiques relatives
+  à now(), now() dans la zone purgée par L09) : sans incidence ici, le
+  contrôle de somme porte sur J-3 = 26 octobre.
+
+-------------------------------------------------------------------------
+3. Corrections du kit faites le 17/09 (à connaître)
+-------------------------------------------------------------------------
+- Fiche : « six jobs » (contexte, prérequis, étape 4) → « tous les jobs »,
+  avec la liste des huit du poste de référence.
+- Fiche, Nettoyage : ordre inversé. La fiche faisait `rm -rf archives/wal`
+  AVANT `archive_mode = off` : entre les deux, l'archiveur a tenté de
+  copier un segment vers un répertoire disparu → `failed_count = 1`,
+  segment retenu dans pg_wal jusqu'au redémarrage (vécu sur le poste,
+  voir l12s5). Désormais : ALTER SYSTEM → restart → rm. Remarque ajoutée :
+  `ALTER SYSTEM` refuse le bloc de transaction d'un `psql -c "A; B;"` —
+  une instruction par `-c`.
+- `l12/restaurer.sh` : étape 6 ajoutée — après la promotion, `ALTER
+  SYSTEM RESET` de restore_command, recovery_target_time,
+  recovery_target_action. Le script les AJOUTAIT à postgresql.auto.conf
+  sans jamais les retirer : ignorés hors restauration (pas de
+  recovery.signal), mais chaque restauration en empilait une couche.
+- `l12/verifier-apres.sql` : vérifié, aucun défaut — `l07/controle-somme.sql`
+  calcule sa borne J-3 lui-même, il n'a pas besoin de `l05/bornes.sql`.
+
+-------------------------------------------------------------------------
+4. Mesures de référence (env. 2 vCPU / 8 Go, NVMe) et mesures du poste
+-------------------------------------------------------------------------
+                                référence        poste (17/09/2026)
+  sauvegarde de base            33,6 s / 17 Go   36,9 s / 21 Go
+  incident (DELETE 3 j)         12 700 915 l.    12 696 679 l. en 20,1 s
+  fenêtre de journaux rejouée   ~13 min d'act.   1,4 Go, 91 segments,
+                                                 A9/8C000028 → A9/E60B2FC0
+  durée du rejeu seul           ~8 s             5,05 s
+  restauration totale           21,4 s           24,3 s (dont ≈ 18 s de
+                                                 copie des 21 Go)
+  contrôles                     4/4              4/4 (151 609 294 lignes,
+                                                 5 hypertables + 3 mat.,
+                                                 10 jobs planifiés, somme
+                                                 4 332 767 aux 4 niveaux)
+Extensions : E1 sans pre_restore = 8 640 lignes perdues sur 25 920 (chunk
+rowstore), 1 erreur « ignorée » ; E2 montée 2.28.3 → 2.29.2 dans une base
+jetable ; E4 plans identiques avant/après redémarrage, R1 233 → 39 ms
+(cache), blocs lus identiques.
+
+-------------------------------------------------------------------------
+5. État de sortie mistral-M13
+-------------------------------------------------------------------------
+Identique à mistral-M11 côté données et objets : `mesures` 151 609 294
+lignes (24/09 → 29/10 21:59:50), 5 hypertables + 3 matérialisations,
+2 index sur mesures, jobs 1000-1008 planifiés avec échéance,
+alertes_qualite 3 lignes, `pg_stat_statements` en plus. Timeline 2 (une
+restauration à un instant donné ouvre une nouvelle ligne temporelle).
+archive_mode = off, archive_command vide, postgresql.auto.conf ne contient
+plus que `archive_mode = 'off'`. `pgdata/data.incident`, `archives/base`,
+`archives/wal` supprimés (43 Go rendus en 0,6 s), bases jetables
+e1_src/e1_sans/e1_avec/e2 supprimées. 128 Go libres, `archives/` vide.

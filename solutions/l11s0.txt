@@ -1,0 +1,127 @@
+L11 — MIGRATION MISTRAL — PROTOCOLE COMMUN (corrigé formateur)
+=================================================================
+
+Fichiers : l11s1 (étape 1, LA CHECKLIST attendue — le livrable), l11s2
+(étape 2, cible dédiée et copie initiale), l11s3 (étape 3, rattrapage),
+l11s4 (étape 4, les trois contrôles), l11s5 (étape 5, bascule
+chronométrée), l11s6 (étape 6, durcir), l11s7 (extensions E1-E4, dont
+le verdict sur la réplication logique et la checklist « production »).
+
+-------------------------------------------------------------------------
+1. Ce que l'atelier vérifie
+-------------------------------------------------------------------------
+Le livrable est la CHECKLIST, pas la migration. Quatre choses :
+  a) une procédure de repli écrite AVANT, et qui repose sur une idée
+     simple : la source reste la référence tant que le flux n'a pas
+     basculé — le repli, c'est détruire la cible partielle ;
+  b) une migration production ouverte : copie par plages sur un
+     identifiant monotone, puis deltas jusqu'à un retard FAIBLE ET
+     STABLE (il oscille, il ne décroît plus) ;
+  c) des contrôles de contenu, sur des ENTIERS, rejoués à la bascule
+     (le contrôle 1 devient strict) — parce que l'état d'un mécanisme
+     de réplication ne prouve rien (E3 : « ready », 0 erreur, 0 ligne) ;
+  d) les deux gestes qu'on oublie : VÉRIFIER l'arrêt du flux par
+     comptage, et remettre les séquences à niveau AVANT de basculer.
+
+-------------------------------------------------------------------------
+2. État du poste vérifié le 17/09/2026 (avant L11)
+-------------------------------------------------------------------------
+- Source : conteneur `legacy`, PostgreSQL 16.14, wal_level = logical,
+  base mistral_legacy 3 043 Mo : `mesures` partitionnée en déclaratif
+  par mois (mesures_y2026m07 … m10), 41 471 963 lignes, id de 38 à
+  41 472 000, ts du 19/07 22:00 au 29/09 21:59 UTC, 400 séries au pas
+  d'une minute ; `evenements` 60 000 lignes ; aucune extension hors
+  plpgsql ; aucun slot, aucune publication. Séquence mesures_id_seq à
+  41 524 341, EN AVANCE de 52 341 sur max(id) (purge ligne à ligne :
+  la « séquence non triviale » du générateur).
+- Structure de l'id : (series_id − 1) × 103 680 + rang de la minute —
+  un bloc contigu par série. Monotone au sens utile (tout ce qui arrive
+  après la borne a un id plus grand), pas chronologique globalement.
+- Cible : conteneur `timescaledb`, 2.29.2 / PG 17 ; template1 porte
+  déjà timescaledb et timescaledb_toolkit (toute base neuve les a).
+  Base du fil rouge `mistral` à l'état M11 (jobs 1000-1008, 3 agrégats,
+  alertes_qualite 3 lignes) — non touchée par l'atelier.
+- Réseau compose : `legacy` résolu (172.25.0.3), pg_isready OK depuis le
+  conteneur timescaledb. Le conteneur legacy ne montait PAS /atelier
+  (voir §3). 128 Go libres.
+
+-------------------------------------------------------------------------
+3. Corrections du kit faites le 17/09 (à connaître)
+-------------------------------------------------------------------------
+- l11/preparer-cible.sql : créait `mesures` avec `WITH (tsdb.hypertable)`
+  → compression ACTIVÉE et politique columnstore par défaut (job 1000,
+  7 j) — l'inverse de ce que le script annonçait, et le piège n° 1 de
+  la fiche. Réécrit avec create_hypertable(), l'index de M06
+  (series_id, ts DESC) que la fiche annonce, et deux requêtes de
+  vérification finales (compression_enabled = f, politiques = 0).
+- l11/controles.sql : l'échantillon `id % 414719 = 1` tombait sur 100
+  lignes des deux dernières heures du 29/09 (414 719 = 4 × 103 680 − 1,
+  la taille du bloc par série). Remplacé par `mod(hashint8(id), 414719)
+  = 0` (98 lignes, 89 séries, toute la fenêtre, identique PG 16/17) et
+  affichage de la couverture de l'échantillon.
+- docker-compose.yml : montage `.:/atelier:ro` ajouté au conteneur
+  legacy (effectif au prochain `docker compose up -d legacy`) ; la fiche
+  montre l'exécution des contrôles par stdin des deux côtés.
+- l11/simuler-flux.sh : écrit son PID dans l11/.flux.pid ; la fiche
+  demande l'arrêt par `kill $(cat l11/.flux.pid)`, jamais par `pkill -f`
+  (vécu sur ce poste : a tué le shell qui exécutait la bascule).
+- Fiche : étape 4 (exécution des deux côtés + diff), étape 6 (« six
+  jobs » → deux politiques ; les jobs 1 et 3 sont système ; la
+  compression agit immédiatement sur la cible), E3 et piège associé
+  (ONLY ne montre rien — voir §4), deux pièges ajoutés (échantillon
+  d'un seul jour ; cible « migrée » qui n'est pas une hypertable).
+
+-------------------------------------------------------------------------
+4. Mesures de référence vs mesures du poste
+-------------------------------------------------------------------------
+                          référence (31/08)     poste (17/09)
+copie initiale            3 min 15 (sans index) 116 s (7 plages + événements
+                                                 + delta 1, avec 2 index)
+delta 1 / retard stable   109 000 lignes        163 500 puis 36 000 → 2 000 id,
+                                                 1,5 s par delta
+interruption réelle       7,4 s                 13,0 s (dont 5 s d'attentes)
+contrôle 1 à la bascule   42 003 963 = idem     41 960 463 = 41 960 463
+contrôle 2                73 j identiques       72 j identiques + jour en cours
+contrôle 3                100 lignes (biaisées) 98 lignes, 89 séries, 0 écart
+setval                    42 056 341            42 012 841 → 1re insertion
+                                                 42 012 842 sans conflit
+cible durcie              —                     5 285 → 1 792 Mo, 8/11 chunks
+                                                 compressés en 20 s
+repli E1                  ~1 s (drop sub.)      8,9 s (kill groupe + drop DB)
+E3                        3 046 Mo, 0 ligne,    2 737 Mo racine, 0 ligne,
+                          0 chunk               ONLY = 0 aussi, 0 chunk,
+                                                 0 erreur, synchro 81 s
+
+Le verdict E3 est confirmé et PRÉCISÉ : les lignes sont dans le tas de
+la racine (n_tup_ins = 100 000 sur la reproduction miniature), mais
+`SELECT … FROM ONLY mesures` retourne 0 — le planificateur réduit la
+racine à `One-Time Filter: false`. Seules pg_stat_user_tables et
+pg_relation_size les trahissent. Le flux continu post-synchro atterrit
+au même endroit. ts_insert_blocker est bien sur la racine mais ne tire
+pas sous session_replication_role = replica.
+
+Un vécu de l'étape 5, à raconter en salle : le premier arrêt du flux
+par `pkill -f simuler-flux.sh` a tué le shell de la bascule elle-même
+(motif présent dans sa ligne de commande) ; au second essai, la
+recherche de processus par motif trouvait encore… le shell de
+vérification, alors que les deux comptages source donnaient 0 lignes
+d'écart. L'arrêt se prouve par le comptage, pas par la liste des
+processus. C'est exactement le piège « le contrôle 1 diverge de quelques
+centaines de lignes après le delta final », vu de l'autre côté.
+
+-------------------------------------------------------------------------
+5. État de sortie et remise à zéro
+-------------------------------------------------------------------------
+- Aucun état de fil rouge nouveau côté cible : mistral_prod supprimée
+  (la checklist corrigée en tient lieu), bases jetables E2/E3/mini
+  supprimées, aucune souscription ni publication ni slot des deux
+  côtés, aucun processus de flux ni de copie, l11/.borne et
+  l11/.flux.pid supprimés. `mistral` intacte : jobs 1000-1008, index
+  (ts et series_id/ts DESC), 3 agrégats, alertes_qualite 3 lignes.
+- La SOURCE a grossi du flux : 42 043 463 lignes, max(id) 42 095 841,
+  max(ts) 29/09 22:08. Elle doit être remise à zéro avant une nouvelle
+  session (note de production) — commande, NON exécutée ici :
+    docker compose exec -T legacy psql -U postgres -c "DROP DATABASE mistral_legacy;" -c "CREATE DATABASE mistral_legacy;"
+    docker compose exec -T legacy pg_restore -U postgres --no-owner -j 4 -d mistral_legacy /jeux/mistral-legacy.dump
+  (c'est la fin de amont/restaurer.sh, rejouable seule).
+- Disque : 128 Go libres, inchangé.

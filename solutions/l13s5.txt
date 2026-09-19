@@ -1,0 +1,155 @@
+L13 — EXTENSIONS E1 À E4
+========================
+
+Non évaluées ; n'entrent pas dans mistral-M14. Toutes jouées le 17/09
+sur des copies jetables (E2), un rôle et des jobs supprimés ensuite (E3).
+
+-------------------------------------------------------------------------
+E1 — Cloisonnement et columnstore
+-------------------------------------------------------------------------
+Ratio de compression : inchangé par définition (la vue ne touche pas au
+stockage). Lots traités par R2 (chunk 24/09→01/10, fenêtre 26-29/09) :
+| forme du prédicat de site                     | lots lus | lignes décompressées | durée   |
+|-----------------------------------------------|----------|----------------------|---------|
+| aucun (accès direct)                          | 13 220   | 12 692 974           | 1 129 ms |
+| sous-requête via la vue (nested loop paramétré)| 4 860   | 4 661 996            |   854 ms |
+| liste littérale `series_id = ANY(ARRAY[…180…])`| 4 856   | 4 661 996            |   419 ms |
+Le prédicat porte bien sur la colonne de segment (series_id) : il
+élimine des lots dans les trois cas où il existe. La liste littérale
+gagne encore × 2 : le planificateur garde le PARALLÉLISME (Parallel
+Index Scan sur le chunk compressé) que la boucle imbriquée de la vue
+lui interdit.
+Réécriture possible : oui — une fonction `series_du_site(int) RETURNS
+int[]` STABLE, et la vue `WHERE series_id = ANY(series_du_site(…))`. Le
+planificateur peut alors évaluer la liste une fois par requête. Prix :
+la politique devient une fonction (à maintenir, à auditer) et le
+référentiel est lu hors de la vue ; lisibilité moindre, surcoût
+d'exécution moindre. À réserver aux requêtes chaudes du tableau de bord.
+
+-------------------------------------------------------------------------
+E2 — Effacer un actif, partout (machine 15, séries 141-150)
+-------------------------------------------------------------------------
+Copie jetable : e2_mesures (site 1, 150 séries, 24-27/09, chunks d'un
+jour, le premier en columnstore segmentby series_id), e2_1h (agrégat
+continu), e2_alertes. 3 884 373 lignes, 235 Mo ; machine 15 = 259 200
+lignes dont 86 400 dans le chunk columnstore.
+
+1. Brut, chunk columnstore compris :
+   DELETE … WHERE series_id IN (SELECT series_id FROM affectation_capteur
+   WHERE machine_id = 15);
+   → ERROR: tuple decompression limit exceeded by operation
+     DETAIL: current limit: 100000, tuples decompressed: 1296000
+   (836 ms perdus). La sous-requête n'est pas résolue au niveau des
+   segments : le chunk ENTIER (150 séries × 8 640) est décompressé.
+   DELETE … WHERE series_id = ANY(ARRAY[141,…,150]);   → 259 200 lignes, 59 ms
+   Le prédicat littéral sur la colonne de segment ne décompresse que les
+   10 segments (86 400 tuples < 100 000). Contre-exemple mesuré : la
+   sous-requête avec `SET LOCAL timescaledb.max_tuples_decompressed_per_
+   dml_transaction = 0` passe en 1 695 ms — 29 fois plus, et le chunk
+   ressort partiellement décompressé.
+2. Agrégat : la suppression du brut NE SE PROPAGE PAS — 720 lignes de la
+   machine 15 restent dans e2_1h après le DELETE. `CALL
+   refresh_continuous_aggregate('e2_1h', '2026-09-24', '2026-09-27')` :
+   970 ms, 0 ligne restante. Le rafraîchissement recalcule TOUTE la
+   fenêtre pour TOUTES les séries : sur `mesures`, un refresh de 36
+   jours du niveau minute coûte ≈ 4 min (L07). Alternative : DELETE
+   direct sur les hypertables de matérialisation (superutilisateur,
+   prédicat littéral) — instantané, mais hors du mécanisme
+   d'invalidation, à documenter.
+3. Alertes : DELETE 10 lignes, 2 ms.
+
+Extrapolation à `mesures` (chiffres du poste) : 2 950 920 lignes de la
+machine 15, réparties 604 800 / 452 680 / 603 686 / 604 800 dans les
+4 chunks columnstore, 605 754 / 79 200 dans les 2 rowstore. Chaque chunk
+columnstore dépasse la limite DML de 100 000 tuples même avec le
+prédicat littéral → soit `SET LOCAL … = 0` dans la transaction (≈ 60 ms
+par 86 400 tuples mesurés → ≈ 1,6 s pour 2,27 M), soit chunk par chunk,
+soit `decompress_chunk` puis DELETE puis `compress_chunk` (L08 E2 :
+0,7 + 0,2 + 1,1 s par chunk). Puis les trois niveaux : minute ≈ 4 min
+par refresh complet ou DELETE direct ; heure/jour : secondes. Alertes :
+ms. Total réaliste : quelques secondes de SQL + 4 minutes de
+rafraîchissement, ou 10 secondes en DELETE direct sur les
+matérialisations.
+Ce qui reste : les sauvegardes. Sur ce poste : rien (base et journaux
+archivés supprimés en L12). En production : la sauvegarde de base et les
+journaux archivés contiennent la machine jusqu'à expiration de la
+rétention des sauvegardes (M jours) — c'est le délai à écrire dans la
+réponse au DPO (E4). Plus le dump legacy et la source de migration s'ils
+existent encore (L11 : « la source reste intacte jusqu'au … »).
+
+-------------------------------------------------------------------------
+E3 — Recréer l'action sous un rôle dédié (mistral_qualite)
+-------------------------------------------------------------------------
+Premier essai : `SET ROLE mistral_qualite; CREATE PROCEDURE …` →
+ERROR: permission denied for schema public (PostgreSQL ≥ 15 : plus de
+CREATE public par défaut). Version tenue : l'ADMIN crée la procédure et
+accorde EXECUTE ; le rôle dédié appelle `add_job` — le job appartient
+alors à mistral_qualite (owner) et s'exécute avec SES droits.
+
+Droits du rôle : USAGE schéma, SELECT sur mesures_site (vue de session),
+affectation_capteur, actifs ; INSERT sur alertes_qualite. Rien d'autre.
+a) Action lisant la vue de SESSION mesures_site, job 1029 :
+   - run_job en session sans mistral.site : NOTICE site=<NULL>
+     ref=<NULL> → 0 capteur muet. Une vue paramétrée par la session ne
+     convient PAS à un job : le worker de l'ordonnanceur n'a pas de
+     `SET mistral.site`.
+   - run_job en session AVEC `SET mistral.site = 2` : 1 capteur (208).
+     Piège : run_job hérite de la session, l'ordonnanceur non → un test
+     par run_job « réussit » et le job planifié ne trouve rien.
+b) Action lisant une vue à site FIXE (mesures_site2, sans paramètre),
+   job 1030 : 1 capteur muet (208), en 18,9 s (contre 25 ms pour
+   l'action de M11 en accès direct — c'est le coût de R1 via la vue,
+   l13s4). Laissé à l'ordonnanceur (next_start rapproché) : exécuté,
+   ligne consignée.
+Ce que le rôle ne peut plus faire : `SELECT count(*) FROM mesures` →
+permission denied ; `SELECT … FROM alertes_qualite` → permission denied
+(INSERT seul : il écrit, il ne relit pas — un job ne doit pas pouvoir
+exfiltrer ce que d'autres jobs ont consigné).
+Le compromis, à écrire : une action cloisonnée ne détecte que son site
+(137 et 451 lui échappent), coûte 750 fois plus cher, et il en faut une
+par site (quatre jobs, quatre vues). L'action globale de M11 sous un
+rôle d'administration + une table d'alertes cloisonnée en lecture (T3)
+est le bon équilibre pour MISTRAL ; l'action par site se justifie quand
+les sites sont des clients distincts.
+Nettoyage : jobs 1029/1030, procédures, vue mesures_site2, rôle
+supprimés ; alertes_qualite remise à 3 lignes.
+
+-------------------------------------------------------------------------
+E4 — La note au délégué à la protection des données (modèle, une page)
+-------------------------------------------------------------------------
+Objet : demande d'effacement des données de l'actif <machine_id>
+(exploitant <site>), reçue le <date>.
+
+1. Ce qui est effacé immédiatement (J+0, sous 1 h ouvrée) :
+   - les mesures brutes de l'actif dans la base d'exploitation `mistral`
+     (série par série, chunks compressés compris — procédure E2) ;
+   - les trois niveaux d'agrégats (minute, heure, jour) par
+     rafraîchissement borné ou suppression directe ;
+   - la table d'alertes qualité et le journal des actions.
+   Vérification : requête de comptage par série = 0 aux quatre niveaux,
+   consignée avec l'horodatage et l'auteur.
+2. Ce qui est effacé sous N jours :
+   - N = 7 j : la base source de migration `mistral_legacy` et sa copie
+     de bascule, si elles existent encore (destruction planifiée à la
+     date écrite dans la checklist de bascule) ;
+   - N = 30 j : les exports analytiques et instantanés de tableaux de
+     bord (Grafana, exports CSV) — inventaire à joindre.
+3. Ce qui subsiste dans les sauvegardes jusqu'à M jours, et pourquoi :
+   - sauvegardes de base et journaux archivés : M = rétention des
+     sauvegardes (ici <M> j). Une sauvegarde physique est un bloc
+     indivisible : on ne peut pas en retirer une machine sans la
+     restaurer entièrement, la modifier et la resauvegarder — ce qui
+     détruirait la capacité de restauration à un instant donné pour
+     tous les autres actifs. La donnée y est chiffrée au repos et
+     inaccessible hors restauration ; toute restauration effectuée
+     avant M rejoue l'effacement (procédure 1) avant remise en service.
+   - à M jours, les sauvegardes contenant l'actif sont expirées ; la
+     date d'expiration calculée : <date + M>.
+4. Ce qui ne contient pas de donnée personnelle et n'est pas effacé : le
+   référentiel (site, modèle de machine, puissance nominale) —
+   caractéristiques techniques, non rattachées à une personne — et les
+   agrégats de site qui ne permettent plus d'individualiser l'actif
+   (à justifier au cas par cas : un site à une seule machine
+   individualise).
+Signature, date, pièces jointes : requêtes de vérification et leurs
+résultats.

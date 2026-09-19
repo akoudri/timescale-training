@@ -1,0 +1,91 @@
+L05 — RÉÉCRITURE DE CINQ REQUÊTES — PROTOCOLE COMMUN (corrigé formateur)
+=========================================================================
+
+Fichiers de corrigé : l5s1 (R1) … l5s5 (R5). Ce fichier fixe ce qui vaut
+pour les cinq : bornes, harnais, plans, forme du rapport.
+
+-------------------------------------------------------------------------
+1. Bornes : la fenêtre COMPLÈTE, pas les jours 1-5
+-------------------------------------------------------------------------
+`mesure.sh` calcule par défaut des bornes « référence » (jours 1 à 5 de
+la fenêtre, pour que les rapports de L01/L03/L08 restent comparables).
+En L05 ces bornes sont FAUSSES pour trois requêtes sur cinq :
+- R2 : la semaine de bascule (19-26 octobre) est hors des jours 1-5 ;
+- R4 : un seul mois dans la fenêtre → `lag()` ne retourne que NULL ;
+- R3 : cinq jours de courbe au lieu de 45 (mesure non représentative).
+
+Commande de l'atelier :
+
+  ./mesure.sh l05/avant/R1.sql --bornes complet
+  ./mesure.sh l05/apres/R1.sql --bornes complet
+
+`--bornes complet` reproduit exactement `l05/bornes.sql` : min(ts) et
+max(ts) + 10 s du jeu, jamais now(). Pour les plans, en session psql :
+
+  \i l05/bornes.sql          -- :debut, :fin, :serie_vent
+  EXPLAIN (ANALYZE, BUFFERS) ...
+
+Sur ce jeu : debut = 2026-09-14 22:00:00+00, fin = 2026-10-29 22:00:00+00
+(le fuseau de session de l'instance est Etc/UTC — voir l5s2, c'est le
+cœur de R2). serie_vent = 3 (première série `vitesse_vent_ms`, machine 1).
+
+-------------------------------------------------------------------------
+2. Le harnais : médiane de 5, écart-type < 20 %
+-------------------------------------------------------------------------
+Ne pas chronométrer à la main : la première exécution charge le cache
+(12 Go d'hypertable pour 8 Go de RAM : rien ne tient entièrement, mais
+les chunks lus en dernier restent chauds). Le harnais applique le même
+protocole aux deux versions ; seul le RAPPORT est transposable, pas la
+durée. Une mesure dont l'écart-type dépasse 20 % de la médiane se relance.
+
+Ordre de grandeur des durées sur la référence (2 vCPU / 8 Go) : 9 à 75 s
+par exécution AVANT → compter 25 à 30 minutes de mesures pour les cinq
+« avant ». Lancer R4-avant (75 s × 5) pendant qu'on rédige R1-après.
+
+-------------------------------------------------------------------------
+3. Désigner le nœud responsable : méthode
+-------------------------------------------------------------------------
+Comparer les deux plans avec `EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)` et
+répondre à trois questions, dans l'ordre :
+  a) quels nœuds de balayage ont disparu ou changé de nature
+     (Seq Scan → Index Scan, Append → ChunkAppend, Sort disparu) ?
+  b) combien de chunks sont touchés avant / après (« Chunks excluded
+     during startup », nombre de sous-nœuds sous ChunkAppend) ?
+  c) le nombre de lignes en sortie de la jointure est-il le même ?
+     (si non, la réécriture a changé le RÉSULTAT, pas seulement la vitesse)
+Le nœud responsable est celui dont la disparition ou le changement
+explique l'essentiel de l'écart de durée ; quand rien n'a changé (R2, R3)
+le rapport est ≈ 1 et c'est la réponse attendue.
+
+-------------------------------------------------------------------------
+4. Mesures de référence (env. 2 vCPU / 8 Go, NVMe, TimescaleDB 2.29)
+-------------------------------------------------------------------------
+  requête                     avant      après     rapport   nœud responsable
+  R1 prod. horaire/site 30 j  36 224 ms  10 011 ms  × 3,6    jointure datée + filtre signal
+  R2 énergie journalière      35 898 ms  39 720 ms  × 0,9    aucun : fausse, pas lente
+  R3 courbe de vent           8 946 ms   8 867 ms   × 1,0    gapfill répare l'axe, pas la durée
+  R4 mois vs mois-1           75 563 ms  40 631 ms  × 1,9    une seule agrégation (CTE)
+  R5 dernière valeur          12 127 ms  118 ms     × 103    l'index (series_id, ts DESC)
+
+  R5 détail : DISTINCT ON sans index 61 016 ms (PIRE que l'avant) ;
+  création de l'index 55,6 s ; DISTINCT ON avec index 118 ms.
+  R2 écart : 25 octobre +17 900 kWh (+2,35 %) ; total semaine 7 423 951 kWh
+  identique dans les deux découpages.
+
+Mesures du poste de l'utilisateur (17/09/2026) : à reporter ici après
+le passage de l'atelier (section M06 de mesures.md).
+
+-------------------------------------------------------------------------
+5. État de sortie mistral-M06
+-------------------------------------------------------------------------
+Le SEUL objet persistant créé par L05 est l'index (series_id, ts DESC)
+de R5. Il fait partie de l'état de reprise : M09 (orderby du columnstore)
+et L14 (incident « structure ») s'appuient dessus. Le vérifier avant de
+passer à L06 :
+
+  SELECT indexname FROM pg_indexes WHERE tablename = 'mesures';
+  -- attendu : mesures_ts_idx ET mesures_series_id_ts_idx
+
+Coût de l'index sur ce jeu : ≈ 4 à 5 Go (190 M d'entrées int4 +
+timestamptz), 55 s de création sur la référence ; vérifier l'espace disque
+(L00 §7) avant de le créer.

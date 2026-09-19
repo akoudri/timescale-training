@@ -1,0 +1,350 @@
+apiVersion: 1
+groups:
+    - orgId: 1
+      name: mistral-alertes
+      folder: MISTRAL
+      interval: 10s
+      rules:
+        - uid: mistral-a1
+          title: A1 · Aucun worker actif
+          condition: C
+          data:
+            - refId: A
+              relativeTimeRange:
+                from: 600
+                to: 0
+              datasourceUid: mistral-supervision
+              model:
+                editorMode: code
+                format: table
+                intervalMs: 1000
+                maxDataPoints: 43200
+                rawQuery: true
+                rawSql: SELECT count(*) AS workers FROM pg_stat_activity WHERE application_name LIKE 'TimescaleDB%'
+                refId: A
+            - refId: B
+              relativeTimeRange:
+                from: 600
+                to: 0
+              datasourceUid: __expr__
+              model:
+                expression: A
+                intervalMs: 1000
+                maxDataPoints: 43200
+                reducer: last
+                refId: B
+                settings:
+                    mode: dropNN
+                type: reduce
+            - refId: C
+              relativeTimeRange:
+                from: 600
+                to: 0
+              datasourceUid: __expr__
+              model:
+                conditions:
+                    - evaluator:
+                        params:
+                            - 1
+                        type: lt
+                expression: B
+                intervalMs: 1000
+                maxDataPoints: 43200
+                refId: C
+                type: threshold
+          noDataState: NoData
+          execErrState: Error
+          annotations:
+            summary: A1 · Aucun worker actif
+          labels:
+            formation: mistral
+          isPaused: false
+        - uid: mistral-a2
+          title: A2 · Job sans succès (3 × période, jobs échus)
+          condition: C
+          data:
+            - refId: A
+              relativeTimeRange:
+                from: 600
+                to: 0
+              datasourceUid: mistral-supervision
+              model:
+                editorMode: code
+                format: table
+                intervalMs: 1000
+                maxDataPoints: 43200
+                rawQuery: true
+                rawSql: |-
+                    SELECT count(*) AS jobs_en_anomalie FROM timescaledb_information.jobs j LEFT JOIN timescaledb_information.job_stats s USING (job_id)
+                    WHERE NOT j.scheduled OR (s.total_runs > 0 AND s.last_successful_finish < now() - 3 * j.schedule_interval)
+                refId: A
+            - refId: B
+              relativeTimeRange:
+                from: 600
+                to: 0
+              datasourceUid: __expr__
+              model:
+                expression: A
+                intervalMs: 1000
+                maxDataPoints: 43200
+                reducer: last
+                refId: B
+                settings:
+                    mode: dropNN
+                type: reduce
+            - refId: C
+              relativeTimeRange:
+                from: 600
+                to: 0
+              datasourceUid: __expr__
+              model:
+                conditions:
+                    - evaluator:
+                        params:
+                            - 0
+                        type: gt
+                expression: B
+                intervalMs: 1000
+                maxDataPoints: 43200
+                refId: C
+                type: threshold
+          noDataState: NoData
+          execErrState: Error
+          annotations:
+            summary: A2 · Job sans succès (3 × période, jobs échus)
+          labels:
+            formation: mistral
+          isPaused: false
+        - uid: mistral-a3
+          title: A3 · Flux muet (60 × pas du flux)
+          condition: C
+          data:
+            - refId: A
+              relativeTimeRange:
+                from: 600
+                to: 0
+              datasourceUid: mistral-supervision
+              model:
+                editorMode: code
+                format: table
+                intervalMs: 1000
+                maxDataPoints: 43200
+                rawQuery: true
+                rawSql: |-
+                    SELECT count(*) AS flux_muets FROM (
+                      SELECT af.series_id, CASE WHEN g.famille = 'meteo' THEN interval '1 hour' ELSE interval '10 seconds' END AS pas, max(m.ts) AS dernier
+                      FROM affectation_capteur af JOIN signaux g ON g.signal_id = af.signal_id
+                      LEFT JOIN mesures m ON m.series_id = af.series_id AND m.ts >= (SELECT max(ts) - interval '1 day' FROM mesures)
+                      WHERE af.fin IS NULL GROUP BY 1, 2) s
+                    WHERE s.dernier IS NULL OR s.dernier < (SELECT max(ts) FROM mesures) - 60 * s.pas
+                refId: A
+            - refId: B
+              relativeTimeRange:
+                from: 600
+                to: 0
+              datasourceUid: __expr__
+              model:
+                expression: A
+                intervalMs: 1000
+                maxDataPoints: 43200
+                reducer: last
+                refId: B
+                settings:
+                    mode: dropNN
+                type: reduce
+            - refId: C
+              relativeTimeRange:
+                from: 600
+                to: 0
+              datasourceUid: __expr__
+              model:
+                conditions:
+                    - evaluator:
+                        params:
+                            - 0
+                        type: gt
+                expression: B
+                intervalMs: 1000
+                maxDataPoints: 43200
+                refId: C
+                type: threshold
+          noDataState: NoData
+          execErrState: Error
+          annotations:
+            summary: A3 · Flux muet (60 × pas du flux)
+          labels:
+            formation: mistral
+          isPaused: false
+        - uid: mistral-a4
+          title: A4 · Espace disponible (seuil 85 % ou < 7 jours)
+          condition: C
+          data:
+            - refId: A
+              relativeTimeRange:
+                from: 600
+                to: 0
+              datasourceUid: mistral-supervision
+              model:
+                editorMode: code
+                format: table
+                intervalMs: 1000
+                maxDataPoints: 43200
+                rawQuery: true
+                rawSql: |-
+                    SELECT CASE WHEN pct > 85 OR jours < 7 THEN 1 ELSE 0 END AS alerte FROM (
+                      SELECT round(100.0 * o.octets / (200.0*1024^3)::numeric, 1) AS pct,
+                             ((200.0*1024^3) - o.octets) / nullif(t.pente_par_jour, 0) AS jours
+                      FROM (SELECT octets FROM supervision_taille ORDER BY ts DESC LIMIT 1) o,
+                           (SELECT regr_slope(octets, extract(epoch FROM ts)) * 86400 AS pente_par_jour
+                            FROM supervision_taille WHERE ts >= now() - interval '24 hours') t) x
+                refId: A
+            - refId: B
+              relativeTimeRange:
+                from: 600
+                to: 0
+              datasourceUid: __expr__
+              model:
+                expression: A
+                intervalMs: 1000
+                maxDataPoints: 43200
+                reducer: last
+                refId: B
+                settings:
+                    mode: dropNN
+                type: reduce
+            - refId: C
+              relativeTimeRange:
+                from: 600
+                to: 0
+              datasourceUid: __expr__
+              model:
+                conditions:
+                    - evaluator:
+                        params:
+                            - 0
+                        type: gt
+                expression: B
+                intervalMs: 1000
+                maxDataPoints: 43200
+                refId: C
+                type: threshold
+          noDataState: NoData
+          execErrState: Error
+          annotations:
+            summary: A4 · Espace disponible (seuil 85 % ou < 7 jours)
+          labels:
+            formation: mistral
+          isPaused: false
+        - uid: mistral-p2
+          title: P2 (L14) · Index attendu absent
+          condition: C
+          data:
+            - refId: A
+              relativeTimeRange:
+                from: 600
+                to: 0
+              datasourceUid: mistral-supervision
+              model:
+                editorMode: code
+                format: table
+                intervalMs: 1000
+                maxDataPoints: 43200
+                rawQuery: true
+                rawSql: |-
+                    SELECT count(*) AS index_absents FROM (VALUES ('(ts DESC)'), ('(series_id, ts DESC)')) a(colonnes)
+                    WHERE NOT EXISTS (SELECT 1 FROM pg_indexes i WHERE i.tablename = 'mesures' AND i.indexdef LIKE '%' || a.colonnes)
+                refId: A
+            - refId: B
+              relativeTimeRange:
+                from: 600
+                to: 0
+              datasourceUid: __expr__
+              model:
+                expression: A
+                intervalMs: 1000
+                maxDataPoints: 43200
+                reducer: last
+                refId: B
+                settings:
+                    mode: dropNN
+                type: reduce
+            - refId: C
+              relativeTimeRange:
+                from: 600
+                to: 0
+              datasourceUid: __expr__
+              model:
+                conditions:
+                    - evaluator:
+                        params:
+                            - 0
+                        type: gt
+                expression: B
+                intervalMs: 1000
+                maxDataPoints: 43200
+                refId: C
+                type: threshold
+          noDataState: NoData
+          execErrState: Error
+          annotations:
+            summary: P2 (L14) · Index attendu absent
+          labels:
+            formation: mistral
+          isPaused: false
+        - uid: mistral-p3
+          title: P3 (L14) · Capacité d'exécution dégradée
+          condition: C
+          data:
+            - refId: A
+              relativeTimeRange:
+                from: 600
+                to: 0
+              datasourceUid: mistral-supervision
+              model:
+                editorMode: code
+                format: table
+                intervalMs: 1000
+                maxDataPoints: 43200
+                rawQuery: true
+                rawSql: |-
+                    SELECT (current_setting('timescaledb.max_background_workers')::int < 8)::int
+                         + (SELECT (count(*) < 3)::int FROM pg_stat_activity WHERE application_name LIKE 'TimescaleDB%')
+                         + (SELECT count(*) FROM timescaledb_information.jobs j WHERE j.scheduled AND j.next_start < now() - j.schedule_interval) AS signes
+                refId: A
+            - refId: B
+              relativeTimeRange:
+                from: 600
+                to: 0
+              datasourceUid: __expr__
+              model:
+                expression: A
+                intervalMs: 1000
+                maxDataPoints: 43200
+                reducer: last
+                refId: B
+                settings:
+                    mode: dropNN
+                type: reduce
+            - refId: C
+              relativeTimeRange:
+                from: 600
+                to: 0
+              datasourceUid: __expr__
+              model:
+                conditions:
+                    - evaluator:
+                        params:
+                            - 0
+                        type: gt
+                expression: B
+                intervalMs: 1000
+                maxDataPoints: 43200
+                refId: C
+                type: threshold
+          noDataState: NoData
+          execErrState: Error
+          annotations:
+            summary: P3 (L14) · Capacité d'exécution dégradée
+          labels:
+            formation: mistral
+          isPaused: false

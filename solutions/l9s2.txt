@@ -1,0 +1,79 @@
+L09 — ÉTAPE 2 : VÉRIFIER L'ÉTAT DES CHUNKS, ET LA GRANULARITÉ
+=============================================================
+
+Fiche : « Consigner le nombre de chunks dans chaque zone, comparer aux
+bornes annoncées, écrire d'une phrase pourquoi la frontière n'est pas
+nette. Vérifier que les agrégats n'ont rien perdu. »
+
+-------------------------------------------------------------------------
+1. Résultats du poste (\i l09/etat-chunks.sql)
+-------------------------------------------------------------------------
+  zone                  attendu        constaté (bornes des chunks, UTC)
+  < 2 j   rowstore      27/10 →        2 chunks : 22/10-29/10, 29/10-05/11
+  2-30 j  columnstore   29/09 → 27/10  4 chunks : 24/09 → 22/10
+  > 30 j  supprimés     < 29/09        2 chunks : 10/09-17/09, 17/09-24/09
+
+  mesures : 6 chunks, 4 columnstore, 2 rowstore ; 151 612 534 lignes ;
+  min(ts) = 24/09 00:00 UTC (référence : mêmes zones, 2/4/2).
+
+  Ratio de la zone columnstore (chunk_compression_stats) :
+    par chunk  heap 1,7 Go + index 1,2 Go → 5 Mo + 1 Mo + toast 172 Mo
+    total      11 Go → 714 Mo, ×16,1 ; heap seul (heap → heap + toast)
+               ×9,6 — c'est ce second chiffre qui se compare au ×9,3 de
+               L08 (cmp_serie n'avait qu'un index, `mesures` en a deux).
+
+  Agrégats :
+    mistral_1h   529 026 lignes, 14/09 22:00 → 29/10 21:00
+    mistral_1min 31 660 848 → en baisse (voir l9s3), min 14/09 22:00
+    mistral_1j   22 050, 14/09 22:00 (= 15/09 Paris) → 28/10 23:00
+  min(seau) = 14/09 22:00 < min(ts) = 24/09 00:00 : l'agrégat couvre dix
+  jours que le brut n'a plus. C'est le downsampling, et c'est le test le
+  plus direct de tests/M10.sql.
+
+-------------------------------------------------------------------------
+2. La phrase de granularité (livrable l09/granularite.md)
+-------------------------------------------------------------------------
+Attendu : « la rétention ne supprime que les chunks ENTIÈREMENT
+antérieurs à la borne ; avec l'intervalle de 7 jours tranché en M04, le
+chunk 24/09-01/10 chevauche la borne du 29/09 et survit : jusqu'à 6 jours
+de données de plus que les "30 jours" affichés restent en base, et la
+frontière ne peut être plus précise que l'intervalle de chunk. »
+
+Même mécanique côté bascule : le chunk 22-29/10 chevauche la borne du
+27/10 et reste en rowstore ; « 2 jours » de rowstore signifie ici 7 jours
+et 22 h (22/10 00:00 → 29/10 21:59).
+
+Ce que cela dit de M04 : un intervalle plus court rend les frontières
+plus nettes et les purges plus fréquentes, au prix de plus de chunks
+(planification, métadonnées, un chunk actif plus petit). L'intervalle
+est un compromis, et la rétention en hérite.
+
+-------------------------------------------------------------------------
+3. Pourquoi les agrégats ont survécu — et jusqu'où
+-------------------------------------------------------------------------
+drop_chunks supprime des chunks du brut ; il ne touche pas aux
+matérialisations. Les lignes de mistral_1h pour 14 → 24/09 sont donc
+toujours là : c'est l'objet même de la chaîne (garder longtemps ce qui
+est petit, purger vite ce qui est gros).
+
+MAIS drop_chunks journalise une INVALIDATION sur la plage supprimée. Tout
+rafraîchissement qui couvre ensuite cette plage recalcule les seaux à
+partir d'un brut absent et les SUPPRIME. Tant qu'aucune fenêtre de
+rafraîchissement ne remonte dans la zone purgée (c'est ce que l'étape 3
+vérifie), rien ne bouge — vérifié en E1 : purge seule → 288 seaux
+intacts ; refresh hors zone → « already up-to-date » ; refresh couvrant →
+seaux supprimés sur la fenêtre. Sur ce poste, la zone purgée contient la
+date du jour : voir l9s3.
+
+-------------------------------------------------------------------------
+4. Erreurs fréquentes
+-------------------------------------------------------------------------
+- « Il manque un chunk supprimé » / « il y a un chunk compressé de
+  trop » : compter les jours de chaque chunk contre les bornes, pas les
+  chunks contre les zones. Le piège de la fiche est exactement là.
+- Conclure que le ratio a « doublé » entre L08 et L09 (×9,3 → ×16) :
+  comparer heap à heap ; les index qui disparaissent à la bascule
+  gonflent le ratio total. En production, c'est pourtant le ratio total
+  qui se facture.
+- Vérifier la couverture des agrégats avec count(*) seul : c'est
+  min(seau) < min(ts) qui prouve le downsampling.

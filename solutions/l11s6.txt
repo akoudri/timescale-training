@@ -1,0 +1,86 @@
+L11 — ÉTAPE 6 : ACTIVER ET DURCIR, APRÈS LA BASCULE
+=====================================================
+
+Fiche : « Après la bascule, jamais pendant. \i l11/durcir-cible.sql —
+le script réactive la compression et les politiques, et déclenche une
+première exécution. Vérifier que les jobs sont planifiés et ont une
+prochaine échéance. »
+
+-------------------------------------------------------------------------
+1. Résultat du poste
+-------------------------------------------------------------------------
+  \i l11/durcir-cible.sql               (0,09 s)
+  add_compression_policy → 1000 ; add_retention_policy → 1001
+  job_id | proc_name                         | scheduled | next_start | last_run_status
+       1 | policy_telemetry                  | t | 19:31 | Success   ← système
+       3 | policy_job_stat_history_retention | t | 00:00 | Success   ← système
+    1000 | policy_compression                | t | (null) | (null)   ← vient d'être créé
+    1001 | policy_retention                  | t | (null) | (null)
+
+Vingt secondes plus tard :
+    1000 compression : Success, total_runs 1, next_start J+1 06:36,
+         config compress_after 7 days   → 8 chunks sur 11 compressés
+    1001 rétention   : Success, total_runs 1, next_start J+1 18:36,
+         config drop_after 90 days      → rien à supprimer (19/06 < min ts)
+  mistral_prod : 5 285 Mo → 1 792 Mo.
+
+-------------------------------------------------------------------------
+2. Ce qu'il faut lire dans ce résultat
+-------------------------------------------------------------------------
+- Les politiques ont une PREMIÈRE EXÉCUTION IMMÉDIATE : add_*_policy
+  place initial_start à l'instant de la création. Sur le fil rouge, ces
+  politiques ne trouvent jamais rien (le jeu est dans le futur de
+  now(), l9s0) ; ici la legacy va du 20/07 au 29/09, dans le PASSÉ de
+  now() (17/09… oui : les chunks antérieurs au 10/09 sont « plus vieux
+  que 7 jours »). C'est la première fois de la formation qu'une
+  politique relative à l'horloge agit toute seule, et le participant
+  voit le volume tomber d'un facteur 3 sans commande explicite. À faire
+  remarquer : c'est le comportement de production.
+- La colonne next_start est NULL juste après la création (aucune
+  exécution planifiée encore inscrite) : ne pas conclure « job
+  suspendu ». Le critère de suspension est scheduled = f, pas
+  next_start = NULL à t0 — relire vingt secondes plus tard.
+- Les jobs 1 et 3 sont ceux du système (télémétrie, purge de
+  l'historique des jobs) : la requête de durcir-cible.sql ne filtre pas
+  sur job_id ≥ 1000, pour que le participant les voie une fois et sache
+  les reconnaître en L14.
+
+-------------------------------------------------------------------------
+3. Pourquoi après, jamais pendant
+-------------------------------------------------------------------------
+- Compression pendant la copie : chaque \copy qui touche un chunk
+  compressé paie la décompression, l'insertion, puis la recompression
+  par la politique — et la limite DML de 100 000 tuples décompressés
+  (l8s4) peut faire ÉCHOUER une plage entière.
+- Rétention pendant la copie : une politique de rétention à 90 jours
+  relative à now() ne trouverait rien ici ; mais avec une cible dont la
+  fenêtre est plus ancienne, elle supprimerait des chunks que la copie
+  vient de remplir — sans erreur.
+- Politiques de rafraîchissement d'agrégats (s'il y en avait) : elles
+  matérialiseraient des seaux partiels pendant la copie, à invalider
+  ensuite. Sur mistral_prod il n'y en a pas : la fiche parlait de « six
+  jobs » par calque du fil rouge ; le kit en crée DEUX. Corrigé le 17/09.
+
+-------------------------------------------------------------------------
+4. Vérifications post-bascule attendues dans la checklist
+-------------------------------------------------------------------------
+  SELECT job_id, proc_name, scheduled, next_start
+  FROM timescaledb_information.jobs WHERE job_id >= 1000;   -- 2 lignes, t, non nul
+  SELECT count(*) FILTER (WHERE is_compressed), count(*)
+  FROM timescaledb_information.chunks WHERE hypertable_name = 'mesures';
+  SELECT last_value FROM mesures_id_seq;                    -- > max(id)
+  -- et le contrôle 2 rejoué sur la cible durcie : les chunks compressés
+  -- doivent donner les mêmes 72 jours que la source (ils le font).
+
+-------------------------------------------------------------------------
+5. Erreurs fréquentes
+-------------------------------------------------------------------------
+- Lire les quatre lignes de la requête et compter « quatre jobs » : deux
+  sont au système.
+- Jouer durcir-cible.sql sur `mistral` par erreur de base : il poserait
+  une DEUXIÈME politique de compression sur le fil rouge (if_not_exists
+  la retiendrait, mais la rétention à 90 j s'ajouterait aux 30 j de L09).
+  Vérifier le prompt : mistral_prod=#.
+- Considérer la migration terminée ici : la source reste en lecture
+  seule jusqu'à la date écrite dans la checklist, et le contrôle 2 se
+  rejoue avant de la supprimer.

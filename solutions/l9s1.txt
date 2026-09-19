@@ -1,0 +1,90 @@
+L09 — ÉTAPE 1 : APPLIQUER LA CHAÎNE
+===================================
+
+Fiche : « Relever l'état de départ. Compléter la chaîne : il manque la
+rétention. Le jeu est daté : une politique relative à now() ne trouve
+aucun chunk à traiter ; l'effet se déclenche à borne explicite, calculée
+depuis le dernier point du jeu. »
+
+-------------------------------------------------------------------------
+1. Commandes attendues
+-------------------------------------------------------------------------
+  \i l09/etat-chunks.sql            -- référence pour l'étape 4 : 8/0/8
+
+  -- ATELIER : valeur réduite, étiquetée
+  SELECT add_retention_policy('mesures', INTERVAL '30 days');   -- job 1007
+
+  SELECT job_id, proc_name, config
+  FROM   timescaledb_information.jobs
+  WHERE  proc_name LIKE '%compression%' OR proc_name LIKE '%retention%';
+  -- 1006 policy_compression  {"compress_after": "7 days"}   ← tranché en L08
+  -- 1007 policy_retention    {"drop_after": "30 days"}
+
+  SELECT max(ts) - INTERVAL '2 days'  AS borne_bascule,
+         max(ts) - INTERVAL '30 days' AS borne_retention
+  FROM   mesures \gset
+  -- 2026-10-27 21:59:50+00 / 2026-09-29 21:59:50+00
+
+  SELECT compress_chunk(c)
+  FROM   show_chunks('mesures', older_than => :'borne_bascule'::timestamptz) c;
+  SELECT drop_chunks('mesures', older_than => :'borne_retention'::timestamptz);
+
+-------------------------------------------------------------------------
+2. Résultats du poste
+-------------------------------------------------------------------------
+  compress_chunk : 6 chunks (86 → 91 : 10/09 → 22/10), 15,2 Go avant,
+    53,1 s, 864 Mo de journal. Le chunk 92 (22 → 29/10) n'est pas
+    « entièrement antérieur » au 27/10 : il reste en rowstore. Le 86
+    (10 → 17/09, 859 Mo : il ne contient que 2 jours, le jeu commence le
+    14/09 22:00 UTC) est basculé puis supprimé dans la foulée — travail
+    perdu, voir §4.
+  drop_chunks : 2 chunks (86, 87 : 10/09 → 24/09), 19 ms, 140 ko de
+    journal, 15 Go rendus au système de fichiers (df : 114 → 129 Go).
+
+  Les deux politiques, elles, se sont exécutées une fois chacune à leur
+  création (job_stats : total_runs 1, Success) et n'ont rien fait :
+  now() − 7 j et now() − 30 j (10/09 et 18/08) sont antérieurs à tout
+  chunk. C'est le point a) du protocole : enregistrées, supervisables en
+  M11, sans effet en salle.
+
+-------------------------------------------------------------------------
+3. Interprétation à faire écrire
+-------------------------------------------------------------------------
+- Pourquoi la politique à 7 j reste : c'est la valeur de PRODUCTION
+  tranchée en L08 (marge ×280 sur le pire retard d'arrivée de 36 min ;
+  la vraie contrainte est le backfill de correction). La modifier à 2 j
+  pour « voir quelque chose » mélangerait les deux échelles dans le
+  fichier que le participant emporte. Les 2 jours sont une BORNE
+  d'atelier, pas un réglage.
+- Pourquoi compress_chunk borné et pas run_job(1006) : run_job applique
+  la configuration de la politique (now() − 7 j) → rien. Une borne
+  explicite en max(ts) est la seule façon d'obtenir l'effet sur un jeu
+  daté ; c'est la même mécanique (compress_chunk) que la politique
+  appelle en production.
+- L'ordre bascule PUIS rétention est celui de la fiche ; l'inverse
+  aurait évité de compresser le chunk 86 pour rien (0,9 Go, ~3 s). En
+  production, les deux politiques tournent indépendamment (1006 toutes
+  les 12 h, 1007 tous les jours) : un chunk peut être compressé un matin
+  et supprimé le lendemain. Coût négligeable ; à savoir, pas à corriger.
+
+Formulation attendue : « la chaîne est enregistrée (trois politiques
+relatives à now()), mais sur un jeu daté son effet se déclenche à borne
+explicite depuis max(ts) ; les valeurs 2 j / 30 j sont d'atelier, la
+politique de bascule garde sa valeur de production (7 j). »
+
+-------------------------------------------------------------------------
+4. Erreurs fréquentes
+-------------------------------------------------------------------------
+- `add_retention_policy` sans `if_not_exists` rejoué : « policy already
+  exists ». Sans gravité.
+- Écrire les bornes en dur ('2026-10-27') : elles sont justes aujourd'hui
+  et fausses à la prochaine génération du jeu. \gset depuis max(ts).
+- Appeler drop_chunks avec `older_than => INTERVAL '30 days'` : c'est
+  relatif à now() → rien de supprimé, sans message. Piège n° 1 de la
+  fiche (« la rétention ne supprime rien »).
+- Lire la taille des chunks basculés avec pg_total_relation_size :
+  16 ko. Les données sont dans _timescaledb_internal.compress_hyper_* ;
+  utiliser chunk_compression_stats('mesures').
+- Lancer la bascule sur `mesures_avant` par erreur (190 M lignes, job
+  1000 par défaut) : ce n'est pas l'état de reprise, et ce serait 15 Go
+  de plus à basculer.

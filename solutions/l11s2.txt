@@ -1,0 +1,100 @@
+L11 — ÉTAPE 2 : PRÉPARER LA CIBLE ET COPIER, PRODUCTION OUVERTE
+=================================================================
+
+Fiche : « Lancer d'abord le flux d'écriture sur la source. Préparer la
+cible : une base dédiée, mistral_prod, qui porte le schéma de M03 et
+l'index de M06, sans compression ni politiques actives. Copie initiale,
+par plages d'identifiant, production ouverte : ./l11/migrer.sh »
+
+-------------------------------------------------------------------------
+1. Commandes et résultat du poste
+-------------------------------------------------------------------------
+  ./l11/simuler-flux.sh --debit 2000 &        # PID dans l11/.flux.pid
+  # vérifier qu'il écrit : deux comptages source à 5 s
+  #   41 476 463 → 41 484 963 : ≈ 1 700 lignes/s (quatre docker exec
+  #   par seconde ne tiennent pas tout à fait 2 000)
+
+  docker compose exec -w /atelier timescaledb psql -U postgres -d mistral
+  \i l11/preparer-cible.sql
+  #   → mistral_prod, hypertables mesures + evenements, index
+  #     (series_id, ts DESC), et les deux requêtes de contrôle :
+  #     compression_enabled = f (×2), politiques_actives = 0
+
+  time ./l11/migrer.sh
+  == copie initiale par plages (production ouverte) ==
+  borne initiale : id <= 41613341
+  plage id [1, 6000001) … ok     (× 7, la dernière [36000001, 41613342))
+  == événements ==
+  == premier delta : id [41613342, 41776842) — 163500 lignes ==
+  real  1m56s                                  (référence : 3 min 15)
+
+État après : cible 41 724 463 lignes, 11 chunks, 5 285 Mo (heap + deux
+index) ; source 41 741 963 — retard ≈ 17 500 lignes = 10 s de flux.
+
+-------------------------------------------------------------------------
+2. Pourquoi une base dédiée
+-------------------------------------------------------------------------
+La base du fil rouge contient déjà 45 jours de `mesures` qui ne sont PAS
+ceux de la legacy : fenêtres partiellement recouvrantes (15-30 sept),
+valeurs différentes, 490 séries contre 400. Y copier la source produirait
+des doublons sur (series_id, ts) — pas d'erreur, l'hypertable n'a pas de
+clé unique — et deux vérités pour la même minute. La cible de migration
+est une base neuve qui porte le SCHÉMA de M03, pas ses données.
+
+Ce que preparer-cible.sql fait et ne fait pas :
+- il conserve la colonne `id` : c'est l'identifiant monotone qui borne
+  les plages et le delta, et c'est lui qui porte la leçon du setval ;
+- il crée l'hypertable par create_hypertable() et non par CREATE TABLE
+  … WITH (tsdb.hypertable) — voir §4 ;
+- il ne pose NI compression NI politique : la copie dans un chunk
+  compressé coûte la décompression + recompression, et une politique
+  relative à now() basculerait des chunks PENDANT la copie (les données
+  de la legacy sont dans le passé de now(), contrairement au fil rouge).
+
+-------------------------------------------------------------------------
+3. Pourquoi copier par plages sur l'id, et pas la réplication logique
+-------------------------------------------------------------------------
+- Chaque plage est une transaction COPY bornée : rejouable, mesurable,
+  interruptible sans état à nettoyer côté source (pas de slot).
+- La borne haute relevée AU DÉPART (max(id) = 41 613 341) délimite ce
+  que le premier delta devra rattraper : tout ce que le flux écrit
+  pendant la copie a un id supérieur. C'est l'équivalent legacy de
+  l'horodatage d'ingestion ajouté en M05 : un ordre d'arrivée, pas un
+  ordre métier.
+- La réplication logique vers une hypertable écrit dans la table racine
+  sans routage vers les chunks (3 Go copiés, 0 ligne visible, aucun
+  message) : constaté à nouveau sur ce poste en E3 (l11s7). Elle reste
+  un bon chemin vers une table ORDINAIRE.
+
+Structure de l'id de la legacy, à connaître (elle explique le piège du
+contrôle 3, l11s4) : id = (series_id − 1) × 103 680 + rang de la minute.
+Un bloc contigu par série, la série 1 commence à l'id 38 (purge ligne à
+ligne). L'id n'est donc PAS chronologique globalement — il est monotone
+au sens qui compte : tout ce qui est inséré après la borne a un id plus
+grand.
+
+-------------------------------------------------------------------------
+4. Correction du kit faite le 17/09 (à connaître)
+-------------------------------------------------------------------------
+La version antérieure de preparer-cible.sql créait `mesures` avec
+`WITH (tsdb.hypertable, …)`. Constat sur le poste : compression_enabled
+= t et une politique columnstore par défaut (job 1000, compress_after
+7 days) — exactement ce que le commentaire du script prétendait exclure,
+et le piège n° 1 de la fiche (« la compression a été activée avant la
+copie »). Elle ne créait pas non plus l'index de M06 que la fiche annonce.
+Corrigé : create_hypertable(), index (series_id, ts DESC), et deux
+requêtes de vérification en fin de script. Voir l8s0 §2 pour l'origine
+de ce comportement de 2.29.
+
+-------------------------------------------------------------------------
+5. Erreurs fréquentes
+-------------------------------------------------------------------------
+- Lancer migrer.sh sans le flux : la copie « réussit » et l'étape 3 ne
+  montre rien. La leçon du delta suppose une production ouverte.
+- Préparer la cible dans `mistral` (par `\c` oublié) : preparer-cible
+  commence par DROP DATABASE IF EXISTS mistral_prod puis \c ; le risque
+  est d'y exécuter la suite si le \c échoue — lire la sortie.
+- Créer l'index APRÈS la copie pour aller plus vite : légitime en
+  production (c'est la variante à discuter en E4), mais la fiche
+  demande la cible complète ; sur ce poste l'index a coûté peu
+  (116 s au total contre 3 min 15 de référence sans index).

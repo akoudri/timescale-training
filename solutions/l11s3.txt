@@ -1,0 +1,71 @@
+L11 — ÉTAPE 3 : LE RATTRAPAGE, JUSQU'À STABILITÉ
+==================================================
+
+Fiche : « Rejouer le delta tant que le flux tourne : chaque passage copie
+la plage [borne précédente, max(id)] et laisse derrière lui un retard
+égal à ce qui a été écrit pendant sa propre durée. Le critère d'entrée en
+bascule : le retard est faible et STABLE. »
+
+-------------------------------------------------------------------------
+1. Résultat du poste (flux à ≈ 1 700-2 000 lignes/s)
+-------------------------------------------------------------------------
+  delta | retard avant (id) | durée  | retard après (id)
+  ------+-------------------+--------+-------------------
+    1   |      36 000       | 1,52 s |      2 000
+    2   |       3 500       | 1,63 s |      2 500
+    3   |       4 000       | 1,46 s |      2 000
+    4   |       3 500       | 1,43 s |      2 000
+    5   |       3 500       | 1,44 s |      2 000
+
+(le « retard avant » de chaque ligne = retard après du précédent + ce
+que le flux a écrit entre les deux commandes, ≈ 1-2 s de saisie)
+
+Lecture : dès le delta 1 le retard tombe de 36 000 à 2 000 et n'en bouge
+plus. 2 000 id ≈ 1 seconde de flux = la durée du delta lui-même (1,5 s,
+dont la part fixe des deux docker exec). Il ne décroît plus, il oscille :
+c'est le critère. Continuer à rejouer des deltas ne gagne rien — chaque
+passage laisse derrière lui exactement ce qui s'écrit pendant sa durée.
+
+-------------------------------------------------------------------------
+2. Pourquoi c'est un critère de STABILITÉ et non de zéro
+-------------------------------------------------------------------------
+Production ouverte, le retard ne peut pas atteindre zéro : le delta
+copie [borne, max(id)] et pendant qu'il copie, max(id) avance. Le retard
+résiduel est une fonction du débit du flux et de la durée d'un delta —
+pas de la taille de la base. C'est pour cela que l'interruption de
+l'étape 5 est courte quelle que soit la volumétrie : à la bascule, le
+flux est arrêté, et le delta final n'a que ce résidu à copier.
+
+Deux régimes à reconnaître :
+- retard qui DÉCROÎT à chaque passage : la copie initiale a laissé un
+  gros écart (ici 163 500 lignes au delta 1 de migrer.sh, puis 36 000)
+  et chaque delta le réduit ; on n'est pas encore à l'équilibre ;
+- retard qui NE DÉCROÎT PAS et reste grand : le flux est plus rapide que
+  la copie (piège « le delta ne rétrécit jamais ») — réduire le débit du
+  simulateur ; en production, c'est le signe qu'il faut copier par un
+  chemin plus rapide (COPY binaire, parallélisme), pas attendre.
+
+-------------------------------------------------------------------------
+3. La mesure demandée par la fiche
+-------------------------------------------------------------------------
+  echo "dernière borne copiée : $(cat l11/.borne)"
+  docker compose exec -T legacy psql -U postgres -d mistral_legacy -Atc \
+    "SELECT max(id) FROM mesures;"
+  # retard = max(id) − borne, en identifiants ; en lignes c'est pareil
+  # tant que la séquence n'a pas de trous (pendant le flux : aucun)
+
+Remarque : compter en id et compter en lignes diffèrent sur le stock
+initial (la séquence source était en avance de 52 341 sur max(id) :
+purges ligne à ligne de la legacy), pas sur le flux. Le contrôle 1 compte
+des lignes ; le delta se borne par des id. Ne pas mélanger les deux.
+
+-------------------------------------------------------------------------
+4. Erreurs fréquentes
+-------------------------------------------------------------------------
+- Déclarer « retard nul » après un delta parce que la commande a dit
+  « delta ok » : le retard se LIT (max(id) − borne), il ne se déduit pas.
+- Basculer au premier delta faible sans avoir vu qu'il est stable : un
+  retard de 2 000 qui suit un retard de 36 000 peut encore être en
+  décroissance. Deux ou trois passages, pas un.
+- Arrêter le flux pour « aider » le delta : c'est l'étape 5, et elle
+  est chronométrée. Tant qu'on n'est pas en bascule, la production tourne.

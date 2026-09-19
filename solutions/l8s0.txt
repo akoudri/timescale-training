@@ -1,0 +1,108 @@
+L08 — SEGMENTATION COMPARÉE — PROTOCOLE COMMUN (corrigé formateur)
+=====================================================================
+
+Fichiers : l8s1 (étape 1, trois configurations), l8s2 (étape 2, bascule
+et ratios), l8s3 (étape 3, les neuf mesures), l8s4 (étape 4, coût d'une
+correction), l8s5 (étape 5, la cardinalité en chiffres), l8s6 (étape 6,
+trancher + politiques.sql + nettoyage), l8s7 (extensions E1-E4).
+
+-------------------------------------------------------------------------
+1. Ce que l'atelier vérifie
+-------------------------------------------------------------------------
+Trois choses, dans cet ordre :
+  a) le choix de segmentby n'est pas un réglage : à données identiques,
+     il fait varier le ratio du simple au double (×9,3 contre ×4,7) et
+     décide si une requête filtrée lit 9 lots ou 4 400 ;
+  b) une correction (UPDATE) sur chunk basculé est possible SEULEMENT si
+     le segment visé est petit : sans segmentby, elle est REFUSÉE par la
+     limite de décompression DML (100 000 tuples par transaction) ;
+  c) la cardinalité est un chiffre : 96 lignes par segment et par chunk
+     (mesures_hc) contre 8 631 (cmp_serie), même configuration, et le
+     ratio passe de ×9,3 à ×5,6 — les lots ne se remplissent pas.
+
+-------------------------------------------------------------------------
+2. État du poste vérifié le 17/09/2026 (avant L08)
+-------------------------------------------------------------------------
+- TimescaleDB 2.29.2 / PG17, Toolkit 1.25. État M08 reconstitué le jour
+  même : index mesures_series_id_ts_idx (L05), pyramide mistral_1min/1h/1j
+  + politiques (jobs 1003-1005), lot tardif de 100 000 points rattrapé
+  (contrôle de somme J-3 : 4 332 767 points aux quatre niveaux).
+- `mesures` : 190 058 049 lignes, 8 chunks de 7 j, AUCUN chunk compressé,
+  18 Go avec ses deux index (ts seul + série/ts). Elle porte le job
+  columnstore PAR DÉFAUT 1002 (compress_after 7 j, sans segmentby) issu de
+  `CREATE TABLE … WITH (tsdb.hypertable)` : c'est le piège de l'étape 6.
+  Idem jobs 1000 (mesures_avant, hypertable de 190 M lignes créée par
+  l'utilisateur en L02/L03, laissée en place) et 1001 (mesures_charge,
+  vidée en L04).
+- `mesures_hc` : 13 440 000 lignes, 8 chunks journaliers UTC (22/10 →
+  30/10), 775 Mo, sans index, non compressée. Le premier chunk (22/10)
+  n'a que 2 h de données (160 000 lignes) : chunk PARTIEL.
+- Paramètres qui comptent (SHOW) :
+    timescaledb.compression_batch_size_limit = 1000
+    timescaledb.max_tuples_decompressed_per_dml_transaction = 100000
+  Le premier tranche le point ouvert des notes de production : la taille
+  maximale d'un lot est bien 1 000 lignes en 2.29 (mesuré : 960 lignes
+  par lot en moyenne sur cmp_serie, 1 000 exactement sur cmp_aucun).
+- Nettoyage L03/L04 fait avant l'atelier (mesures_ord, mesures_1j/7j/30j
+  supprimées, mesures_charge vidée) : 114 Go libres.
+- Fuseau de session Etc/UTC ; les fenêtres de l'atelier sont écrites en
+  UTC dans les fichiers fournis (jours 25-26 septembre 2026, nominaux).
+
+-------------------------------------------------------------------------
+3. Corrections du kit apprenant faites le 17/09 (à connaître)
+-------------------------------------------------------------------------
+- Fiche, étape 2 : `\i l08/basculer.sql cmp_serie` ne fonctionne pas
+  (`\i` ne prend pas d'argument ; psql l'ignore et :table est indéfini).
+  Remplacé par `\set table cmp_serie` puis `\i l08/basculer.sql`, la
+  convention de l08/ratios.sql.
+- `l08/basculer.sql` et fiche, étape 2 : `hypertable_compression_stats()`
+  ne retourne PAS de colonne hypertable_name (colonnes : total_chunks,
+  number_compressed_chunks, before/after_*_bytes, node_name). La requête
+  échouait après la bascule. Corrigé : le nom vient de :'table'.
+- Rien d'autre : creer-configurations.sql, ratios.sql, R1-R3 et
+  mesure.sh --table fonctionnent tels quels.
+
+-------------------------------------------------------------------------
+4. Mesures de référence (env. 2 vCPU / 8 Go, NVMe) et mesures du poste
+-------------------------------------------------------------------------
+                          référence            poste (17/09)
+  ratio cmp_serie          ×9,3                 ×9,3 (9,2 / 9,3 par chunk)
+  ratio cmp_machine        ×5,0                 ×5,0
+  ratio cmp_aucun          ×4,7                 ×4,7
+  486 Mo → serie/machine/aucun                  52 / 97 / 103 Mo
+  bascule (2 chunks, 8,46 M lignes)             1,30 s / 2,50 s / 1,93 s
+  R2 filtrée (mesure.sh)   87 ms / — / 123 ms   83 / 98 / 121 ms
+  R1 (mesure.sh)                                80 / 85 / 81 ms
+  R3 (mesure.sh)                                126 / 132 / 166 ms
+  UPDATE série-jour        19,9 ms              15,3 ms (cmp_serie)
+     sans segmentby        ÉCHOUE (4,23 M)      ÉCHOUE, 832 ms perdus
+     segment machine       —                    93 ms (86 400 tuples)
+  décompression / recompression  846 / —        709 ms / 1 115 ms
+  UPDATE sur rowstore      241 ms               235 ms
+  ratio mesures_hc         ×5,6                 ×5,6 (5,9 par chunk plein)
+  lignes/segment/chunk     8 631 vs 96          8 631 vs 96
+  lots par chunk plein     —                    4 405 (960/lot) vs 20 000 (96/lot)
+  octets compressés/ligne  —                    6,49 vs 10,28
+
+Plancher de mesure.sh sur ce poste : ~80 ms (docker exec + démarrage de
+psql). Les écarts entre configurations se lisent donc sur R2 et R3 ; pour
+R1 (LIMIT 1) ils sont sous le plancher — voir l8s3 pour les temps
+serveur relevés par EXPLAIN ANALYZE, qui montrent l'écart réel (R2 :
+0,28 ms contre 39 ms).
+
+-------------------------------------------------------------------------
+5. État de sortie mistral-M09 (vérifié)
+-------------------------------------------------------------------------
+- `mesures` : compression configurée segmentby series_id / orderby
+  ts DESC (timescaledb_information.compression_settings), politique
+  job 1006 compress_after 7 days (schedule 12 h), 0 chunk compressé —
+  la bascule bornée est l'objet de L09. Politique par défaut 1002 retirée.
+- `mesures_hc` : 8/8 chunks compressés, même configuration, 139 Mo.
+  Elle reste (démonstration de cardinalité, M15).
+- Tables cmp_* supprimées ; disque : 114 Go libres avant et après (les
+  trois tables pesaient 260 Mo compressées).
+- Index et pyramide intacts (mesures_ts_idx1, mesures_series_id_ts_idx ;
+  mistral_1min/1h/1j, jobs 1003-1005).
+- Jobs 1000 (mesures_avant) et 1001 (mesures_charge) toujours là, avec
+  la configuration par défaut : sans effet sur la suite (mesures_charge
+  est vide ; mesures_avant n'est pas dans l'état de reprise).

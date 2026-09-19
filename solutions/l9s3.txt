@@ -1,0 +1,101 @@
+L09 — ÉTAPE 3 : COHÉRENCE DES FENÊTRES — ET LE PIÈGE DES DEUX HORLOGES
+======================================================================
+
+Fiche : « Le seuil de rétention doit être strictement supérieur à la
+portée du rafraîchissement. Si la rétention coupe à 30 jours et que le
+rafraîchissement remonte à 35, chaque passage matérialise du vide et
+écrase des valeurs auparavant correctes. Écrire la vérification en une
+ligne dans politiques.sql. »
+
+-------------------------------------------------------------------------
+1. Résultat du poste (\i l09/coherence-fenetres.sql, version 17/09)
+-------------------------------------------------------------------------
+  rafraîchissement mistral_1min   00:30:00
+  rafraîchissement mistral_1h     04:00:00
+  bascule columnstore (atelier)   2 days
+  rafraîchissement mistral_1j     3 days
+  rétention (atelier)             30 days
+  → COHÉRENT : la rétention (30 j) dépasse la plus grande portée (3 j)
+
+Ligne attendue dans politiques.sql :
+  -- cohérence (l09/coherence-fenetres.sql) : rétention 30 j > portée max
+  -- de rafraîchissement 3 j (mistral_1j) > bascule 2 j  ✓
+
+L'ordre rétention > portée > bascule se lit ainsi : le brut doit exister
+tant qu'un rafraîchissement peut le relire (rétention > portée) ; et il
+vaut mieux qu'il soit encore en rowstore quand il est relu souvent
+(portée > bascule : un rafraîchissement sur columnstore fonctionne, il
+lit seulement plus lentement — ce n'est pas une règle de sûreté mais de
+coût).
+
+-------------------------------------------------------------------------
+2. Ce que le contrôle ne voit pas : les deux horloges (observé en direct)
+-------------------------------------------------------------------------
+Le contrôle compare des INTERVALLES (30 j > 3 j) et suppose que les deux
+politiques mesurent depuis la même origine. En production c'est vrai :
+toutes deux sont relatives à now(). En atelier, ce n'est plus vrai :
+  - la rétention a été appliquée à borne explicite : max(ts) − 30 j
+    = 29/09/2026 ;
+  - les rafraîchissements tournent relativement à now() = 17/09/2026,
+    c'est-à-dire 42 jours plus tôt — DANS la zone purgée (10 → 24/09).
+Vu depuis l'agrégat, la rétention est donc « à −12 jours » et le
+rafraîchissement 1min « à −30 minutes » : la règle est violée, et le
+contrôle dit COHÉRENT.
+
+Effet mesuré sur le poste :
+  mistral_1min  31 660 848 lignes avant la purge
+                31 645 658 quelques minutes après : −15 190 = 31 × 490
+                31 644 188 deux minutes plus tard : −490 par minute
+  Heure 17/09 17:00 UTC : 14 210 lignes au lieu de 29 400 (29 minutes
+  sur 60) ; heure 18:00 en cours d'érosion. Aucune erreur, aucun
+  avertissement, job 1003 en Success à chaque passage (21 exécutions).
+  Le trou grandira de 490 lignes/min tant que now() < 24/09 (retour du
+  brut), soit ~4,9 M lignes au total si l'instance tourne toute la
+  semaine. Les niveaux 1h et 1j (source = l'agrégat du dessous) étaient
+  encore intacts à 18:05 après trois passages de la politique 1h ; les
+  suppressions faites par un rafraîchissement ne semblent pas
+  journalisées comme invalidation pour le niveau supérieur — observé,
+  à ne pas tenir pour garanti.
+
+C'est exactement « l'erreur du bloc 10.2 », produite non par une valeur
+mal choisie mais par une DIFFÉRENCE D'ORIGINE entre deux politiques. La
+référence formateur, jouée avant le 15/09, ne l'a pas rencontrée ; tout
+poste joué entre le 15/09 et le 30/10/2026 la rencontrera.
+
+-------------------------------------------------------------------------
+3. Ce qu'on en tire (à faire écrire)
+-------------------------------------------------------------------------
+- Règle complétée : « rétention > portée de rafraîchissement, MESURÉES
+  DEPUIS LA MÊME ORIGINE ». Toute purge à borne explicite doit vérifier
+  borne_retention < now() − portée_max, sinon elle purge sous les pieds
+  des politiques. Requête de garde, à ajouter avant drop_chunks borné :
+    SELECT :'borne_retention'::timestamptz
+         < now() - (SELECT max((config->>'start_offset')::interval)
+                    FROM timescaledb_information.jobs
+                    WHERE proc_name = 'policy_refresh_continuous_aggregate')
+           AS purge_sure;
+  Sur ce poste : false. En atelier on choisit de purger quand même
+  (l'effet est la leçon) ; en production, false = on ne purge pas.
+- La requête de détection de E1 (jours sans seau entre min et max de
+  l'agrégat, l9s5) devient l'alerte de M15 : elle ne déclenche pas ici
+  (le trou est infra-journalier), d'où une seconde détection utile,
+  par heure : count(*) par seau heure de mistral_1min < 490.
+- Deux options de kit, tranchées en NOTES-PRODUCTION : générer le jeu sur
+  une fenêtre qui ne contient jamais les dates de session (config.yaml
+  du générateur), ou plafonner la borne d'atelier à
+  least(max(ts) − 30 j, now() − 3 j) — ce qui, un jour de session dans
+  la fenêtre, ne purge rien et enlève sa démonstration à l'étape 2.
+
+-------------------------------------------------------------------------
+4. Erreurs fréquentes
+-------------------------------------------------------------------------
+- Croire le verdict du script sans regarder l'origine des deux
+  fenêtres : c'est le point de cette section.
+- Vouloir « réparer » le trou par run_job(1003) ou refresh borné : le
+  brut n'existe plus, un rafraîchissement supprime plutôt qu'il ne
+  recrée. Seule voie : réinsérer le brut (ici, il existe encore dans
+  `mesures_avant`) puis rafraîchir — et le trou se rouvre à la minute
+  suivante tant que now() reste dans la zone. Non fait sur ce poste :
+  aucun atelier suivant ne lit septembre.
+- Lire « COHÉRENT » comme « la chaîne est sûre » : le script ne vérifie
+  ni l'origine des fenêtres ni l'ordre d'exécution des jobs.

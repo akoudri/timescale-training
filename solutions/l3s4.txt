@@ -1,0 +1,142 @@
+L03 — ÉTAPE 4 : TROUVER LA REQUÊTE QUI N'EXCLUT RIEN — CORRIGÉ FORMATEUR
+=========================================================================
+
+Table : mesures_1j (50 séries, 45 jours, chunks d'un jour → 46 chunks).
+Toutes les requêtes calculent la même chose : la moyenne de `valeur` sur
+une fenêtre de trois jours à partir du 1er octobre 2026 (heure de Paris).
+Elles ne diffèrent que par l'écriture du prédicat temporel — et donc par
+ce que le planificateur peut en faire.
+
+Exécution, depuis psql connecté à mistral (répertoire courant /atelier) :
+
+    \i l03/exclusion/Q1.sql
+    \i l03/exclusion/Q2.sql
+    \i l03/exclusion/Q3.sql
+    \i l03/exclusion/Q4.sql
+    \i l03/exclusion/Q5.sql
+
+Chaque fichier enveloppe la requête dans EXPLAIN (ANALYZE, BUFFERS, TIMING OFF).
+
+-------------------------------------------------------------------------
+Q1 — bornes littérales (référence)
+-------------------------------------------------------------------------
+EXPLAIN (ANALYZE, BUFFERS, TIMING OFF)
+SELECT avg(valeur) FROM mesures_1j
+WHERE  ts >= '2026-10-01T00:00:00+02' AND ts < '2026-10-04T00:00:00+02';
+
+Catégorie : EXCLUSION À LA PLANIFICATION.
+Preuve : le nœud Append ne liste que les chunks utiles (4 à 5 sur 46 :
+la fenêtre de 3 jours en heure de Paris chevauche 4 chunks UTC, plus un
+partiel). Les 41 autres n'apparaissent pas du tout dans le plan.
+Référence : ≈ 60 ms.
+
+-------------------------------------------------------------------------
+Q2 — EXTRACT non sargable… accompagné de bornes littérales
+-------------------------------------------------------------------------
+EXPLAIN (ANALYZE, BUFFERS, TIMING OFF)
+SELECT avg(valeur) FROM mesures_1j
+WHERE  EXTRACT(hour FROM ts) = 14
+  AND  ts >= '2026-10-01T00:00:00+02' AND ts < '2026-10-04T00:00:00+02';
+
+Catégorie : EXCLUSION À LA PLANIFICATION — malgré la fonction sur ts.
+Preuve : mêmes 4-5 scans de chunk qu'en Q1 ; l'EXTRACT apparaît comme
+« Filter » résiduel sur chaque chunk (Rows Removed by Filter), il ne
+participe pas à l'exclusion mais ne l'empêche pas.
+Le point à faire dire : un prédicat non sargable n'est fatal que lorsqu'il
+est le SEUL prédicat temporel. Ici le planificateur exclut sur les bornes,
+puis filtre l'heure.
+Référence : ≈ 75 ms.
+
+-------------------------------------------------------------------------
+Q3 — requête préparée, plan générique forcé (comportement d'un pool)
+-------------------------------------------------------------------------
+PREPARE p(timestamptz, timestamptz) AS
+SELECT avg(valeur) FROM mesures_1j WHERE ts >= $1 AND ts < $2;
+SET plan_cache_mode = force_generic_plan;
+EXPLAIN (ANALYZE, BUFFERS, TIMING OFF)
+EXECUTE p('2026-10-01T00:00:00+02', '2026-10-04T00:00:00+02');
+DEALLOCATE p;
+RESET plan_cache_mode;
+
+Catégorie : EXCLUSION À L'EXÉCUTION (au démarrage).
+Preuve : le nœud est un Custom Scan (ChunkAppend) qui porte les 46 chunks
+au plan, avec la ligne « Chunks excluded during startup: 42 ». Les bornes
+ne sont pas connues à la planification (plan générique), l'élimination se
+fait quand la requête démarre — et se paie à chaque exécution, avec un
+coût qui croît avec le nombre de chunks (voir E2 sur 1 080 chunks).
+Référence : ≈ 132 ms.
+
+-------------------------------------------------------------------------
+Q4 — borne issue d'une sous-requête
+-------------------------------------------------------------------------
+EXPLAIN (ANALYZE, BUFFERS, TIMING OFF)
+SELECT avg(valeur) FROM mesures_1j
+WHERE  ts >= (SELECT max(ts) - interval '3 days' FROM mesures_1j);
+
+Catégorie : EXCLUSION À L'EXÉCUTION.
+Preuve : un InitPlan calcule la borne ; le ChunkAppend liste tous les
+chunks et affiche « Chunks excluded during runtime: 42 » ; les chunks
+écartés portent la mention (never executed). La borne n'existe qu'une
+fois la sous-requête évaluée.
+Référence : ≈ 121 ms.
+
+-------------------------------------------------------------------------
+Q5 — fonction appliquée à la colonne de temps
+-------------------------------------------------------------------------
+EXPLAIN (ANALYZE, BUFFERS, TIMING OFF)
+SELECT avg(valeur) FROM mesures_1j
+WHERE  date_trunc('day', ts) = '2026-10-01T00:00:00+02';
+
+Catégorie : AUCUNE EXCLUSION — c'est la requête fautive.
+Preuve : 46 scans de chunk, « Chunks excluded during startup: 0 », chaque
+chunk porte le Filter date_trunc(...) et « Rows Removed by Filter: 432000 »
+sur ceux qui n'ont rien à voir avec la fenêtre. Le planificateur ne sait
+pas inverser date_trunc pour comparer aux bornes des chunks : la colonne
+est devenue opaque.
+Référence : ≈ 1 022 ms.
+
+Q5 CORRIGÉE — même résultat, plage demi-ouverte sargable
+EXPLAIN (ANALYZE, BUFFERS, TIMING OFF)
+SELECT avg(valeur) FROM mesures_1j
+WHERE  ts >= '2026-10-01T00:00:00+02'
+  AND  ts <  '2026-10-01T00:00:00+02'::timestamptz + interval '1 day';
+
+Preuve : 2 à 3 scans au plan, exclusion à la planification.
+Référence : ≈ 38 ms, soit un gain × 27. C'est ce rapport qu'on consigne
+dans mesures.md, avec le nombre de chunks avant/après.
+(Le fichier l03/exclusion/Q5-corrigee.sql de la copie de référence
+contient cette version.)
+
+-------------------------------------------------------------------------
+Tableau de classement attendu (l03/exclusion/classement.md)
+-------------------------------------------------------------------------
+| Requête | Catégorie                   | Preuve dans le plan                          |
+|---------|-----------------------------|----------------------------------------------|
+| Q1      | exclusion à la planification| 4-5 chunks au plan sur 46                    |
+| Q2      | exclusion à la planification| idem ; EXTRACT en filtre résiduel            |
+| Q3      | exclusion à l'exécution     | 46 au plan, « excluded during startup: 42 » |
+| Q4      | exclusion à l'exécution     | 46 au plan, « excluded during runtime: 42 » |
+| Q5      | aucune exclusion            | 46 chunks scannés, 0 exclu                   |
+
+Une seule des cinq relève de la troisième catégorie : Q5.
+
+-------------------------------------------------------------------------
+Ce qu'il faut faire lire dans un plan (pour la restitution)
+-------------------------------------------------------------------------
+1. Le nœud au-dessus des chunks : Append ou Custom Scan (ChunkAppend).
+2. Le nombre de chunks listés sous ce nœud, comparé au total (46).
+3. Les lignes « Chunks excluded during startup/runtime: N » : présentes
+   seulement quand l'exclusion se fait à l'exécution.
+4. Sur les chunks lus : « Rows Removed by Filter » — élevé sur tous les
+   chunks = la requête lit tout et filtre après, c'est Q5.
+5. « Planning Time » : quasi constant ici, il ne trahit la prolifération
+   de chunks que sur mesures_1h (E1).
+
+Erreurs fréquentes des participants :
+- classer Q2 en « aucune exclusion » par réflexe (fonction sur ts) sans
+  regarder le plan ;
+- ne pas distinguer Q3 et Q4 de Q1 : le résultat est le même, le
+  mécanisme et le coût ne le sont pas ;
+- corriger Q5 avec date_trunc des deux côtés (ts >= date_trunc(...)) :
+  c'est sargable seulement si la fonction est sur la constante, pas sur
+  la colonne — la version demi-ouverte est la bonne.

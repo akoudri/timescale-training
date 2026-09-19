@@ -1,0 +1,107 @@
+L10 — ÉTAPE 2 : ÉCRIRE L'ACTION — LE CONTRAT ET LA RÉFÉRENCE DE TEMPS
+======================================================================
+
+Fiche : « La signature est imposée : un identifiant de job, une
+configuration en JSON. […] "plus ancien que le seuil" par rapport à quoi ?
+L'horloge murale, ou le dernier point reçu par le parc ? Écrire le choix
+en commentaire. Ne pas tester en appelant la procédure directement. »
+
+-------------------------------------------------------------------------
+1. Procédure attendue (l10/controle-qualite.sql)
+-------------------------------------------------------------------------
+CREATE OR REPLACE PROCEDURE controle_qualite(job_id int, config jsonb)
+LANGUAGE plpgsql AS $$
+DECLARE
+  seuil     interval := (config->>'seuil')::interval;
+  reference timestamptz;
+  n         integer;
+BEGIN
+  -- journaliser le paramètre reçu : une config mal formée (clé absente)
+  -- donne NULL sans erreur, et le filtre ne retient alors personne
+  RAISE NOTICE 'controle_qualite job=% seuil=%', job_id, seuil;
+
+  -- « plus ancien que le seuil » PAR RAPPORT AU DERNIER POINT DU PARC :
+  -- le jeu est daté (now() = 42 j avant max(ts)), et en production un
+  -- incident de collecte global ne doit pas déclarer 490 capteurs muets
+  -- (c'est un autre symptôme — aucun point du parc — alerte A3 de M15)
+  SELECT max(ts) INTO reference FROM mesures;
+
+  INSERT INTO alertes_qualite (detecte_le, series_id, dernier_point, anciennete)
+  SELECT now(), d.series_id, d.dernier, reference - d.dernier
+  FROM  (SELECT DISTINCT ON (series_id) series_id, ts AS dernier  -- R5 de L05
+         FROM   mesures
+         ORDER  BY series_id, ts DESC) d
+  WHERE d.dernier < reference - seuil;
+
+  GET DIAGNOSTICS n = ROW_COUNT;
+  RAISE NOTICE 'controle_qualite : % capteurs muets', n;
+END $$;
+
+-------------------------------------------------------------------------
+2. Les trois décisions que le code porte
+-------------------------------------------------------------------------
+a) LE CONTRAT. (job_id int, config jsonb) est imposé par l'ordonnanceur :
+   c'est lui qui appelle la procédure avec l'identifiant du job et la
+   configuration stockée dans le catalogue. Tout ce qui doit varier
+   (seuil, périmètre, tolérance) vient de `config`, jamais du code : un
+   alter_job(job_id, config => …) suffit à changer le comportement, et
+   c'est exactement ce que fait l'étape 4 pour casser le job — puis pour
+   le réparer. Le RAISE NOTICE de la première ligne n'est pas cosmétique :
+   il est la seule trace de ce que l'action a reçu (piège du seuil NULL,
+   l10s4 §3).
+
+b) LA RÉFÉRENCE DE TEMPS. L'ancienneté se mesure contre max(ts) du parc,
+   pas contre now(). Deux raisons, de nature différente :
+   - d'atelier : le jeu est daté ; avec now(), 490 capteurs seraient
+     « muets depuis 42 jours » quel que soit le jour de la séance ;
+   - de production : si le collecteur s'arrête, PLUS AUCUN capteur ne
+     remonte. Contre now(), l'action déclarerait 490 capteurs muets d'un
+     coup et noierait la vraie information (une panne de collecte, pas
+     490 pannes de capteurs). Contre max(ts), elle ne dit rien — et c'est
+     l'alerte « flux muet » de M15 (A3), qui compare max(ts) à l'horloge,
+     qui porte ce symptôme-là. Deux symptômes, deux détecteurs.
+   Formulation attendue, en commentaire dans la procédure : « un capteur
+   est muet s'il a cessé de parler alors que le parc, lui, parle ».
+
+c) LA REQUÊTE DU DERNIER POINT. La référence formateur écrit
+   `SELECT series_id, max(ts) FROM mesures GROUP BY series_id HAVING …` ;
+   la version ci-dessus réutilise R5 de L05 (DISTINCT ON + index
+   (series_id, ts DESC)). Mesuré sur le poste, chunks columnstore compris :
+     GROUP BY max(ts)  : 3 020 ms (HashAggregate parallèle, chaque chunk
+                         lu en entier : ColumnarIndexScan + Seq Scan)
+     DISTINCT ON       :   504 ms (SkipScan sur chaque chunk : 490 lignes
+                         lues par chunk au lieu de 29 M ; sur les chunks
+                         columnstore, l'index des métadonnées de lot
+                         _compressed_series_id__ts_meta_v2_first_ts_idx
+                         joue le rôle de l'index de L05)
+   Les deux sont justes ; la seconde est six fois moins chère pour une
+   action qui tourne toutes les heures. C'est la leçon de L05 (« c'est
+   l'index qui fait le travail ») qui revient dans une action. Les deux
+   formulations sont acceptables au livrable ; la première mérite la
+   remarque.
+
+-------------------------------------------------------------------------
+3. Pourquoi ne pas tester par CALL controle_qualite(0, '{…}')
+-------------------------------------------------------------------------
+Le job s'exécute dans un worker d'arrière-plan : rôle propriétaire du job
+(celui qui a fait add_job), search_path par défaut du rôle, pas de
+variables de session, pas de transaction ouverte par l'appelant. Un CALL
+en session hérite du search_path, du rôle courant et de ses privilèges —
+un test qui passe ne prouve pas que le job passera. `CALL run_job(id)`
+exécute la procédure comme le ferait l'ordonnanceur (mêmes paramètres,
+même config) — c'est le bon test du CODE. Mais il ne remplace pas
+l'ordonnanceur pour tester la SUPERVISION : voir l10s4.
+
+-------------------------------------------------------------------------
+4. Erreurs fréquentes
+-------------------------------------------------------------------------
+- `now() - max(ts) > seuil` : la référence murale. Sur le poste, 490
+  lignes à chaque passage ; en production, une panne de collecte devient
+  490 alertes.
+- `HAVING max(ts) < now() - seuil` sans RAISE NOTICE : quand la config est
+  mal formée, la procédure réussit en silence avec 0 ligne.
+- Oublier `GET DIAGNOSTICS` : le nombre de capteurs n'est pas journalisé,
+  et l'extension E3 n'a rien à instrumenter.
+- Une FUNCTION au lieu d'une PROCEDURE : add_job accepte les deux, mais
+  une fonction ne peut pas faire de COMMIT intermédiaire (utile pour les
+  actions longues de E1) ; la fiche impose la procédure.

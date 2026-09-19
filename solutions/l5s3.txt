@@ -1,0 +1,115 @@
+L05 — R3 : COURBE DE VENT À PAS RÉGULIER (corrigé)
+====================================================
+
+Fiche : « Attendu : time_bucket_gapfill avec ses bornes, pour que chaque
+heure de la fenêtre produise une ligne. Puis la question qui compte :
+faut-il remplir ces lignes, et avec quoi ? Trancher d'après la nature du
+signal, pas d'après le confort d'affichage. Écrire la justification dans
+l05/apres/R3.sql, en commentaire. »
+
+-------------------------------------------------------------------------
+1. Le problème : des heures absentes, pas des heures nulles
+-------------------------------------------------------------------------
+`GROUP BY date_trunc('hour', ts)` ne produit une ligne que pour les
+heures qui ont AU MOINS un point. Le jeu contient une vingtaine
+d'interruptions de collecte de 35 min à 8 h (L00 §5) : une interruption
+de 3 h fait disparaître deux ou trois lignes, et l'outil de tracé relie
+les deux voisines par une droite — l'axe des temps « se contracte ».
+Ce n'est pas la base qui est fausse, c'est l'affichage qui invente une
+continuité. Sur la série serie_vent = 3 (machine 1, `vitesse_vent_ms`),
+compter les heures : 45 j × 24 = 1 080 attendues ; l'avant en retourne
+moins.
+
+  SELECT count(*) FROM (SELECT time_bucket('1 hour', ts) FROM mesures
+         WHERE series_id = :serie_vent AND ts >= :'debut' AND ts < :'fin'
+         GROUP BY 1) s;
+
+-------------------------------------------------------------------------
+2. Requête après (l05/apres/R3.sql)
+-------------------------------------------------------------------------
+-- Nœud responsable : Custom Scan (GapFill) au-dessus du GroupAggregate —
+-- il ENGENDRE les seaux manquants entre :debut et :fin ; le balayage
+-- (Seq Scan des 8 chunks, Filter series_id) est inchangé, la durée aussi
+-- (× 1,0). La réécriture répare l'AXE, pas la vitesse.
+--
+-- JUSTIFICATION : les valeurs des seaux engendrés restent à NULL.
+-- La vitesse de vent est une grandeur VOLATILE : son autocorrélation
+-- tombe en quelques minutes. LOCF (dernière valeur portée) fabriquerait
+-- un vent constant pendant 3 h — un plateau qui n'a jamais existé ;
+-- interpolate() fabriquerait une rampe entre deux valeurs sans lien.
+-- Les deux produisent une donnée FAUSSE, indistinguable d'une mesure, qui
+-- entrerait ensuite dans les moyennes, les percentiles (M07) et les
+-- alertes (M15). Le trou EST l'information : le tableau de bord doit
+-- montrer une interruption, et E3 / M11 la qualifier.
+SELECT time_bucket_gapfill(INTERVAL '1 hour', ts,
+                           :'debut'::timestamptz, :'fin'::timestamptz) AS heure,
+       avg(valeur) AS vitesse
+FROM   mesures
+WHERE  series_id = :serie_vent
+  AND  ts >= :'debut' AND ts < :'fin'
+GROUP  BY 1 ORDER BY 1;
+
+Résultat : exactement 1 080 lignes, les heures d'interruption avec
+`vitesse` NULL. Dans Grafana, l'option « Connect null values » à
+« Never » laisse le trou visible ; c'est le réglage à retenir pour L15.
+
+-------------------------------------------------------------------------
+3. La grille de décision (bloc 6.2), appliquée aux signaux MISTRAL
+-------------------------------------------------------------------------
+La question n'est pas « quelle fonction ? » mais « qu'a-t-on le DROIT
+d'inventer entre deux mesures ? » :
+
+  Nature du signal            Exemple MISTRAL            Trou
+  Consigne / état, change     angle_pale_deg, disponible LOCF légitime : la
+  par paliers, reste vrai     (0/1), etat d'un job        valeur reste vraie
+  jusqu'au prochain ordre                                 jusqu'au changement
+  Grandeur lente, continue    temperature_nacelle_c,     interpolate() défen-
+  (inertie de plusieurs h)    temperature_multiplicateur dable sur un trou court
+  Compteur monotone           energie_kwh                interpolation du
+                                                          CUMUL défendable,
+                                                          jamais du débit (M07)
+  Grandeur volatile           vitesse_vent_ms,           RIEN : NULL, trou
+                              puissance_kw, irradiance   visible, à qualifier
+
+Le piège visé par la fiche : « R3 est réécrite avec locf() par réflexe ».
+Une réécriture avec locf() ou interpolate() SANS justification ne passe
+pas le critère ; une réécriture avec locf() justifiée par « c'est plus
+joli » non plus. Une réécriture qui laisse NULL doit dire pourquoi (le
+commentaire ci-dessus).
+
+Précision utile : la moyenne horaire d'une heure PARTIELLEMENT couverte
+(interruption de 35 min) n'est pas NULL — elle est calculée sur 150
+points au lieu de 360 et rien ne le signale. gapfill ne voit que les
+heures vides. Compter les points par seau (`count(*)`) à côté de la
+moyenne rend le trou partiel visible ; c'est la piste d'E3.
+
+-------------------------------------------------------------------------
+4. Plans et mesure
+-------------------------------------------------------------------------
+Avant et après : Parallel Append de 8 Seq Scan (Filter: series_id = 3),
+Sort, GroupAggregate. Aucun index ne porte series_id à ce stade : lire
+190 M de lignes pour en garder 388 800 (0,2 %) coûte 9 s dans les deux
+cas. Après l'étape R5, l'index (series_id, ts DESC) transforme ce plan en
+Index Scan par chunk : relancer R3 après l'index est une bonne façon de
+montrer que le gain de R3 ne pouvait pas venir de sa syntaxe.
+
+Référence : 8 946 → 8 867 ms (× 1,0). Poste de l'utilisateur : à reporter.
+
+Formulation attendue dans mesures.md :
+  R3 : 8 946 → 8 867 ms, × 1,0. Nœud : GapFill (seaux engendrés : 1 080
+  lignes au lieu de N). Pas de gain de vitesse attendu : le balayage
+  n'a pas changé. Trous laissés à NULL : signal volatil, combler =
+  fabriquer une mesure.
+
+Erreurs fréquentes :
+- bornes passées en texte (`:'debut'` sans `::timestamptz`) : gapfill
+  prend le littéral pour un fuseau et l'erreur est déroutante (errata) ;
+- bornes absentes du WHERE et des arguments : « missing time_bucket_gapfill
+  argument » ou aucun seau engendré ;
+- ORDER BY absent : les seaux engendrés arrivent dans l'ordre du GapFill,
+  mais le tracé Grafana exige un tri explicite ;
+- locf() « pour éviter les NULL dans Grafana » ;
+- interpolate() sur une vitesse de vent ;
+- remplir avec 0 (`coalesce(avg, 0)`) : pire que tout, une vitesse nulle
+  est une valeur physique plausible (calme plat) que rien ne distingue
+  du trou.

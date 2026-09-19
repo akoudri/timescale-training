@@ -1,0 +1,89 @@
+L11 — ÉTAPE 5 : LA BASCULE, CHRONOMÉTRÉE
+==========================================
+
+Fiche : « C'est la seule étape qui interrompt. Chronométrer du premier au
+dernier geste. 1. Arrêter le flux. 2. VÉRIFIER l'arrêt. 3. Delta final.
+4. Contrôle 1. 5. Remettre les séquences à niveau. 6. Basculer le flux. »
+
+-------------------------------------------------------------------------
+1. Résultat du poste (exécution scriptée, chrono date +%s.%N)
+-------------------------------------------------------------------------
+  1. kill $(cat l11/.flux.pid)                        t = 0
+  2. comptages source à 4 s : 41 960 463 → 41 960 463 (écart 0)
+  3. ./l11/migrer.sh --delta : id [42002842, 42012842) — 10 000 lignes
+  4. contrôle 1 : source 41 960 463 / cible 41 960 463 → ÉGAL
+  5. setval('mesures_id_seq', max(id)) : 1 → 42 012 841
+     (source : max(id) = 42 012 841, séquence source = 42 012 841)
+  6. INSERT … RETURNING id → 42 012 842, sans conflit
+  INTERRUPTION RÉELLE : 13,0 s   (référence : 7,4 s)
+
+Dont 4 s d'attente de la vérification et ≈ 1 s de pause après le kill :
+la part « travail » est de 8 s, presque toute dans les docker exec des
+gestes 3 à 6. Le chiffre n'est pas transposable ; la séquence de gestes
+l'est.
+
+-------------------------------------------------------------------------
+2. Le vécu de ce poste : la première bascule a tué le mauvais processus
+-------------------------------------------------------------------------
+Première tentative : `pkill -f "simuler-flux.sh"`. Le motif figurait
+aussi dans la ligne de commande du shell qui exécutait la bascule (un
+script passé par `bash -c`) : pkill a tué CE shell — sortie code 144, la
+bascule s'est arrêtée au geste 1, chrono perdu. Le flux, lui, était
+mort aussi, mais rien ne le prouvait : il a fallu le relancer, rattraper
+(delta de 170 500 lignes) et rejouer la bascule avec un kill par PID.
+
+Deuxième tentative, autre faux positif : la vérification « il ne reste
+aucun processus simuler-flux » par `ps | grep` a trouvé… le shell de la
+bascule lui-même (« ENCORE UN PROCESSUS »), alors que les deux comptages
+source donnaient 0 lignes d'écart. Conclusion à écrire dans la
+checklist : l'arrêt du flux se PROUVE par le comptage, pas par une
+liste de processus ; et on arrête par identifiant, jamais par motif.
+C'est le piège « le contrôle 1 diverge de quelques centaines de lignes
+après le delta final » de la fiche, vécu à l'envers. En production :
+arrêt de service et connexions en lecture seule, pas un kill.
+
+Depuis le 17/09, simuler-flux.sh écrit son PID dans l11/.flux.pid (et
+l'efface en sortant) ; la fiche demande `kill $(cat l11/.flux.pid)`.
+
+-------------------------------------------------------------------------
+3. Le geste 5, celui qui ne va pas de soi
+-------------------------------------------------------------------------
+Ni la copie par plages ni la réplication logique ne positionnent les
+séquences : la cible en est à `last_value = 1, is_called = false`. Sans
+setval, la première insertion post-bascule reçoit l'id 1 — qui existe :
+conflit si une contrainte d'unicité existe, DOUBLON SILENCIEUX sinon
+(l'hypertable du kit n'a pas de clé unique sur id : c'est le pire cas,
+l'incident n'est pas immédiat). D'où l'insertion réelle du geste 6 :
+elle prouve que l'id attribué est max(id) + 1.
+
+Deux subtilités à consigner :
+- setval sur max(id) de la CIBLE, après le delta final et le contrôle 1 :
+  à ce moment cible = source, donc max(id) est le même des deux côtés.
+- la séquence SOURCE peut être en avance sur max(id) (elle l'était de
+  52 341 au départ : purges). Si la source doit rester écrivable en
+  parallèle (double écriture pendant une période de validation), il faut
+  positionner la cible sur last_value de la séquence source, pas sur
+  max(id), pour éviter tout recouvrement. Ici la source passe en lecture
+  seule : max(id) suffit.
+- `evenements_id_seq` a le même problème ; le même setval s'applique.
+
+-------------------------------------------------------------------------
+4. Ordre des gestes : pourquoi celui-là et pas un autre
+-------------------------------------------------------------------------
+- Vérifier l'arrêt AVANT le delta final : un delta joué pendant que le
+  flux écrit encore laisse un résidu que le contrôle 1 attrapera trop
+  tard (« quelques centaines de lignes »), après la bascule.
+- Contrôle 1 strict AVANT setval : si l'égalité manque, on ne bascule
+  pas, on rejoue un delta — la cible n'a encore reçu aucune écriture
+  applicative, le repli reste gratuit.
+- setval AVANT de basculer le flux : l'inverse, c'est l'incident de la
+  première insertion.
+
+-------------------------------------------------------------------------
+5. Erreurs fréquentes
+-------------------------------------------------------------------------
+- Chronométrer seulement le delta final : l'interruption va du premier
+  geste (arrêt du flux) au dernier (première écriture sur la cible).
+- « Vérifier l'arrêt » par l'absence de processus : voir §2.
+- Oublier evenements_id_seq parce que « personne n'écrit d'événements
+  pendant la bascule » : la première alarme post-bascule le rappellera.

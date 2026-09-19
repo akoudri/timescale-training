@@ -1,0 +1,124 @@
+L14 — ÉTAPE 4 : RESTITUER, ET LES REQUÊTES DE PRÉVENTION
+==========================================================
+
+Fiche : « Présenter la démarche, pas le résultat. Trois phrases suffisent :
+"Le symptôme était X. Nous avons envisagé A, B et C. La requête Y a
+montré que c'était B, parce que Z." »
+
+-------------------------------------------------------------------------
+1. Restitution attendue (trois phrases par incident)
+-------------------------------------------------------------------------
+INCIDENT 1
+  « Le symptôme était : les valeurs du tableau de bord du site 2 ne
+  changent plus depuis le matin, alors que des points bruts continuent
+  d'arriver. Nous avons envisagé un rafraîchissement arrêté, un flux du
+  site 2 muet, un cloisonnement trop large. La requête des jobs
+  (automatisation.sql) a montré que c'était le rafraîchissement : le job
+  du niveau minute a `scheduled = f` et un `next_start` gelé depuis trois
+  jours, avec Success et zéro erreur — un job suspendu n'échoue pas, il
+  disparaît. »
+  Correction : réactivation + rattrapage borné niveau par niveau ;
+  effet : niveau minute à jour en 0,4 s, rafraîchissement automatique
+  repris à la minute suivante.
+
+INCIDENT 2
+  « Le symptôme était : l'écran "état du parc" répond en 9,3 s, stable à
+  2 %, contre 126 ms de référence. Nous avons envisagé un objet de
+  structure disparu, une compression modifiée, une charge concurrente.
+  L'inventaire des index (structure.sql) a montré que c'était l'index
+  (series_id, ts DESC) de L05 qui manquait, parce que le plan balayait et
+  triait les 33,6 M lignes des deux chunks rowstore. »
+  Correction : CREATE INDEX, 8,5 s ; effet : 125 ms (× 74).
+
+Les deux familles sont différentes (automatisation / structure) : le
+critère de la fiche est rempli. Un binôme qui cite deux fois la même
+famille a un diagnostic superficiel (par exemple « les deux, c'est un
+problème de job »).
+
+Question du formateur à la restitution : « Quelle requête auriez-vous
+lancée si la première n'avait pas départagé ? » — la réponse attendue est
+la SUIVANTE de la liste d'hypothèses, pas « les six d'un coup ».
+
+-------------------------------------------------------------------------
+2. l15/diagnostic/prevention.sql attendu (version de ce poste, éprouvée en E2)
+-------------------------------------------------------------------------
+-- P1 — incident 1 : job suspendu, ou sans succès depuis plus de 3 × sa
+-- période, PARMI LES JOBS DÉJÀ EXÉCUTÉS AU MOINS UNE FOIS. Assise sur
+-- scheduled / last_successful_finish, jamais sur last_run_status (un job
+-- suspendu affiche Success pour toujours). Le garde-fou total_runs > 0
+-- écarte le job jamais échu (last_successful_finish = -infinity ET
+-- last_run_started_at = -infinity — pas NULL : vérifié, job 1001).
+SELECT j.job_id, j.proc_name, j.hypertable_name,
+       CASE WHEN NOT j.scheduled
+            THEN 'SUSPENDU depuis ' || date_trunc('second', now() - s.last_successful_finish)
+            ELSE 'SANS SUCCÈS depuis ' || date_trunc('second', now() - s.last_successful_finish)
+       END AS anomalie
+FROM   timescaledb_information.jobs j
+LEFT   JOIN timescaledb_information.job_stats s USING (job_id)
+WHERE  NOT j.scheduled
+   OR (s.total_runs > 0
+       AND s.last_successful_finish < now() - 3 * j.schedule_interval);
+
+-- P2 — incident 2 : dérive de structure. Les index attendus sur
+-- l'hypertable principale, reconnus par leurs COLONNES (indexdef), pas
+-- par leur nom : le nom dépend du poste (mesures_ts_idx1 et
+-- mesures_series_id_ts_idx ici, mesures_ts_idx / mesures_series_ts_idx
+-- sur la référence — comparer les noms donne deux faux « ABSENT »).
+WITH attendu(colonnes) AS (VALUES ('(ts DESC)'), ('(series_id, ts DESC)'))
+SELECT a.colonnes AS index_attendu, 'ABSENT' AS etat
+FROM   attendu a
+WHERE  NOT EXISTS (SELECT 1 FROM pg_indexes i
+                   WHERE i.tablename = 'mesures'
+                     AND i.indexdef LIKE '%' || a.colonnes);
+
+-- P3 — incident 3 (E1) : capacité d'exécution. Trois signes, du moins
+-- cher au plus parlant : le réglage, les processus, le retard des jobs.
+SELECT 'max_background_workers = ' || current_setting('timescaledb.max_background_workers')
+       || ' (référence M02 : 8)' AS anomalie
+WHERE  current_setting('timescaledb.max_background_workers')::int < 8;
+SELECT 'workers TimescaleDB actifs : ' || count(*)
+       || ' (attendu ≥ 3 : lanceur + ordonnanceur + au moins un worker)' AS anomalie
+FROM   pg_stat_activity WHERE application_name LIKE 'TimescaleDB%'
+HAVING count(*) < 3;
+SELECT j.job_id, j.proc_name,
+       'EN RETARD de ' || date_trunc('second', now() - j.next_start)
+       || ' (période ' || j.schedule_interval || ')' AS anomalie
+FROM   timescaledb_information.jobs j
+WHERE  j.scheduled AND j.next_start < now() - j.schedule_interval
+ORDER  BY 1;
+
+-------------------------------------------------------------------------
+3. Ce que chaque prévention a montré (E2, sur ce poste)
+-------------------------------------------------------------------------
+                      incident actif                    après correction
+  P1  incident 1      1003 « SUSPENDU depuis 3 days »   vide
+      incident 3      1003, 1004 « SANS SUCCÈS depuis   vide
+                      2 h » (P1 attrape AUSSI l'incident 3 : rien ne
+                      tourne, donc plus de succès — mais elle ne dit pas
+                      pourquoi ; c'est P3 qui nomme la cause)
+  P2  incident 2      « (series_id, ts DESC) ABSENT »   vide
+  P3  incident 3      réglage = 1 ; 1 processus actif ; 1003/1004/1005/
+                      1008 en retard de 1 h 20 à 2 h 10  vide
+
+Trois observations pour la salle :
+- une prévention qui ne se déclenche PAS sur son incident est fréquente
+  (la version « par nom » de P2 se déclenchait… tout le temps, ce qui
+  revient au même : personne ne la lit) ;
+- une prévention doit SE TAIRE après correction : P1 sans garde-fou
+  remontait 1001 en permanence — une alerte permanente est une alerte
+  morte ;
+- P1 et P3 se recouvrent partiellement : c'est voulu (deux angles), mais
+  au moment d'en faire des alertes (L15 E2) il faudra choisir laquelle
+  garder dans la liste courte.
+
+-------------------------------------------------------------------------
+4. Erreurs fréquentes
+-------------------------------------------------------------------------
+- Restituer la cause (« l'index avait sauté ») sans la requête : la
+  fiche évalue la requête citée, pas la cause.
+- Écrire une prévention qu'on n'a pas testée en réintroduisant l'incident
+  (E2) : c'est le test qui révèle qu'elle ne se déclenche pas, ou ne se
+  tait pas.
+- Comparer `last_successful_finish` à une durée absolue (« > 1 jour »)
+  au lieu de N × la période : faux sur la rétention quotidienne, aveugle
+  sur le job à la minute.

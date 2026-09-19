@@ -1,0 +1,105 @@
+L04 — ÉTAPE 2 : LES TROIS INJECTIONS — CORRIGÉ FORMATEUR
+=========================================================
+
+Objet : cinq grandeurs sur trois stratégies d'écriture, à durée fixe
+(60 s). On compare des lignes écrites, jamais des durées totales.
+
+-------------------------------------------------------------------------
+1. Protocole (ce que le participant doit faire, dans cet ordre)
+-------------------------------------------------------------------------
+Pour CHAQUE stratégie :
+
+  -- 1. table vide, activité retombée (autovacuum terminé)
+  TRUNCATE mesures_charge;
+  -- 2. position de journal avant
+  SELECT pg_current_wal_lsn() AS avant \gset
+
+  # 3. injection (terminal bash, depuis atelier/)
+  uv run l04/injecteur.py --strategie unitaire --duree 60
+  uv run l04/injecteur.py --strategie lots --taille-lot 1000 --duree 60
+  uv run l04/injecteur.py --strategie copy --binaire --duree 60
+  # 4. pendant l'injection, dans un autre terminal, vers la 25e seconde :
+  docker stats --no-stream timescaledb        → CPU serveur
+
+  -- 5. après : recoupement et journal
+  SELECT count(*) FROM mesures_charge;         -- doit = "lignes" de l'injecteur
+  SELECT pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), :'avant'))
+         AS wal_produit;
+
+L'injecteur imprime lignes, débit, latence médiane par opération et CPU
+client. Le script l04/campagne.sh de la copie de référence enchaîne les
+trois avec TRUNCATE, sonde CPU et différence de WAL.
+
+-------------------------------------------------------------------------
+2. Mesures de référence (2 vCPU / 8 Go, conteneur local, NVMe)
+-------------------------------------------------------------------------
+| Grandeur relevée              | Unitaire          | Lots 1 000            | COPY binaire              |
+|-------------------------------|-------------------|-----------------------|---------------------------|
+| Lignes écrites en 60 s        | 26 993            | 3 946 000             | 34 450 000                |
+| Débit · points par seconde    | 450               | 65 762                | 574 061                   |
+| Latence médiane par opération | 2,11 ms (1 ligne) | 13,7 ms (le lot)      | 12,4 ms (lot de 10 000)   |
+| CPU serveur / CPU client      | 8 % / 8 %         | 80 % / 72 %           | 65 % / 39 %               |
+| Journal produit (WAL)         | 5,9 Mo (225 o/l.) | 633 Mo (168 o/l.)     | 3,77 Go (115 o/l.)        |
+
+Rapports : unitaire → lots × 146 ; unitaire → COPY × 1 276 ; lots → COPY × 8,7.
+
+Seconde série, relevée sur un autre poste (déroulé du 16/09/2026), à
+titre de fourchette :
+
+| Grandeur                      | Unitaire | Lots 1 000 | COPY binaire |
+|-------------------------------|----------|------------|--------------|
+| Lignes écrites en 60 s        | 58 209   | 4 619 000  | 38 440 000   |
+| Débit · points par seconde    | 970      | 76 983     | 640 540      |
+| Latence médiane par opération | 0,97 ms  | 12,16 ms   | 10,87 ms     |
+| CPU client                    | 10,5 %   | 78,6 %     | 42,8 %       |
+
+Rapports : × 79 ; × 660 ; × 8,3. La stratégie unitaire varie du simple au
+double entre postes (elle mesure surtout la latence de la boucle) ; les
+deux autres sont stables à ± 20 %. C'est pourquoi le critère porte sur le
+RAPPORT et non sur une valeur.
+
+-------------------------------------------------------------------------
+3. Ce que les chiffres disent (étape 3 de la fiche)
+-------------------------------------------------------------------------
+Rapport unitaire → meilleure stratégie : entre × 600 et × 1 300 en local.
+Contexte OBLIGATOIRE à côté du chiffre : conteneur local, latence réseau
+négligeable, 2 vCPU, type de disque. À travers un réseau d'entreprise
+(0,5 à 1 ms d'aller-retour), l'unitaire tombe sous 1 000 pts/s quel que
+soit le serveur, et le rapport grimpe encore. Le chiffre cité hors
+contexte six mois plus tard est faux.
+
+Question 1 — le journal est-il proportionnel au nombre de lignes ?
+Non : 225 octets par ligne en unitaire, 168 en lots, 115 en COPY. Chaque
+transaction paie un enregistrement de validation et l'en-tête de page ;
+le COPY remplit des pages entières et journalise des blocs pleins. Le
+volume de WAL dépend de la stratégie, pas seulement des lignes.
+
+Question 2 — la latence d'un lot vaut-elle mille fois celle d'une ligne ?
+Non : 12-14 ms pour 1 000 lignes contre 1-2 ms pour une seule, soit un
+facteur 6 à 13, pas 1 000. Ce que l'unitaire paie n'est pas l'écriture
+mais le COÛT PAR INSTRUCTION — aller-retour, analyse, planification,
+validation — que le lot amortit sur mille lignes. Le COPY va plus loin en
+supprimant l'analyse SQL et le format texte : 10 000 lignes en ~11 ms.
+
+Lecture du CPU :
+- unitaire : ~8-10 % des deux côtés — les deux attendent le réseau ;
+- lots : serveur ET client hauts (70-80 %) — le client est PRÈS DU
+  GARDE-FOU de 80 % : à l'étape 4 il saturera avant la base sur les
+  postes rapides ; prévoir deux injecteurs en parallèle ;
+- COPY : serveur 65 %, client 40 % pour 8 × plus de lignes — le coût par
+  ligne est faible des deux côtés, c'est la stratégie de M03 (chargement
+  initial) et de M12 (copie de migration).
+
+-------------------------------------------------------------------------
+4. Erreurs fréquentes
+-------------------------------------------------------------------------
+- Table non vidée entre deux stratégies : le count(*) inclut la
+  précédente, le débit calculé est faux, et l'écart n'apparaît que si on
+  recoupe avec le compteur de l'injecteur.
+- Journal mesuré par la taille de pg_wal : recyclé en continu, taille à
+  peu près constante — seule la différence de LSN vaut.
+- CPU serveur lu avant ou après l'injection : le lire PENDANT, vers la
+  moitié de la durée.
+- Conclure sur le serveur alors que le client sature (lots à 78 %) :
+  c'est le mode d'échec principal de l'étape 4, préparé ici.
+- Oublier le contexte à côté du rapport.

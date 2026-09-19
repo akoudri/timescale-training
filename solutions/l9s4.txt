@@ -1,0 +1,111 @@
+L09 — ÉTAPE 4 : CHIFFRER L'ÉCONOMIE, SUR LES DEUX ÉCHELLES
+=========================================================
+
+Fiche : « Deux chiffres, distingués clairement : l'échelle d'atelier
+(volume de mesures avant/après, pyramide déduite), l'échelle de
+production (estimation à 3 ans de L02 × ratio de L08 × rétention).
+Écrire la cible de production dans politiques.sql, étiquetée. »
+
+-------------------------------------------------------------------------
+1. Échelle d'atelier (\i l09/economie.sql)
+-------------------------------------------------------------------------
+  objet                     avant chaîne     après chaîne
+  mesures (hypertable)      18 Go            3 981 Mo (heap 1 951, index
+                                             1 341, toast 689)
+  pyramide 1min             4 074 Mo         4 074 Mo (4 254 après E2)
+  pyramide 1h                  63 Mo            63 Mo
+  pyramide 1j                   3 Mo             3 Mo
+  ------------------------------------------------------------------
+  total                     22,1 Go          8,1 Go   (référence : 8,1)
+  base mistral              35 Go            21 Go (mesures_avant 12 Go
+                                             et mesures_hc comprises)
+
+Décomposition du gain sur `mesures` (18 → 4 Go) : 2 chunks supprimés
+(~5,7 Go), 4 chunks basculés 11 Go → 714 Mo, 2 chunks rowstore inchangés
+(2,9 Go + 0,4 Go, dont 1,2 Go d'index sur le chunk plein).
+
+Le point à faire remarquer : la pyramide 1min NON compressée (4,1 Go)
+pèse PLUS que tout le brut compressé (0,7 Go pour 4 semaines). Sans
+politique sur l'agrégat lui-même, la chaîne déplace le volume plus
+qu'elle ne le réduit. C'est E2 (l9s5) : 4 074 → 546 Mo (×7,5).
+
+-------------------------------------------------------------------------
+2. Échelle de production (3 ans, 4 000 signaux à 0,1 Hz)
+-------------------------------------------------------------------------
+Hypothèses reprises de L02 (corrigé du 17/09) : 34,56 M points/jour,
+37,8 G points sur 1 095 j, 50 o/ligne heap + 30 o/entrée d'index.
+
+  Sans chaîne : heap 1,89 To + index 1,14 To         = 3,03 To
+
+  Avec chaîne (cible ci-dessous), ratio ×9,3 de L08 appliqué au total
+  heap + index (80 o/ligne) :
+    brut rowstore   7 j  × 34,56 M × 80 o                =  19,4 Go
+    brut columnstore 83 j × 34,56 M × 80 o / 9,3        =  24,7 Go
+      (avec le ×16,1 mesuré ici, deux index : 14,3 Go)
+    agrégat 1 min, 1 an : 4 000 × 525 600 = 2,1 G lignes
+      × 129 o/ligne (mesuré : 4 074 Mo / 31,66 M)       = 271 Go brut,
+      compressé ×7,5 (E2)                                ≈  36 Go
+    agrégat 1 h, 10 ans : 350 M lignes × 119 o          ≈  42 Go
+    agrégat 1 j : négligeable (< 1 Go)
+    ------------------------------------------------------------------
+    total ≈ 120 Go (1 min compressée) ; ≈ 360 Go si la pyramide 1 min
+    reste en rowstore (référence : 320 Go, même ordre, calculée avant
+    E2).
+
+  Tarif (l09/tarifs-stockage.md, Tiger Cloud haute performance
+  0,177 $/Go-mois) : sans chaîne 3 030 Go × 0,177 × 12 ≈ 6 430 $/an ;
+  avec ≈ 120 Go → ≈ 255 $/an. Économie ≈ 6 200 $/an ≈ 5 600 €/an.
+  Étagé (E3, brut > 90 j déplacé, facturé AVANT compression : 2,78 To ×
+  0,021 × 12) ≈ 700 $/an — plus cher que le columnstore haute
+  performance dès que le ratio dépasse ~8,4 (déjà noté en L08 E4).
+
+Ce que l'ordre de grandeur enseigne : ×25 à ×30 de réduction, dont
+l'essentiel vient de la RÉTENTION (90 j sur 1 095 : ×12), le reste de la
+compression (×9,3). Un agrégat compressé coûte moins que le brut qu'il
+résume ; non compressé, il peut coûter plus.
+
+-------------------------------------------------------------------------
+3. politiques.sql attendu (section M10, à la suite de la section M09)
+-------------------------------------------------------------------------
+  -- ============================ M10 — RÉTENTION ============================
+  -- ATELIER : valeurs réduites, effet observable sur 45 jours, déclenché à
+  -- borne EXPLICITE (jeu daté ; une politique relative à now() ne produit
+  -- rien en salle) :
+  --   bascule columnstore : max(ts) − 2 jours   (compress_chunk borné)
+  --   rétention brut      : max(ts) − 30 jours  (drop_chunks borné)
+  -- Cohérence (l09/coherence-fenetres.sql) : rétention 30 j > portée max
+  -- de rafraîchissement 3 j (mistral_1j) > bascule 2 j  ✓
+  -- Garde des deux horloges : borne_retention (29/09) < now() − 3 j ?
+  --   → FAUX le 17/09/2026 (séance dans la fenêtre du jeu) : la purge
+  --   vide mistral_1min sur [now − 30 min] — assumé en atelier, interdit
+  --   en production.
+  SELECT add_retention_policy('mesures', INTERVAL '30 days', if_not_exists => true);
+
+  -- PRODUCTION : cible retenue, non applicable au jeu d'atelier
+  --   rowstore         : 7 jours   (politique 1006, inchangée depuis M09)
+  --   columnstore      : 90 jours
+  --   rétention brut   : 90 jours
+  --   agrégat 1 min    : 1 an, compressé au-delà de 30 j (E2 : ×7,5 ;
+  --                      non compressé il pèse plus que le brut compressé)
+  --   agrégat 1 h      : 10 ans
+  --   agrégat 1 jour   : sans limite
+  -- Volume estimé à 3 ans : ≈ 120 Go (contre 3,03 To sans chaîne) —
+  --   brut 44 Go + 1 min 36 Go + 1 h 42 Go ; ×25.
+
+Les valeurs de production ne sont PAS exécutées dans le fichier : elles
+y figurent en commentaire, et c'est cette dissymétrie qui protège le
+participant qui rejouera le fichier ailleurs.
+
+-------------------------------------------------------------------------
+4. Erreurs fréquentes
+-------------------------------------------------------------------------
+- Multiplier les chiffres d'atelier par « 500 » : partir de l'échelle de
+  production (34,56 M points/jour), jamais de 190 M / 45 j × un facteur.
+- Oublier la pyramide dans le « après » (22 → 4 Go au lieu de 22 → 8) :
+  la fiche l'exige, et c'est ce qui fait apparaître E2.
+- Appliquer le ratio ×9,3 aux 3 ans entiers : seuls les 90 j conservés
+  comptent ; le reste est SUPPRIMÉ, pas compressé — la rétention pèse
+  plus que la compression dans le résultat.
+- Confondre « ratio total » (×16, index compris) et « ratio heap »
+  (×9,6) : le premier est celui qui se facture, le second celui qui se
+  compare entre configurations.

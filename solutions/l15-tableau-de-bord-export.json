@@ -1,0 +1,169 @@
+{
+ "__inputs": [
+  {
+   "description": "Connexion au rôle de supervision (lecture seule) sur la base mistral",
+   "label": "PostgreSQL MISTRAL",
+   "name": "DS_MISTRAL",
+   "pluginId": "grafana-postgresql-datasource",
+   "type": "datasource"
+  }
+ ],
+ "annotations": {
+  "list": []
+ },
+ "id": 1,
+ "panels": [
+  {
+   "gridPos": {
+    "h": 7,
+    "w": 12,
+    "x": 0,
+    "y": 0
+   },
+   "id": 1,
+   "targets": [
+    {
+     "format": "table",
+     "rawSql": "SELECT max(ts) AS time, count(*)/15.0 AS points_min FROM mesures WHERE ts >= (SELECT max(ts) - interval '15 minutes' FROM mesures);"
+    }
+   ],
+   "title": "M1 · Débit d'ingestion (points/min)",
+   "type": "timeseries"
+  },
+  {
+   "gridPos": {
+    "h": 7,
+    "w": 12,
+    "x": 12,
+    "y": 0
+   },
+   "id": 2,
+   "targets": [
+    {
+     "format": "table",
+     "rawSql": "SELECT g.famille, max(m.ts) AS dernier_point, (SELECT max(ts) FROM mesures) - max(m.ts) AS anciennete FROM mesures m JOIN affectation_capteur af ON af.series_id = m.series_id JOIN signaux g ON g.signal_id = af.signal_id WHERE m.ts >= (SELECT max(ts) - interval '1 hour' FROM mesures) GROUP BY 1;"
+    }
+   ],
+   "title": "M2 · Ancienneté du dernier point, par famille de flux",
+   "type": "table"
+  },
+  {
+   "gridPos": {
+    "h": 7,
+    "w": 8,
+    "x": 0,
+    "y": 7
+   },
+   "id": 3,
+   "targets": [
+    {
+     "format": "table",
+     "rawSql": "SELECT 'mistral_1min' AS agregat, (SELECT max(ts) FROM mesures) - max(seau) AS retard FROM mistral_1min UNION ALL SELECT 'mistral_1h', (SELECT max(ts) FROM mesures) - max(seau) FROM mistral_1h UNION ALL SELECT 'mistral_1j', (SELECT max(ts) FROM mesures) - max(seau) FROM mistral_1j;"
+    }
+   ],
+   "title": "M3 · Retard de rafraîchissement par agrégat",
+   "type": "table"
+  },
+  {
+   "gridPos": {
+    "h": 7,
+    "w": 8,
+    "x": 8,
+    "y": 7
+   },
+   "id": 4,
+   "targets": [
+    {
+     "format": "table",
+     "rawSql": "SELECT hypertable_name, count(*) AS chunks FROM timescaledb_information.chunks GROUP BY 1 ORDER BY 2 DESC;"
+    }
+   ],
+   "title": "M4 · Chunks par hypertable",
+   "type": "stat"
+  },
+  {
+   "gridPos": {
+    "h": 7,
+    "w": 8,
+    "x": 16,
+    "y": 7
+   },
+   "id": 5,
+   "targets": [
+    {
+     "format": "table",
+     "rawSql": "SELECT round(before_compression_total_bytes::numeric / nullif(after_compression_total_bytes,0), 1) AS ratio, (SELECT count(*) FILTER (WHERE NOT is_compressed)::float / count(*) FROM timescaledb_information.chunks WHERE hypertable_name = 'mesures') AS part_rowstore FROM hypertable_compression_stats('mesures');"
+    }
+   ],
+   "title": "M5 · Ratio de compression / part rowstore",
+   "type": "stat"
+  },
+  {
+   "description": "Alerte A2 assise sur ce panneau (seuil relatif : 3 × la période, jobs déjà échus)",
+   "gridPos": {
+    "h": 7,
+    "w": 12,
+    "x": 0,
+    "y": 14
+   },
+   "id": 6,
+   "targets": [
+    {
+     "format": "table",
+     "rawSql": "SELECT j.job_id, j.proc_name, j.scheduled, s.total_failures, now() - s.last_successful_finish AS depuis_dernier_succes FROM timescaledb_information.jobs j LEFT JOIN timescaledb_information.job_stats s USING (job_id);"
+    }
+   ],
+   "title": "M6 · Jobs : échecs et dernier succès",
+   "type": "table"
+  },
+  {
+   "gridPos": {
+    "h": 7,
+    "w": 6,
+    "x": 12,
+    "y": 14
+   },
+   "id": 7,
+   "targets": [
+    {
+     "format": "table",
+     "rawSql": "SELECT now() AS time, pg_database_size(current_database()) AS octets;"
+    }
+   ],
+   "title": "M7 · Taille de la base (tendance = alerte A4)",
+   "type": "timeseries"
+  },
+  {
+   "gridPos": {
+    "h": 7,
+    "w": 6,
+    "x": 18,
+    "y": 14
+   },
+   "id": 8,
+   "targets": [
+    {
+     "format": "table",
+     "rawSql": "SELECT round(100.0 * blks_hit / nullif(blks_hit + blks_read, 0), 2) AS cache_hit_pct FROM pg_stat_database WHERE datname = current_database();"
+    }
+   ],
+   "title": "M8 · Taux de succès du cache",
+   "type": "gauge"
+  }
+ ],
+ "refresh": "1m",
+ "schemaVersion": 39,
+ "tags": [
+  "mistral",
+  "timescaledb",
+  "formation"
+ ],
+ "time": {
+  "from": "now-24h",
+  "to": "now"
+ },
+ "timezone": "Europe/Paris",
+ "title": "MISTRAL — supervision TimescaleDB",
+ "uid": "mistral-supervision",
+ "version": 1
+}

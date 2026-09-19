@@ -1,0 +1,76 @@
+L08 — ÉTAPE 4 : LE COÛT D'UNE CORRECTION
+========================================
+
+Fiche : « Rejouer le même UPDATE sur une période non basculée, et
+comparer. Consigner le rapport. C'est ce chiffre, et non une intuition,
+qui doit décider du délai de bascule à l'étape 6. »
+
+-------------------------------------------------------------------------
+1. Commandes attendues
+-------------------------------------------------------------------------
+  \timing on
+  -- chunk basculé, segment série (8 640 lignes visées)
+  UPDATE cmp_serie SET valeur = valeur * 1.01
+  WHERE  series_id = 137 AND ts >= '2026-09-25T00:00:00Z' AND ts < '2026-09-26T00:00:00Z';
+
+  -- même correction, table sans segmentby
+  UPDATE cmp_aucun SET valeur = valeur * 1.01 WHERE …;      -- REFUSÉ
+
+  -- « période non basculée » : les cmp_* sont entièrement basculées ;
+  -- soit on décompresse le chunk du 25/09 de cmp_serie (E2), soit on
+  -- rejoue l'UPDATE sur `mesures` (rowstore, mêmes lignes, indexée).
+  SELECT decompress_chunk('_timescaledb_internal._hyper_15_157_chunk');
+  UPDATE cmp_serie SET valeur = valeur / 1.01 WHERE …;      -- rowstore
+  SELECT compress_chunk('_timescaledb_internal._hyper_15_157_chunk');
+
+-------------------------------------------------------------------------
+2. Résultats du poste
+-------------------------------------------------------------------------
+  cmp_serie, chunk basculé            15,3 ms   (référence 19,9 ms)
+  cmp_machine, chunk basculé          93 ms     (segment de 86 400 tuples)
+  cmp_aucun, chunk basculé            ERREUR après 832 ms :
+     « tuple decompression limit exceeded by operation — current limit:
+       100000, tuples decompressed: 4229606 »
+  cmp_serie, chunk redécompressé      235 ms    (rowstore, sans index)
+  décompression du chunk              709 ms
+  recompression                       1 115 ms
+
+Rapport à consigner : sur chunk basculé ET segmenté par série, la
+correction coûte 15 ms — MOINS que sur rowstore sans index (235 ms),
+parce que l'index de segment mène directement aux 9 lots concernés, qui
+sont décompressés, modifiés, puis réécrits (le chunk reste « basculé »
+avec une petite partie rowstore recompressée par la politique). Sur
+cmp_machine le segment vaut 10 séries : 86 400 tuples décompressés pour
+en modifier 8 640, ×6 plus lent. Sans segmentby, la même correction
+doit décompresser les 4,23 M lignes du chunk : refus net, 832 ms de
+travail perdu, transaction annulée.
+
+Le vrai coût d'une correction tardive n'est donc pas « l'UPDATE est
+lent » : c'est décompresser → modifier → recompresser un chunk entier
+(0,7 + 0,2 + 1,1 ≈ 2 s pour 243 Mo ici ; ×30 à l'échelle d'un chunk de
+production de 7 Go), ou pire, un refus qui oblige à lever la limite DML
+(timescaledb.max_tuples_decompressed_per_dml_transaction = 0) et à
+tenir la mémoire.
+
+-------------------------------------------------------------------------
+3. Ce que cela décide pour l'étape 6
+-------------------------------------------------------------------------
+Le délai de bascule doit couvrir la période pendant laquelle des
+corrections arrivent — le retard d'arrivée mesuré en M05 (p99 13 min 20,
+pire cas 36 min) — avec une marge large : une donnée qui arrive après
+la bascule coûte la décompression d'un segment ; une correction de
+masse (recalibrage d'un capteur sur un mois) coûte la décompression de
+chunks entiers. Retenu : 7 jours (l8s6).
+
+-------------------------------------------------------------------------
+4. Erreurs fréquentes
+-------------------------------------------------------------------------
+- Viser plusieurs chunks (ts sur les deux jours) : la fiche le dit, un
+  seul chunk suffit ; sur cmp_aucun cela double le refus, pas l'info.
+- Lire le 235 ms du rowstore comme « le rowstore est plus lent » : il
+  est plus lent SANS INDEX. Sur `mesures` (indexée série/ts) le même
+  UPDATE tient en quelques ms. Le point n'est pas rowstore vs
+  columnstore, c'est « accès direct » vs « tout décompresser ».
+- Oublier de recompresser après E2 : hypertable_compression_stats ne
+  compte plus le chunk et le ratio de la table chute — vérifier
+  is_compressed dans timescaledb_information.chunks avant de conclure.

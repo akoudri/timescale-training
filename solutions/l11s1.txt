@@ -1,0 +1,141 @@
+L11 — ÉTAPE 1 : LA CHECKLIST DE BASCULE (le livrable)
+=======================================================
+
+Fiche : « Avant toute manipulation. Compléter l11/checklist-modele.md,
+qui comporte trois rubriques. Le formateur relit une checklist par binôme
+avant d'autoriser l'étape 2. Une checklist sans procédure de repli écrite
+ne passe pas. »
+
+Ce fichier est la checklist ATTENDUE, remplie avec les commandes réelles
+du kit, telle qu'elle a été éprouvée sur le poste le 17/09/2026 (les
+chiffres des « Résultats » viennent des étapes 2 à 6 — l11s2 à l11s6).
+Le participant la remet sous le nom checklist-bascule.md.
+
+-------------------------------------------------------------------------
+1. Ce que le formateur vérifie à la relecture
+-------------------------------------------------------------------------
+Quatre choses, dans cet ordre, et la première élimine la moitié des
+checklists :
+  a) la procédure de REPLI est écrite, avec ses commandes, et elle repose
+     sur une propriété simple : la source n'a jamais cessé d'être la
+     référence tant que le flux n'a pas été basculé — le repli, c'est
+     « détruire la cible partielle » et rien d'autre ;
+  b) chaque étape a un CRITÈRE DE PASSAGE observable (un chiffre, un état),
+     pas un « ok » ;
+  c) « arrêter le flux » est suivi de « VÉRIFIER l'arrêt » par un
+     comptage, et les séquences apparaissent AVANT la bascule du flux ;
+  d) les deux gestes qu'on oublie sont là : setval, et « quand la source
+     peut-elle être supprimée ».
+
+-------------------------------------------------------------------------
+2. La checklist attendue
+-------------------------------------------------------------------------
+# Checklist de bascule — migration `mistral_legacy` → `mistral_prod`
+
+## Avant la bascule
+
+- [x] Cible : extension `timescaledb` présente (2.29.2 ; `\dx` dans
+      mistral_prod), schéma en place : hypertables `mesures` (chunk 7 j,
+      colonne `id` conservée, index (series_id, ts DESC)) et
+      `evenements` — vérifié par
+      `SELECT hypertable_name FROM timescaledb_information.hypertables`
+      (2 lignes attendues : une erreur de create_hypertable laisse des
+      tables ORDINAIRES qui acceptent la copie sans rien dire, voir E2) ;
+      espace disque ≥ 2 × source = 6 Go (vérifié : 128 Go libres)
+- [x] Cible : compression NON activée, aucune politique active — les deux
+      requêtes de fin de `preparer-cible.sql` retournent « f » et « 0 »
+- [x] Source : identifiant monotone disponible pour borner les plages et
+      le delta : colonne `id` (bigint, séquence `mesures_id_seq`) ; la
+      séquence est EN AVANCE sur max(id) (41 524 341 contre 41 472 000 :
+      purges ligne à ligne) — sans conséquence pour la copie, à connaître
+      pour le setval
+- [x] Flux d'écriture actif sur la source pendant toute la migration :
+      `./l11/simuler-flux.sh --debit 2000 &` — PID dans `l11/.flux.pid`
+- [x] **Procédure de repli, complète, avec ses commandes** :
+  1. arrêter la copie : `kill -TERM -- -$(cat l11/.migrer.pid)` (le
+     groupe de processus : migrer.sh ET ses deux psql en tube)
+  2. vérifier qu'aucune COPY ne tourne plus, des deux côtés :
+     `SELECT count(*) FROM pg_stat_activity WHERE query ILIKE 'COPY%' AND state <> 'idle';`
+  3. la source est intacte et le flux y écrit toujours (deux comptages) :
+     rien à rebasculer, la production n'a jamais quitté la source
+  4. détruire la cible partielle et la borne :
+     `DROP DATABASE mistral_prod;` (depuis une session sur `mistral`) et
+     `rm l11/.borne`
+  5. incident clos ; la migration se rejoue depuis l'étape 2 quand la
+     cause est comprise
+- [x] Délai maximal avant déclenchement du repli : **20 min** sans
+      convergence du retard de delta (copie initiale attendue ≈ 2 min sur
+      ce poste, ≈ 5 min avec marge), décidé à froid
+- [x] Qui prononce la bascule : l'exploitant de permanence (en salle : le
+      binôme, après relecture des trois contrôles par le formateur)
+
+## Pendant
+
+| Étape | Critère de passage |
+|---|---|
+| Copie initiale par plages (`./l11/migrer.sh`) | 7 plages « ok », événements copiés, premier delta joué ; `l11/.borne` écrit |
+| Delta de rattrapage (`./l11/migrer.sh --delta`, répété) | retard = max(id) source − borne **faible et stable** : il oscille autour de 1-2 s de flux (≈ 2 000 id), il ne décroît plus |
+| Contrôle 1 — comptage global | écart = flux en transit depuis le dernier delta uniquement (< 1 min de flux) ; strictement 0 à la bascule |
+| Contrôle 2 — somme par jour, sur entiers | identique jour par jour, sauf le jour en cours (flux) |
+| Contrôle 3 — échantillon par hachage, champ par champ | 0 ligne différente ; couverture lue : toute la fenêtre, ≥ 80 séries |
+| Interruption réelle relevée ici → | du premier au dernier geste : **13,0 s** (voir Résultats) |
+
+## Bascule (seule étape qui interrompt — chronométrer)
+
+1. Arrêter le flux d'écriture sur la source — `kill $(cat l11/.flux.pid)`
+   (par PID, jamais `pkill -f` : il peut viser le terminal lui-même)
+2. **Vérifier** l'arrêt — deux comptages à 4 s d'écart :
+   `SELECT count(*) FROM mesures;` sur la source, écart attendu 0
+3. Delta final — `./l11/migrer.sh --delta`
+4. Contrôle 1, égalité stricte (source = cible)
+5. Séquences remises à niveau côté cible —
+   `SELECT setval('mesures_id_seq', (SELECT max(id) FROM mesures));`
+   (et `evenements_id_seq` de même)
+6. Basculer le flux vers la cible — preuve : une insertion réelle
+   `INSERT INTO mesures (ts, series_id, valeur, qualite) VALUES (...)
+   RETURNING id;` → id = max(id) + 1, sans conflit
+
+## Après
+
+- [x] Compression et politiques activées (`\i l11/durcir-cible.sql`),
+      première exécution déclenchée (la compression agit immédiatement :
+      la legacy est dans le passé de now())
+- [x] Les deux politiques planifiées (1000 compression, 1001 rétention),
+      `scheduled = t`, `next_start` non nul — les jobs 1 et 3 sont ceux
+      du système
+- [x] Séquence au-delà du maximum observé — vérifiée par l'insertion
+      réelle du geste 6
+- [x] La source reste intacte, en lecture seule, jusqu'au : J+7 après
+      validation métier ; suppression planifiée le : J+7, après un dernier
+      contrôle 2 sur la cible
+
+## Résultats (exécution du 2026-09-17, poste 2 vCPU / 8 Go, NVMe)
+
+- copie initiale (7 plages + événements + delta 1) : **116 s**, production
+  ouverte à 2 000 lignes/s ; deltas suivants ≈ 1,5 s chacun, retard
+  stable ≈ 2 000 id
+- contrôles avant bascule : C1 écart 79 000 (40 s de flux en transit) ;
+  C2 : 72 jours identiques, seul le 29/09 (jour en cours) diverge ;
+  C3 : 0 ligne différente (98 lignes, 89 séries, 20/07 → 29/09)
+- bascule : arrêt vérifié (41 960 463 → 41 960 463), delta final 10 000
+  lignes, C1 strict égal, setval 1 → 42 012 841, première insertion
+  id 42 012 842 ; **interruption 13,0 s**
+- écarts entre l'écrit et l'exécuté : voir l11s7 (E1) — et un vécu à
+  l'étape 5 : un premier `pkill -f simuler-flux` a tué le shell qui
+  l'exécutait (motif présent dans sa propre ligne de commande) ; la
+  bascule a été rejouée avec un kill par PID. D'où la ligne 1 ci-dessus.
+
+-------------------------------------------------------------------------
+3. Erreurs fréquentes à la relecture
+-------------------------------------------------------------------------
+- Repli = « restaurer la source » : non, la source n'a pas bougé ; le
+  repli est la destruction de la cible partielle. Un binôme qui écrit un
+  pg_restore dans le repli n'a pas compris où est la référence.
+- Critère de passage du delta = « delta terminé » : il faut le chiffre
+  (retard avant / après) et le mot STABLE.
+- Contrôle 2 sur `sum(valeur)` : flottants, ordre d'agrégation différent
+  entre deux instances → divergence sans cause. Entiers seulement.
+- Séquence absente de la rubrique Bascule : la première insertion
+  post-bascule entre en conflit de clé (id 1 existe déjà).
+- « Quand supprimer la source » laissé vide : la checklist n'est pas
+  finie tant que la fin de vie de la source n'est pas datée.

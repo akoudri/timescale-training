@@ -1,0 +1,114 @@
+L13 — CLOISONNEMENT MISTRAL — PROTOCOLE COMMUN (corrigé formateur)
+====================================================================
+
+Fichiers : l13s1 (étape 1, les trois rôles + roles.sql complété), l13s2
+(étape 2, les vues barrière et le retrait des accès directs), l13s3
+(étape 3, les trois tentatives T1-T3 avant/après correction + le
+resultats.md attendu), l13s4 (étape 4, le surcoût mesuré, les plans et la
+règle d'exploitation), l13s5 (extensions E1-E4, dont la note au DPO).
+
+-------------------------------------------------------------------------
+1. Ce que l'atelier vérifie
+-------------------------------------------------------------------------
+Trois choses, dans cet ordre d'importance :
+  a) un cloisonnement qu'on a ESSAYÉ de contourner — trois mécanismes
+     PostgreSQL légitimes (un autre objet, un autre rôle, un job). Deux
+     réussissent sur une configuration naïve. Sans cette étape, le
+     cloisonnement est une intention ;
+  b) la séparation des rôles vérifiée PAR BASCULE (SET ROLE), jamais en
+     relisant les GRANT. L'erreur la plus fréquente : un rôle d'ingestion
+     qui sait lire ;
+  c) le SURCOÛT mesuré, parce qu'un surcoût non mesuré sera invoqué un
+     jour pour désactiver la protection en urgence — et parce qu'il est
+     très contrasté selon le motif de requête.
+
+Le mécanisme : en 2.29.2, la sécurité au niveau ligne (RLS) est REFUSÉE
+sur une hypertable au columnstore actif et sur les tables de
+matérialisation des agrégats continus. Le cloisonnement passe donc par des
+vues `security_barrier` + retrait des accès directs. Même prédicat, autre
+mécanisme — avec deux conséquences que la RLS n'aurait pas eues : le
+lecteur doit lire la VUE et non la table (d'où T1, T2) et le planificateur
+perd certains raccourcis (d'où le surcoût de R1).
+
+-------------------------------------------------------------------------
+2. État du poste vérifié le 17/09/2026 (avant L13)
+-------------------------------------------------------------------------
+- État mistral-M13 : `mesures` 151 609 294 lignes, 24/09 → 29/10 21:59:50
+  UTC, 6 chunks (4 columnstore 24/09→22/10, 2 rowstore) ; 3 agrégats ;
+  index (series_id, ts DESC) ; jobs 1000-1008 (1008 = controle_qualite,
+  propriétaire postgres) ; `alertes_qualite` 3 lignes — capteurs 137
+  (site 1), 208 (site 2), 451 (site 4). Aucun rôle mistral_*, aucune vue
+  de cloisonnement. Toutes les tables appartiennent à `postgres`.
+- Séries par site (affectation_capteur × actifs) : site 1 = 150, site 2
+  = 180, site 3 = 110, site 4 = 50. Le site 2 sert de site témoin dans
+  tout l'atelier (mesure.sh positionne `mistral.site = 2`).
+- RLS, vérifié sur le poste :
+    ALTER TABLE mesures ENABLE ROW LEVEL SECURITY;
+    → ERROR: operation not supported on hypertables that have columnstore enabled
+    ALTER TABLE _timescaledb_internal._materialized_hypertable_13 ENABLE ROW LEVEL SECURITY;
+    → ERROR: operation not supported on materialization tables
+  (idem sur mesures_hc, compressée). Ce n'est pas un problème de droits.
+- Érosion connue de mistral_1min/1h sur 14-24 sept (politiques relatives
+  à now(), L09) : sans incidence ici.
+- 128 Go libres.
+
+-------------------------------------------------------------------------
+3. Corrections du kit faites le 17/09 (à connaître)
+-------------------------------------------------------------------------
+Aucun fichier du kit apprenant modifié : `l13/roles.sql`, T1-T3 et
+`mesure.sh` (options --table et --role, SET ROLE + SET mistral.site = 2
+en prélude) fonctionnent tels quels.
+
+Deux écarts consignés dans NOTES-PRODUCTION (copie formateur, non
+modifiée ici) :
+- `-sol/atelier/l13/roles.sql` (référence) est PÉRIMÉ : il pose la RLS
+  (ENABLE/FORCE ROW LEVEL SECURITY + CREATE POLICY) sur `mesures` et sur
+  les matérialisations, ce que 2.29.2 refuse. La fiche, la note de
+  production et `resultats.md` disent le contraire (vues barrière). Le
+  fichier de référence est à réaligner ; le roles.sql attendu est dans
+  l13s1/l13s2.
+- La référence (`resultats.md`, mesures.md §M14) affirme que « le
+  prédicat de site ne participe pas à l'élimination de lots ». Mesuré
+  ici : il y participe, via l'index de segment (series_id) du chunk
+  compressé — R2 via la vue lit 4 860 lots contre 13 220 en accès direct
+  (détail l13s4). Le surcoût négatif de R2/R3 vient de là, pas d'un
+  filtrage « après jointure ».
+
+Suggestion non appliquée : `T3.sql` ne vérifie pas la présence de
+l'action (note de production) — si `controle_qualite` manque, `\gset`
+ne définit pas :job_id et `CALL run_job(:job_id)` échoue sur une erreur
+de syntaxe, pas sur un message explicite.
+
+-------------------------------------------------------------------------
+4. Mesures de référence vs poste
+-------------------------------------------------------------------------
+                         référence (2 vCPU/8 Go)   poste (17/09)
+R1 dernier point, direct       120 ms                  114 ms
+R1 via mesures_site         17 185 ms (× 143)       16 793 ms (× 147)
+R2 fenêtre 3 j, direct       1 033 ms                1 057 ms
+R2 via la vue                  826 ms (× 0,8)          888 ms (× 0,84)
+R3 j1-j5, direct             1 436 ms                1 434 ms
+R3 via la vue                  974 ms (× 0,7)          955 ms (× 0,67)
+T1 avant/après : 490 séries → permission denied / 180 via *_site (idem)
+T2 : propriétaire 490, mistral_admin 490 (idem — structurel)
+T3 : job sous postgres ; lecteur : permission denied (droits stricts),
+     9 lignes / 3 séries des sites 1, 2, 4 avec un GRANT « par réflexe »
+Écarts-types < 4 % partout. Les rapports sont reproduits à 5 % près.
+
+-------------------------------------------------------------------------
+5. État de sortie mistral-M14 (vérifié)
+-------------------------------------------------------------------------
+- Trois rôles : mistral_ingestion (INSERT mesures, evenements),
+  mistral_lecture (SELECT sur mesures_site, mistral_1min_site,
+  mistral_1h_site, mistral_1j_site, alertes_qualite_site, sites, actifs,
+  signaux, affectation_capteur — AUCUN accès direct à mesures ni aux
+  agrégats ni à alertes_qualite), mistral_admin (ALL sur toutes les
+  tables et séquences du schéma).
+- Cinq vues security_barrier, prédicat
+  `nullif(current_setting('mistral.site', true), '')::int` (session
+  sans site → aucune ligne, pas d'erreur).
+- Corrections T1-T3 appliquées ; `alertes_qualite` remise à 3 lignes
+  (TRUNCATE + run_job 1008) après les exécutions répétées de T3 et E3.
+- Objets de E2 (e2_*) et E3 (mistral_qualite, mesures_site2, jobs
+  1029/1030, procédures) supprimés. `mesures`, agrégats, index, jobs
+  1000-1008 intacts. 128 Go libres.

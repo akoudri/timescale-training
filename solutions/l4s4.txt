@@ -1,0 +1,253 @@
+Étape 4 : Point de rupture et ressource saturée
+
+L'étape 4 isole la ressource qui limite le débit en base, en écartant le client comme facteur de confusion.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+LE PIÈGE : Plafond du client vs. point de rupture du serveur
+
+Un injecteur seul produit cette montée :
+
+  20 000 demandés → 20 000 points/s, 23,1 % CPU client, 12,96 ms latence
+  50 000 demandés → 50 000 points/s, 53,9 % CPU client, 12,51 ms latence
+ 100 000 demandés → 78 717 points/s, 79,2 % CPU client, 11,92 ms latence
+ 200 000 demandés → 77 275 points/s, 78,8 % CPU client, 12,07 ms latence
+
+Au-delà de 100 000, le débit n'augmente plus : il plafonne à 78 000 points/s. La
+latence reste à 12 ms, pas d'augmentation. La base ne montre aucun signe de saturation.
+
+Cause : un injecteur envoie ses lots l'un après l'autre. À 12 ms le lot, il ne peut
+pas dépasser 83 lots/s, soit ~83 000 lignes. Son CPU au plafond confirme qu'un
+processus seul atteint sa limite d'exécution. Conclusion sur la base : elle ne sature
+pas du tout à ce niveau, c'est le client qui lâche.
+
+La vraie question reste sans réponse : où sature la base ? Pour le savoir, il faut
+deux injecteurs en parallèle, chacun sous 80 % de CPU client.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PROTOCOLE : Deux injecteurs à débit réparti
+
+Vider la table avant chaque palier :
+
+  sql: TRUNCATE mesures_charge;
+
+Palier à 120 000 points/s (60 000 × 2) :
+
+  bash: uv run l04/injecteur.py --strategie lots --taille-lot 1000 \
+        --debit-cible 60000 --duree 30 --graine 1 &
+        uv run l04/injecteur.py --strategie lots --taille-lot 1000 \
+        --debit-cible 60000 --duree 30 --graine 2
+        wait
+
+Palier à 200 000 points/s (100 000 × 2) : même commande avec --debit-cible 100000
+
+Palier à 300 000 points/s (100 000 × 3) si les deux injecteurs tiennent toujours :
+
+  bash: for i in 1 2 3; do uv run l04/injecteur.py --strategie lots \
+        --taille-lot 1000 --debit-cible 100000 --duree 30 --graine $i & done
+        wait
+
+Vigilance : deux injecteurs à 100 000 = 200 000 points/s, mais 2 000 lignes/s
+par injecteur. Le poste prête déjà 2 cœurs au conteneur TimescaleDB. Pendant
+l'essai, docker stats doit montrer que le conteneur reçoit bien ses 2 cœurs
+(100 % = 1 cœur alloué, 200 % = 2 cœurs alloués). Si le conteneur affiche
+50 % et s'étouffe, la limite mesurée est celle du poste, pas de la base.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+LES TROIS DIAGNOSTICS EN CONTINU
+
+Les prises uniques donnent des réponses aléatoires. Les échantillonner pendant
+tout le palier révèle le profil réel.
+
+1. Événements d'attente — Terminal psql séparé, lancé avant les injecteurs :
+
+  sql: SELECT wait_event_type, wait_event, count(*)
+       FROM   pg_stat_activity
+       WHERE  state = 'active' AND pid <> pg_backend_pid()
+       GROUP  BY 1, 2 ORDER BY 3 DESC
+       \watch 0.5
+
+   Lisez les trente secondes. Trois cas dominants :
+
+   ✓ Ligne vide (pas de wait_event) très présente : session active, consomme CPU.
+   ✓ IO / WALWrite, WALSync, ou DataFileWrite dominant : attentes disque journal.
+   ✓ IO / DataFileWrite ou BufFileRead dominant : attentes disque données.
+   ✓ LWLock dominant : contention entre sessions (plusieurs injecteurs).
+
+   Arrêtez avec Ctrl-C et comptez visuellement : sur 60 prises de 0,5s, si 50
+   montrent « » (pas d'attente) et 10 montrent « IO / WALWrite », le CPU domine.
+
+2. CPU du serveur — Terminal séparé, lancé avant les injecteurs :
+
+  bash: docker stats timescaledb
+
+   Lisez la colonne CPU chaque 2 secondes pendant trente secondes. Notez le
+   plateau, pas les valeurs en début ou fin (qui reflètent le démarrage ou l'arrêt).
+
+   Plafond attendu : 200 % pour un conteneur épinglé à 2 cœurs. Si le chiffre
+   reste sous 150 % et le débit plafonne, le CPU n'en est pas la cause.
+
+3. Checkpoints — Avant et après le palier, session psql :
+
+  sql: SELECT checkpoints_req FROM pg_stat_bgwriter
+       \gset avant_
+       -- (attendre 30s, laisser les injecteurs tourner, arrêter avec Ctrl-C)
+       SELECT checkpoints_req FROM pg_stat_bgwriter
+       SELECT :'avant_checkpoints_req'::bigint - checkpoints_req AS demandes_pendant;
+
+   Beaucoup de checkpoints demandés (vs. planifiés) indique que le journal se
+   remplit plus vite que prévu, ce qui charge le disque. Zéro ou très peu :
+   disque pas en cause.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+LIRE LES RÉSULTATS
+
+Trois profils observés en pratique :
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PROFIL 1 : CPU serveur saturé (référence attendue)
+
+Symptômes :
+  • Débit total atteint 66 000–68 000 points/s avec deux injecteurs à 60 000 chacun.
+  • CPU du conteneur : 180–200 % (plafond de 2 cœurs).
+  • Événements d'attente : surtout des lignes vides (pas d'attente).
+  • Latence médiane : monte vers 15–20 ms au-delà de 100 000 points/s.
+  • Checkpoints : peu ou aucun en sus.
+
+Diagnostic : le processeur serveur ne peut pas exécuter plus vite.
+
+Phrase de conclusion :
+  « Au-delà de 67 000 points par seconde, le CPU serveur sature. On le lit sur
+   le plafond de 200 % du conteneur, la latence qui monte de 12 ms à 19 ms, et
+   l'absence de pattern d'attente disque. »
+
+Implication : pour aller plus vite, il faudrait plus de cœurs ou une répartition
+en réplicas.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PROFIL 2 : Disque journal saturé (postes avec NVMe lent ou SSD SATA)
+
+Symptômes :
+  • Débit plafonne vers 40 000–60 000 points/s.
+  • CPU du conteneur : 80–120 % (loin du plafond).
+  • Événements d'attente : beaucoup de WALWrite, WALSync.
+  • Checkpoints : nombreux « demandés » au-delà de ce seuil.
+  • Latence : monte vite (20+ ms) dès que le débit approche le palier.
+
+Diagnostic : le journal écrit plus vite que le disque ne peut suivre.
+
+Phrase de conclusion :
+  « Au-delà de 55 000 points par seconde, le disque journal sature. On le lit
+   sur les événements d'attente WALWrite dominants et les checkpoints demandés. »
+
+Implication : ajouter un disque journal dédié en NVMe lèverait le goulot.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PROFIL 3 : Client qui n'a pas lâché
+
+Symptômes :
+  • Les deux injecteurs tiennent le cap : débit demandé = débit obtenu.
+  • CPU clients : tous deux sous 70 %.
+  • CPU serveur : reste sous 150 %.
+  • Latence : stable, inchangée sur trois paliers.
+  • Événements d'attente : aucun pattern majeur.
+
+Diagnostic : ni le serveur ni les clients ne limitent. La base pourrait aller
+plus haut. Ajoutez un troisième injecteur.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RÉSULTATS ATTENDUS
+
+Référence, poste de réf (CPU 4c, disque SSD NVMe) :
+
+  120 000 points/s : débit_1 = 59 800 / débit_2 = 60 100 / total = 119 900
+                     latence médiane = 11,8 ms / CPU serveur = 84 %
+  150 000 points/s : débit_1 = 75 500 / débit_2 = 74 800 / total = 150 300
+                     latence médiane = 13,2 ms / CPU serveur = 110 %
+  180 000 points/s : débit_1 = 88 900 / débit_2 = 89 100 / total = 178 000
+                     latence médiane = 16,5 ms / CPU serveur = 189 %
+  200 000 points/s : débit_1 = 92 000 / débit_2 = 91 900 / total = 183 900
+                     latence médiane = 19,2 ms / CPU serveur = 200 %
+
+Point de rupture : entre 180 000 et 200 000, le débit plafonne, latence grimpe.
+
+Conclusion : « Au-delà de 188 000 points par seconde, le CPU serveur sature à
+200 %, ce qui se lit sur l'absence d'augmentation du débit et la montée de la
+latence de 16 ms à 19 ms. »
+
+Votre poste aura un chiffre différent. C'est normal. L'important : que la
+procédure soit menée, et qu'une ressource soit clairement nommée.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+EXEMPLE DE RÉPONSE À CONSIGNER
+
+Dans mesures.md, section M06 :
+
+  Point de rupture : 183 000 points par seconde
+
+  Diagnostic :
+  - Débit total : 180 000 demandés → 183 000 obtenu (stable)
+              240 000 demandés → 183 500 obtenu (plafonne)
+  - Latence : 11,8 ms (stable jusqu'à 150 000) → 19,2 ms (au-delà de 180 000)
+  - CPU serveur : 189 % (à 180 000) → 200 % (limite du conteneur)
+  - Événements d'attente : aucun pattern (pas d'IO, pas de LWLock)
+  - Checkpoints : 0 demandé en sus (disque pas en cause)
+
+  Ressource saturée : processeur serveur
+
+  Ce qui le désigne : le CPU du conteneur plafonne à 200 %, correspondant à ses
+  2 cœurs alloués, tandis que la latence grimpe et le débit n'augmente plus.
+
+Ou, plus concis pour l4/conclusion.md :
+
+  Au-delà de 183 000 points par seconde, le CPU serveur sature. On le lit sur
+  le plafond de 200 % du conteneur, la latence qui monte de 12 ms à 19 ms, et
+  l'absence de pattern d'attente disque.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ERREURS FRÉQUENTES
+
+1. Prise unique de docker stats ou des événements d'attente
+   ✗ Lancé une fois entre deux paliers, révèle zéro.
+   ✓ Lancé en continu pendant les trente secondes, le profil apparaît.
+
+2. Oublier que 200 % est le plafond absolu du conteneur
+   ✗ « Le CPU est à 95 %, donc pas saturé ».
+   ✓ 95 % de quoi ? Si le conteneur est épinglé à 2 cœurs, 200 % est le max.
+     180–200 % = saturé.
+
+3. Conclure sur la latence seule
+   ✗ « La latence monte à 15 ms, donc c'est le disque ».
+   ✓ La latence monte quand la base a du mal. C'est CPU ou disque ?
+     Regardez les événements d'attente : rien = CPU, WALWrite = disque.
+
+4. Négliger la contention du poste
+   ✗ Deux injecteurs + conteneur à 2 cœurs = 4 cœurs pour 4 cœurs dispos.
+   ✓ docker stats peut montrer le conteneur en contention s'il ne reçoit que 50 %.
+     C'est alors le poste qui limite, pas la base.
+
+5. Lire le cumul d'E/S bloc comme une mesure instantanée
+   ✗ « 901 Go écrits, donc le disque sature ».
+   ✓ C'est le total depuis le démarrage du conteneur. La variation pendant
+     le palier compterait, pas le cumul.
+
+6. Inverser les deux injecteurs et les paliers
+   ✗ Lancer un injecteur à 120 000 directement (il plafonnera).
+   ✓ Deux injecteurs à 60 000 chacun, puis à 100 000 chacun.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SUITE : Étape 5
+
+Vous connaissez maintenant le point de rupture. L'étape 5 demande de justifier
+par le modèle de coûts interne de PostgreSQL pourquoi c'est cette ressource
+qui cède en premier, pas une autre.

@@ -1,0 +1,191 @@
+L11 — EXTENSIONS E1 À E4
+=========================
+
+Les quatre extensions ont été jouées le 17/09/2026 sur le poste (E4 :
+rédaction). Aucune n'entre dans un état de reprise : L11 ne produit que
+des fichiers.
+
+-------------------------------------------------------------------------
+E1 — Exécuter le repli (interruption volontaire à mi-copie)
+-------------------------------------------------------------------------
+Protocole : preparer-cible rejoué (mistral_prod détruite et recréée),
+flux relancé, migrer.sh lancé dans son propre groupe de processus
+(setsid), interrompu 45 s plus tard pendant la troisième plage. Puis le
+repli TEL QU'ÉCRIT dans la checklist de l11s1, chronométré.
+
+  [20:39:24] plage id [12000001, 18000001) … ← interrompue
+  R1. kill -TERM -- -<pgid de migrer.sh>       → plus de processus migrer.sh
+  R2. COPY en cours : source 2 (!), cible 0
+  R3. source : 42 036 463 → 42 040 463 en 2 s — intacte, flux actif
+  R4. DROP DATABASE mistral_prod ; rm l11/.borne
+  R5. rien à rebasculer — incident clos
+  DURÉE DU REPLI : 8,9 s     (cible partielle : 11 999 963 lignes)
+
+Les écarts entre l'écrit et l'exécuté — la vraie valeur de l'exercice :
+1. R2 a trouvé DEUX « COPY en cours » côté source juste après le kill :
+   les deux psql du tube (`\copy … TO STDOUT` côté source, `\copy … FROM
+   STDIN` côté cible) ne meurent pas instantanément avec le script, et
+   le backend source termine son COPY TO dans le vide. Deux secondes
+   plus tard il n'y avait plus rien, mais la checklist disait « vérifier
+   qu'aucune COPY ne tourne » sans dire « attendre et revérifier ». À
+   ajouter : boucle jusqu'à 0, avec un délai maximal, puis
+   pg_terminate_backend si nécessaire.
+2. Tuer le SCRIPT ne suffit pas : c'est le groupe de processus qu'il
+   faut viser (le tube de deux docker exec). D'où le setsid au
+   lancement et le `kill -- -PGID` : la checklist doit dire COMMENT la
+   copie est lancée pour pouvoir dire comment on l'arrête.
+3. Le repli n'a coûté que la destruction d'une base de 12 M lignes :
+   c'est la conséquence directe de « la source reste la référence tant
+   que le flux n'a pas basculé ». Un repli APRÈS bascule serait une
+   migration inverse, avec les mêmes contrôles — ce que la rubrique
+   « la source reste intacte jusqu'au J+7 » achète.
+4. Le chrono (8,9 s) est dominé par les docker exec et les pauses de
+   vérification ; à l'échelle de production, le DROP DATABASE d'une
+   cible de 200 Go se compte en secondes aussi (unlink des fichiers) —
+   c'est la vérification de l'arrêt des COPY qui peut durer.
+
+-------------------------------------------------------------------------
+E2 — L'extension manquante
+-------------------------------------------------------------------------
+La source n'utilise aucune extension (plpgsql seul) ; c'est la CIBLE qui
+dépend de timescaledb. Sur ce poste, l'image timescaledb-ha l'installe
+dans template1 : toute base neuve l'a déjà. Simulation : base jetable,
+DROP EXTENSION timescaledb CASCADE, puis le corps de preparer-cible.sql.
+
+  ERROR:  function by_range(unknown, interval) does not exist
+  tables : mesures, evenements          ← créées quand même, ORDINAIRES
+
+Diagnostic : le message ne dit pas « extension absente », il dit qu'une
+fonction n'existe pas — un participant pressé y voit une faute de frappe
+(« il manque un cast ? », dit le HINT). Et surtout : CREATE TABLE a
+réussi. Un migrer.sh lancé ensuite copierait 42 M de lignes dans deux
+tables ordinaires, sans un message, et les trois contrôles PASSERAIENT
+(ils comparent des lignes, pas des chunks). La migration serait
+« réussie » vers une base sans partitionnement, sans compression
+possible, sans politiques.
+
+Où ce contrôle appartient : rubrique « Avant la bascule », première
+ligne — « extension présente (version) » — ET « schéma en place » doit
+se vérifier par `timescaledb_information.hypertables` (2 lignes), pas
+par l'absence d'erreur. preparer-cible.sql affiche désormais cette vue
+en fin de script. Le piège correspondant a été ajouté à la fiche.
+
+-------------------------------------------------------------------------
+E3 — La réplication logique, pour constater (le point de validation)
+-------------------------------------------------------------------------
+Protocole : base jetable mistral_e3 avec l'hypertable `mesures` (chunk
+7 j) ; côté source `CREATE PUBLICATION pub_e3 FOR TABLE mesures WITH
+(publish_via_partition_root = true)` (sans cette option, la souscription
+cherche des tables nommées comme les partitions mesures_y2026m07…) ;
+côté cible `CREATE SUBSCRIPTION sub_e3 CONNECTION 'host=legacy
+dbname=mistral_legacy user=postgres password=mistral' PUBLICATION pub_e3
+WITH (copy_data = true)`.
+
+  synchro initiale : état r (ready) après 81 s   — 42 M lignes, 3 Go
+  count(*) FROM mesures        = 0
+  count(*) FROM ONLY mesures   = 0        ← la fiche prétendait l'inverse
+  chunks = 0
+  taille table racine = 2 737 Mo ; hypertable_size = 3 075 Mo
+  une insertion côté source après la synchro : ONLY = 0, hypertable = 0
+  pg_stat_subscription_stats : apply_error 0, sync_error 0
+  slot côté source : sub_e3, actif, 264 octets de WAL retenus
+  DROP SUBSCRIPTION → « dropped replication slot on publisher » → 0 slot
+
+Reproduction miniature (100 000 lignes, table ordinaire → hypertable),
+pour comprendre :
+  pg_stat_user_tables (racine) : n_tup_ins = 100 000, n_live_tup = 100 000
+  pg_relation_size(racine) = 5,5 Mo
+  EXPLAIN SELECT count(*) FROM ONLY t_e3 →  Result, One-Time Filter: false
+  après une insertion poussée par le flux : n_tup_ins = 100 001, chunks 0
+  déclencheur ts_insert_blocker sur la racine : présent, mais le worker
+  de réplication tourne en session_replication_role = replica, qui ne
+  fait pas tirer les déclencheurs ordinaires.
+
+Le verdict, en trois points :
+1. les lignes SONT écrites — dans le tas de la table racine, jamais
+   routées vers les chunks (le routage est fait par le déclencheur
+   d'insertion de l'extension, désactivé pour le worker) ;
+2. elles sont INVISIBLES, y compris avec ONLY : le planificateur de
+   l'extension remplace la racine d'une hypertable par un filtre
+   constant faux. Seules pg_stat_user_tables et pg_relation_size les
+   trahissent ;
+3. RIEN ne le signale : état « ready », zéro erreur, slot sain. Le
+   silence est le mode de défaillance — c'est pour cela que la
+   validation d'une migration se fait par des contrôles de contenu, pas
+   par l'état de la réplication.
+
+Comparaison avec la copie par plages :
+  durée totale : 81 s de synchro (sans index) contre 116 s de copie
+    (avec deux index) — équivalent ;
+  interruption : n/a, la cible est vide ; en théorie quelques secondes
+    (attendre retard 0, setval) ;
+  complexité : wal_level, publication avec option non évidente, slot à
+    surveiller et à SUPPRIMER (un slot orphelin retient le WAL de la
+    source jusqu'à saturation du disque), replica identity pour les
+    DELETE/UPDATE (vu : « cannot delete from table mesures_y2026m07
+    because it does not have a replica identity ») — contre deux
+    scripts de \copy.
+La phrase attendue : « La réplication logique reste un excellent chemin
+vers une table ordinaire, parce que le worker y écrit directement ; vers
+une hypertable de 2.29, il écrit là où personne ne lit. »
+
+Point ouvert des NOTES tranché : le comportement est reproduit à
+l'identique sur 2.29.2 / PG 17, et précisé (ONLY ne montre rien).
+
+-------------------------------------------------------------------------
+E4 — Transposer à l'échelle de production (200 Go, 19 milliards de points)
+-------------------------------------------------------------------------
+Ce qui ne passe plus, et par quoi le remplacer :
+
+Copie initiale par plages de 6 M d'id : 3 200 plages en série, à ≈ 50 k
+lignes/s (débit observé ici : 41 M en 100 s ≈ 400 k/s en local, mais
+c'est un tube docker sur le même NVMe ; en réseau d'entreprise, compter
+10× moins) → des heures à des jours. Remplacer par : plages parallèles
+(N flux \copy simultanés sur des plages disjointes), format binaire
+(`WITH (FORMAT binary)` des deux côtés — la leçon de L04), index de
+la cible créés APRÈS la copie (l'index (series_id, ts DESC) a coûté
+peu ici ; à 19 G de lignes il double le temps), et compression des
+chunks anciens AU FIL de la copie par borne explicite (compress_chunk
+sur les chunks entièrement copiés, pas une politique relative à now()).
+
+Delta : inchangé dans son principe (id monotone), mais le retard résiduel
+= débit du flux × durée d'un delta ; avec un delta en \copy binaire par
+plages, il reste de l'ordre de la minute. Critère « stable » identique.
+
+Contrôle 1 (count global) : un count(*) sur 19 G de lignes prend des
+minutes des deux côtés, et bloque la bascule pendant ce temps. Remplacer
+par un comptage PAR CHUNK / PAR PARTITION (les chunks clos ne bougent
+plus : compter une fois, mémoriser), et ne recompter à la bascule que la
+zone ouverte (dernier delta).
+
+Contrôle 2 (somme par jour) : 1 095 jours × agrégation complète = trop
+long ; mais il se rejoue par PLAGE : jour clos = calculé une fois,
+comparé une fois, consigné. À la bascule, seul le jour en cours se
+recalcule. Ajouter une somme d'entiers par jour ET par série (count,
+sum(series_id) ne détecte pas une série manquante compensée par une
+autre : sum(series_id) sur 400 séries est trop grossier — prendre
+sum(id) ou un hachage agrégé, toujours sur entiers).
+
+Contrôle 3 (échantillon) : il tient, à condition que l'échantillon soit
+RÉPARTI (hachage, pas modulo — l11s4) et dimensionné : 1 000 lignes sur
+19 G ne prouvent rien statistiquement, mais un échantillon par chunk
+(10 lignes × 30 000 chunks) détecte une plage sautée. C'est le contrôle
+le moins cher et le plus rapide ; il reste.
+
+Bascule : identique — mais « arrêter le flux » devient « passer les
+collecteurs en mode tampon » (ils bufferisent quelques minutes), et
+l'interruption réelle se mesure du premier point retenu au premier point
+écrit sur la cible, pas au chrono du shell. setval : sur last_value de la
+séquence source si la source reste écrivable en parallèle.
+
+Repli : inchangé avant bascule (détruire la cible) ; APRÈS bascule, il
+faut un delta INVERSE (cible → source sur l'id monotone, qui continue
+grâce au setval) — à écrire dans la checklist de production, avec son
+propre critère de stabilité, et un délai maximal au-delà duquel on ne
+revient plus (la source aurait trop de retard).
+
+Version production de la checklist : les mêmes trois rubriques, plus une
+quatrième — « Répétition » : la migration se joue une fois à blanc sur
+une copie, chrono en main, avant la vraie ; c'est cette répétition qui
+donne le délai maximal avant repli, au lieu du « 20 min » décidé à froid
+en salle.

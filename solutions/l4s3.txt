@@ -1,0 +1,102 @@
+L04 — ÉTAPE 3 : LE RAPPORT, ET CE QU'IL VEUT DIRE — CORRIGÉ FORMATEUR
+======================================================================
+
+Pas de nouvelle mesure : sept minutes d'écriture à partir du tableau de
+l'étape 2. Trois livrables dans mesures.md, section M05.
+
+-------------------------------------------------------------------------
+1. Le rapport, avec son contexte
+-------------------------------------------------------------------------
+Forme attendue (la fiche l'impose) :
+
+  Rapport unitaire → COPY binaire : × 1 276
+  Contexte : conteneur local, latence réseau négligeable, 2 vCPU, NVMe
+
+Référence : 450 → 574 061 pts/s = × 1 276 (et × 146 unitaire → lots).
+Autre poste (16/09/2026) : 970 → 640 540 = × 660 (× 79 vers les lots).
+
+Pourquoi l'écart entre postes ne compte pas : la stratégie unitaire mesure
+surtout l'aller-retour client-serveur (0,5 à 2 ms selon le poste, en
+local). Les deux autres stratégies sont stables à ± 20 %. Le rapport
+dépasse un ordre de grandeur partout — c'est le critère — et il change
+d'un ordre de grandeur de plus à travers un réseau d'entreprise, où
+l'unitaire plafonne sous 1 000 pts/s quel que soit le serveur.
+
+Le contexte est la partie évaluée : un rapport sans contexte sera cité
+hors contexte. « × 1 276 » sur une diapositive de direction, sans « en
+local », devient une promesse intenable.
+
+-------------------------------------------------------------------------
+2. Le journal est-il proportionnel au nombre de lignes ?
+-------------------------------------------------------------------------
+Non. Mesuré par différence de LSN, ramené à la ligne :
+
+  Unitaire      5,9 Mo  pour    26 993 lignes  →  225 octets / ligne
+  Lots 1 000    633 Mo  pour 3 946 000 lignes  →  168 octets / ligne
+  COPY binaire  3,77 Go pour 34 450 000 lignes →  115 octets / ligne
+
+Une ligne de mesures_charge pèse ~50 octets en heap ; le reste est le
+prix de la journalisation : en-tête d'enregistrement WAL par insertion,
+enregistrement de validation (commit) par transaction, image complète de
+page à la première modification après un checkpoint (full-page write).
+
+- L'unitaire paie un commit et un en-tête par ligne : 225 o.
+- Le lot amortit le commit sur 1 000 lignes mais journalise encore
+  ligne à ligne : 168 o.
+- Le COPY remplit des pages entières et journalise des pages pleines :
+  115 o — le plus proche du coût brut de la donnée.
+
+Réponse à écrire : le journal dépend de la stratégie, pas seulement des
+lignes ; l'écart est d'un facteur 2 entre unitaire et COPY, à données
+identiques. C'est un argument de plus pour le COPY en chargement initial
+(M03) et en migration (M12) : moins de WAL, donc moins d'archives (M13)
+et moins de réplication à transporter.
+
+Si le participant n'a pas relevé le WAL à l'étape 2 : une injection de
+20 s par stratégie avec pg_current_wal_lsn() avant/après suffit, la
+grandeur utile étant le volume PAR LIGNE.
+
+-------------------------------------------------------------------------
+3. La latence d'un lot vaut-elle mille fois celle d'une insertion ?
+-------------------------------------------------------------------------
+Non, très loin de là :
+
+  Référence : 2,11 ms (1 ligne) → 13,7 ms (1 000 lignes) : × 6,5
+  Autre poste : 0,97 ms         → 12,16 ms                : × 12,5
+  COPY : 10 000 lignes en 12,4 ms (réf.) / 10,87 ms       : × 6 pour 10 × plus
+
+Lecture : le coût d'une insertion unitaire est presque entièrement un
+COÛT PAR INSTRUCTION — aller-retour, analyse, planification, validation.
+Le coût par ligne (écriture, index, journal) n'en représente qu'une
+fraction. Le lot amortit le premier sur mille lignes ; le COPY supprime en
+plus l'analyse SQL et le format texte, d'où un coût par ligne encore
+divisé par dix.
+
+Ce que cela dit du plateau (extension E4) : au-delà d'une certaine taille
+de lot, le coût par instruction est amorti et il ne reste que le coût par
+ligne, incompressible — le débit cesse de croître. Sur 2 vCPU, ce plateau
+est atteint dès quelques milliers de lignes par lot.
+
+Ce que cela dit de l'étape 4 : à 12 ms par lot de 1 000, un seul
+injecteur monodébit plafonne vers 80 000 pts/s ET consomme 70-80 % d'un
+cœur côté client — le point de rupture qu'on va chercher risque d'être
+celui du client. Deux injecteurs en parallèle lèvent l'ambiguïté.
+
+-------------------------------------------------------------------------
+4. Formulation attendue dans mesures.md (exemple)
+-------------------------------------------------------------------------
+  Rapport unitaire → COPY binaire : × 660 — contexte : conteneur local,
+  latence réseau négligeable, 2 vCPU, NVMe.
+  Journal : 225 / 168 / 115 octets par ligne (unitaire / lots / COPY) :
+  non proportionnel aux lignes — le commit et les en-têtes se paient par
+  transaction et par enregistrement, le COPY journalise des pages pleines.
+  Latence : 1 000 lignes coûtent 12,5 fois une ligne, pas 1 000 : le coût
+  dominant de l'unitaire est par instruction, pas par ligne ; le lot
+  l'amortit, le COPY le supprime.
+
+Erreurs fréquentes :
+- rapport calculé entre lots et COPY (× 8) au lieu d'unitaire → meilleure ;
+- contexte absent, ou « poste de formation » sans préciser local/réseau ;
+- « le journal est proportionnel » affirmé sans avoir divisé par les lignes ;
+- confondre latence par opération (ce que l'injecteur donne) et latence
+  par ligne.

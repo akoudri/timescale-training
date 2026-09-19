@@ -1,0 +1,100 @@
+L13 — ÉTAPE 2 : CLOISONNER PAR SITE (VUES BARRIÈRE)
+====================================================
+
+Fiche : « La sécurité au niveau ligne n'est pas disponible ici. Le
+cloisonnement passe par une vue sécurisée : même prédicat, autre
+mécanisme — et retrait de l'accès direct à la table. Ne pas s'arrêter là :
+faire de même pour les trois niveaux d'agrégats. »
+
+-------------------------------------------------------------------------
+1. Pourquoi pas la RLS (à faire constater, pas raconter)
+-------------------------------------------------------------------------
+ALTER TABLE mesures ENABLE ROW LEVEL SECURITY;
+→ ERROR: operation not supported on hypertables that have columnstore enabled
+ALTER TABLE _timescaledb_internal._materialized_hypertable_13 ENABLE ROW LEVEL SECURITY;
+→ ERROR: operation not supported on materialization tables
+
+Deux refus distincts, deux raisons : le columnstore (les lots compressés
+ne portent pas de politique ligne à ligne) et la matérialisation (objet
+interne de l'extension). Ce n'est pas un problème de droits : la
+commande est refusée au superutilisateur.
+
+-------------------------------------------------------------------------
+2. Requêtes attendues (suite de roles.sql)
+-------------------------------------------------------------------------
+-- mesures : la vue, puis retrait de l'accès direct
+CREATE VIEW mesures_site WITH (security_barrier) AS
+  SELECT m.*
+  FROM   mesures m
+  WHERE  m.series_id IN (
+    SELECT af.series_id
+    FROM   affectation_capteur af
+    JOIN   actifs a ON a.machine_id = af.machine_id
+    WHERE  a.site_id = nullif(current_setting('mistral.site', true), '')::int);
+REVOKE SELECT ON mesures FROM mistral_lecture;
+GRANT  SELECT ON mesures_site TO mistral_lecture;
+
+-- les trois niveaux d'agrégats : même prédicat, même retrait
+CREATE VIEW mistral_1min_site WITH (security_barrier) AS
+  SELECT v.* FROM mistral_1min v WHERE v.series_id IN (… même sous-requête …);
+CREATE VIEW mistral_1h_site   WITH (security_barrier) AS … FROM mistral_1h …;
+CREATE VIEW mistral_1j_site   WITH (security_barrier) AS … FROM mistral_1j …;
+REVOKE SELECT ON mistral_1min, mistral_1h, mistral_1j FROM mistral_lecture;
+GRANT  SELECT ON mistral_1min_site, mistral_1h_site, mistral_1j_site TO mistral_lecture;
+
+Trois points de syntaxe à expliquer :
+- `security_barrier` : sans lui, le planificateur peut évaluer une
+  fonction fournie par le lecteur (une fonction « indiscrète » à coût
+  déclaré faible) AVANT le filtre de la vue, et la fonction voit passer
+  les lignes des autres sites. Avec lui, seules les opérations
+  LEAKPROOF (=, <, … sur les types de base) traversent le filtre — c'est
+  ce qui permet encore de pousser `series_id = …` et `ts >= …` vers
+  l'index (l13s4).
+- `current_setting('mistral.site', true)` : le second argument rend
+  l'absence de paramètre tolérée (NULL au lieu d'une erreur) ; `nullif(…,
+  '')` traite le cas d'un paramètre remis à vide par RESET. Sans cela :
+    SET ROLE mistral_lecture; SELECT count(*) FROM mesures_site;
+    → ERROR: invalid input syntax for type integer: ""
+  (session neuve). Avec : 0 ligne. Une politique qui ne retourne rien
+  vaut mieux qu'une qui échoue : le tableau de bord affiche « aucune
+  donnée », pas une erreur SQL.
+- La vue s'exécute avec les droits de son PROPRIÉTAIRE (postgres) : c'est
+  pour cela que le REVOKE sur la table sous-jacente ne casse pas la vue.
+  Et c'est pour cela que le propriétaire, lui, passe à côté (T2).
+
+-------------------------------------------------------------------------
+3. Résultats du poste
+-------------------------------------------------------------------------
+SET mistral.site = 2; SET ROLE mistral_lecture;
+SELECT count(DISTINCT series_id) FROM mesures_site WHERE ts >= '2026-10-29 21:00+00';
+→ 179   (180 séries au site 2 ; la 180ᵉ est le capteur 208, coupé 3 h en L10)
+SELECT count(*) FROM mesures;      → ERROR: permission denied for table mesures
+SELECT count(DISTINCT series_id) FROM mistral_1h_site;  → 180
+SELECT count(DISTINCT series_id) FROM mistral_1j_site;  → 180
+Session sans site : 0 ligne (variante tolérante) — ou l'erreur ci-dessus
+(variante naïve). Faire voir les deux.
+
+Le compte attendu se calcule, il ne se devine pas :
+  SELECT a.site_id, count(DISTINCT af.series_id) FROM affectation_capteur af
+  JOIN actifs a USING (machine_id) GROUP BY 1;
+  → 150 / 180 / 110 / 50. Le site 2 = 18 éoliennes × 10 signaux.
+
+-------------------------------------------------------------------------
+4. Ce que l'étape laisse volontairement ouvert
+-------------------------------------------------------------------------
+À ce stade, un participant qui a fait SEULEMENT mesures_site croit avoir
+fini : c'est T1. Celui qui a tout fait mais teste sous postgres croit que
+ça ne marche pas : c'est T2. Ne pas corriger avant l'étape 3 — le but est
+que la salle constate elle-même.
+
+-------------------------------------------------------------------------
+5. Erreurs fréquentes
+-------------------------------------------------------------------------
+- Oublier `WITH (security_barrier)` : la vue « marche » et fuit.
+- Créer la vue avec `current_setting('mistral.site')::int` sans second
+  argument : erreur sur toute session neuve, tableaux de bord en panne.
+- REVOKE sur la table mais pas sur les agrégats — ou l'inverse : REVOKE
+  sur les agrégats sans GRANT sur les vues _site (« les tableaux de bord
+  tombent après l'étape 2 », piège de la fiche).
+- Tester le prédicat avec `SET mistral.site = '2'` puis oublier `SET
+  ROLE` : on lit la table en tant que postgres, résultat 490 séries.

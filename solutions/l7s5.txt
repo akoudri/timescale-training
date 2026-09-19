@@ -1,0 +1,137 @@
+L07 — ÉTAPE 5 : LE PROTOCOLE DE LA DONNÉE TARDIVE (+ E3, E4)
+==============================================================
+
+Fiche : « Suivre exactement les cinq étapes, dans l'ordre. Ce qu'il faut
+constater et documenter : après le rattrapage du niveau minute, les
+niveaux heure et jour ne bougent pas. La propagation se fait à la main,
+bornée, niveau par niveau. »
+
+-------------------------------------------------------------------------
+1. Le déroulé, et ce que chaque contrôle doit montrer
+-------------------------------------------------------------------------
+Contrôle = `\i l07/controle-somme.sql` (jour de Paris J-3 = 26 octobre,
+quatre lignes). Noter les COMPTES, ce sont eux qu'on compare.
+
+  1. Référence avant injection : quatre comptes identiques (≈ 4,3 M
+     points : 490 séries × 8 640, moins les trous).
+  2. `./l07/injecter-tardif.sh --jour J-3 --points 100000` : 100 000
+     points, qualite = 2, ts sur J-3 avec un décalage de 0,5 s (jamais en
+     collision avec la grille 10 s), graine fixe (rejouable).
+  3. Contrôle : brut = référence + 100 000 ; 1min, 1h, 1j INCHANGÉS.
+     Normal : l'écriture est plus ancienne que le seuil de matérialisation
+     et que toute fenêtre de politique ; elle a été journalisée comme
+     invalidation (visible dans
+     _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log
+     → après passage du job, continuous_aggs_materialization_invalidation_log
+     par agrégat), rien de plus.
+  4. Rattrapage du niveau bas, borné :
+       SELECT max(ts) - INTERVAL '4 days' AS debut,
+              max(ts) - INTERVAL '2 days' AS fin FROM mesures \gset
+       CALL refresh_continuous_aggregate('mistral_1min', :'debut', :'fin');
+     Bornes du JEU (max(ts)), jamais now() ; la fenêtre [25/10 21:59:50,
+     27/10 21:59:50] est élargie aux seaux entiers et couvre le jour de
+     Paris du 26. Hors transaction (piège : pas de BEGIN).
+  5. Contrôle : 1min = brut ; 1h et 1j TOUJOURS à la référence. Puis :
+       CALL refresh_continuous_aggregate('mistral_1h', :'debut', :'fin');
+       CALL refresh_continuous_aggregate('mistral_1j', :'debut', :'fin');
+     Contrôle : quatre comptes identiques (référence + 100 000).
+
+Référence : 4 332 865 points sur J-3 après rattrapage (jour UTC de la
+version initiale du contrôle ; le jour de Paris donne un autre compte).
+Poste de l'utilisateur : à reporter, les cinq contrôles.
+
+-------------------------------------------------------------------------
+2. Les deux questions de l'étape 5 (l07/tardif-observations.md)
+-------------------------------------------------------------------------
+Q1 — Les niveaux supérieurs se sont-ils mis à jour seuls ? NON. Le
+refresh du 1min invalide bien la plage [25/10, 27/10] dans le journal
+d'invalidation du 1h (l'invalidation se PROPAGE, hiérarchie oblige),
+mais rien ne la TRAITE : la politique du 1h ne regarde que [now − 4 h,
+now − 5 min], et now() est le 17 septembre. Un run_job forcé de cette
+politique rafraîchit ses 4 heures relatives à now() et laisse J-3 tel
+quel (vérifié sur la référence : total inchangé à 189 958 049 points).
+
+Q2 — Qu'est-ce qui a déclenché le rattrapage ? Rien d'automatique : un
+refresh_continuous_aggregate MANUEL et BORNÉ sur chaque niveau, du bas
+vers le haut, sur la même plage. L'ordre compte : rafraîchir le 1h avant
+le 1min matérialiserait le 1h à partir d'un 1min encore faux, et
+consommerait l'invalidation — il faudrait tout refaire.
+
+Conséquence d'architecture à écrire : « le plus court des start_offset
+de la pyramide borne la profondeur de rattrapage automatique de TOUTE la
+pyramide ; toute donnée plus tardive exige une propagation manuelle
+niveau par niveau, bornée, dans l'ordre bas → haut. C'est un choix
+(fenêtres courtes = passages bon marché) qui se documente dans la
+procédure d'exploitation. » Cette procédure est le livrable de L07, et
+L14 (incident « job suspendu ») la fera rejouer.
+
+-------------------------------------------------------------------------
+3. Ce qu'il faut savoir en plus (questions de la salle)
+-------------------------------------------------------------------------
+- « Et le temps réel ? » N'aide pas : il n'agrège à la volée que le brut
+  situé APRÈS le seuil de matérialisation, pas une région invalidée en
+  dessous. J-3 n'apparaît dans aucun niveau tant qu'on ne rafraîchit pas.
+- « Et si je mets start_offset = 45 jours sur le 1min ? » La politique
+  traite alors J-3 automatiquement (à chaque passage, uniquement les
+  seaux invalidés : coût faible en régime normal) — mais le 1h et le 1j
+  ont le même problème, et le risque est un passage qui recalcule
+  45 jours après une migration ou un DELETE massif. C'est un arbitrage
+  légitime, à écrire avec sa perte : temps d'un passage dans le pire cas.
+- « Pourquoi qualite = 2 ? » Substituée : marque la donnée de rattrapage,
+  identifiable après coup (79 946 points de qualité 2 existaient déjà
+  dans le jeu : filtrer sur ts pour isoler l'injection).
+- « Comment savoir qu'il reste des invalidations non traitées ? »
+  SELECT * FROM _timescaledb_catalog.continuous_aggs_materialization_invalidation_log ;
+  c'est une requête de diagnostic pour L14/L15 (alerte « agrégat en
+  retard »).
+- Le rattrapage manuel sur une plage compressée (M09) devra décompresser
+  ou passer par le recompress : le délai de bascule vers le columnstore
+  doit dépasser la fenêtre de données tardives (fin de la fiche).
+
+-------------------------------------------------------------------------
+4. E3 — modifier un agrégat en production
+-------------------------------------------------------------------------
+La définition d'un agrégat continu ne se modifie pas (ALTER ne change
+que les options). Et supprimer `mistral_1min` supprime EN CASCADE 1h et
+1j : c'est toute la pyramide qu'on remplace, pas une brique.
+Checklist chronométrée (référence : ≈ 5 min, dominée par le 1min) :
+  1. créer mistral_1min_v2 (+ min(valeur) AS minimum), WITH NO DATA ;
+     créer 1h_v2 et 1j_v2 dessus ;
+  2. CALL refresh(NULL, NULL) sur les trois, bas → haut (4 min + 18 s + 1 s) ;
+  3. politiques sur les trois _v2 (mêmes offsets) ;
+  4. contrôle de somme v1 contre v2 sur J-3 : comptes identiques ;
+  5. basculer les lecteurs : soit renommer (DROP v1 CASCADE puis ALTER
+     MATERIALIZED VIEW … RENAME TO — coupure de quelques secondes),
+     soit des vues stables `tb_1h`, `tb_1j` pointant sur la version
+     courante (recommandé : bascule atomique par CREATE OR REPLACE VIEW,
+     et c'est ce qu'on aurait dû faire dès l'étape 4) ;
+  6. supprimer v1 (CASCADE, retire aussi ses trois jobs) ; vérifier
+     timescaledb_information.jobs ;
+  7. re-mesurer le tableau de bord.
+C'est la checklist de bascule de M12 en miniature : doublon, comparaison,
+bascule des lecteurs, décommission.
+
+-------------------------------------------------------------------------
+5. E4 — un état de percentile dans la pyramide
+-------------------------------------------------------------------------
+  CREATE MATERIALIZED VIEW vent_1h WITH (timescaledb.continuous) AS
+  SELECT time_bucket('1 hour', ts) AS seau, series_id,
+         percentile_agg(valeur) AS p_etat
+  FROM   mesures
+  WHERE  series_id IN (SELECT series_id FROM affectation_capteur af
+                       JOIN signaux g USING (signal_id)
+                       WHERE g.libelle = 'vitesse_vent_ms')   -- si refusé (sous-requête) :
+                                                              -- lister les 42 series_id
+  GROUP  BY 1, 2 WITH NO DATA;
+  CALL refresh_continuous_aggregate('vent_1h', NULL, NULL);
+
+  SELECT time_bucket('1 day', seau, 'Europe/Paris') AS jour,
+         approx_percentile(0.95, rollup(p_etat)) AS p95
+  FROM   vent_1h GROUP BY 1 ORDER BY 1;
+  -- contre percentile_disc(0.95) WITHIN GROUP (ORDER BY valeur) sur le brut,
+  -- même jour : écart < 1 % (L06 indicateur 3), état de quelques Ko par heure.
+C'est l'industrialisation de L06 E2 : l'état (sketch) est stocké, le
+percentile se lit à n'importe quel niveau par rollup. Le même schéma
+vaut pour time_weight (état TimeWeightSummary + rollup + average) et
+state_agg. Ne PAS stocker approx_percentile(...) au niveau heure : ce
+serait la « moyenne de p95 », non réagrégeable.

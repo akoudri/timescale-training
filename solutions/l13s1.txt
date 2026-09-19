@@ -1,0 +1,90 @@
+L13 — ÉTAPE 1 : LES TROIS RÔLES
+===============================
+
+Fiche : « Vérifier chaque rôle en basculant dessus, plutôt qu'en relisant
+les instructions d'attribution. Le rôle d'ingestion qui peut lire est
+l'erreur la plus fréquente de cette étape. »
+
+-------------------------------------------------------------------------
+1. roles.sql complété (attendu)
+-------------------------------------------------------------------------
+CREATE ROLE mistral_ingestion LOGIN PASSWORD 'ingestion';
+CREATE ROLE mistral_lecture   LOGIN PASSWORD 'lecture';
+CREATE ROLE mistral_admin     LOGIN PASSWORD 'admin';
+GRANT USAGE ON SCHEMA public TO mistral_ingestion, mistral_lecture, mistral_admin;
+
+-- ingestion : INSERT seul. Pas de SELECT « par réflexe » : sur une
+-- hypertable, INSERT suffit à écrire (le routage vers les chunks n'exige
+-- aucun droit de lecture).
+GRANT INSERT ON mesures, evenements TO mistral_ingestion;
+
+-- lecture : les mesures, les TROIS niveaux d'agrégats, et le référentiel
+-- (le prédicat de cloisonnement de l'étape 2 consulte affectation_capteur
+-- et actifs : une vue security_barrier s'exécute avec les droits de son
+-- propriétaire, mais le lecteur doit pouvoir lire ces tables pour ses
+-- propres jointures).
+GRANT SELECT ON mesures, mistral_1min, mistral_1h, mistral_1j TO mistral_lecture;
+GRANT SELECT ON sites, actifs, signaux, affectation_capteur TO mistral_lecture;
+
+-- admin : tout, y compris politiques et jobs.
+GRANT ALL ON ALL TABLES    IN SCHEMA public TO mistral_admin;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO mistral_admin;
+
+Remarque : « tout, y compris jobs » n'est pas entièrement couvert par un
+GRANT sur les tables. `alter_job`/`delete_job` exigent d'être
+propriétaire du job (ou superutilisateur) : les jobs 1000-1008 ont été
+créés par `postgres`. Un vrai rôle d'administration créerait les jobs
+lui-même (add_job sous mistral_admin) — c'est exactement le sujet de T3
+et de E3.
+
+-------------------------------------------------------------------------
+2. Vérification par bascule — résultats du poste
+-------------------------------------------------------------------------
+SET ROLE mistral_ingestion;
+INSERT INTO mesures VALUES ('2026-10-29 22:00+00', 1, 0, 2);   → INSERT 0 1
+SELECT count(*) FROM mesures;        → ERROR: permission denied for table mesures
+DELETE FROM mesures WHERE …;         → ERROR: permission denied for table mesures
+SELECT count(*) FROM mistral_1h;     → ERROR: permission denied for view mistral_1h
+RESET ROLE;  (la ligne de test est supprimée ensuite sous postgres)
+
+SET ROLE mistral_lecture;
+SELECT count(*) FROM mistral_1j;     → 22 050
+SELECT count(*) FROM actifs;         → 46
+SELECT count(*) FROM mesures WHERE ts >= '2026-10-29 21:00+00';  → 175 320
+INSERT INTO mesures …;               → ERROR: permission denied for table mesures
+SELECT count(*) FROM alertes_qualite;→ ERROR: permission denied (pas dans la liste, et c'est voulu — voir T3)
+RESET ROLE;
+
+SET ROLE mistral_admin;
+SELECT count(*) FROM alertes_qualite;→ 3
+SELECT job_id, scheduled FROM timescaledb_information.jobs WHERE job_id = 1008; → 1008 | t
+RESET ROLE;
+
+Le critère « vérifié par bascule » veut dire : la salle a vu les DEUX
+lignes ERROR du rôle d'ingestion. Un participant qui montre seulement
+`\dp mesures` n'a pas vérifié.
+
+-------------------------------------------------------------------------
+3. Ce qu'il faut faire dire
+-------------------------------------------------------------------------
+- « INSERT sans SELECT » : un collecteur compromis ne peut pas exfiltrer
+  l'historique. C'est la séparation qui donne son sens aux trois rôles.
+- Le référentiel est lisible par le lecteur : c'est petit, stable, et
+  nécessaire aux jointures. Le cloisonnement porte sur les séries
+  temporelles, pas sur le catalogue.
+- Les mots de passe en clair dans roles.sql sont un artefact d'atelier :
+  en production, `CREATE ROLE … LOGIN` sans mot de passe + authentification
+  externe (ou `\password` hors script).
+
+-------------------------------------------------------------------------
+4. Erreurs fréquentes
+-------------------------------------------------------------------------
+- `GRANT SELECT, INSERT ON mesures TO mistral_ingestion` : l'erreur
+  annoncée. Se voit uniquement par bascule.
+- `GRANT SELECT ON ALL TABLES IN SCHEMA public TO mistral_lecture` : trop
+  large — alertes_qualite, mesures_charge, mesures_avant, mesures_hc
+  deviennent lisibles ; c'est ce qui fait réussir T3 (l13s3 §3).
+- Oublier `GRANT USAGE ON SCHEMA public` : « permission denied for schema
+  public » sur toute requête, même avec les GRANT de table.
+- Tester avec `postgres` (superutilisateur) : tout passe, rien n'est
+  vérifié — c'est déjà T2.

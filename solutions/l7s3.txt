@@ -1,0 +1,121 @@
+L07 — ÉTAPE 3 : LES POLITIQUES, AVEC UN DÉCALAGE JUSTIFIÉ
+===========================================================
+
+Fiche : « Le start_offset du niveau minute doit être justifié par le
+retard d'arrivée mesuré en M05 : p50, p95, p99 ou pire cas — écrire la
+valeur retenue ET ce qu'on accepte de perdre. Pour les niveaux
+supérieurs, le start_offset couvre le retard de rafraîchissement du
+niveau inférieur, pas le retard d'arrivée des mesures. »
+
+-------------------------------------------------------------------------
+1. Comment une politique décide de ce qu'elle rafraîchit
+-------------------------------------------------------------------------
+À chaque passage (schedule_interval), le travail rafraîchit la fenêtre
+[now() − start_offset, now() − end_offset[, alignée sur les seaux, et
+uniquement les régions de cette fenêtre marquées invalides par des
+écritures. Une écriture PLUS ANCIENNE que now() − start_offset est
+journalisée comme invalidation mais JAMAIS traitée par la politique :
+elle attend un refresh manuel qui couvre sa plage. Donc :
+- start_offset borne la profondeur de rattrapage AUTOMATIQUE ;
+- end_offset écarte les seaux encore ouverts (un seau matérialisé
+  incomplet est figé jusqu'à la prochaine invalidation — piège « le
+  décalage est trop court ») ;
+- la politique exige start_offset − end_offset ≥ 2 seaux (2.29 refuse
+  2 h pour un seau d'une heure : errata du support).
+
+-------------------------------------------------------------------------
+2. Le niveau minute : justification par le profil de retard de M05
+-------------------------------------------------------------------------
+Profil relevé sur ce poste le 16/09 (à recopier dans « M05 — retard
+d'arrivée », section encore vide) : p50 2,2 s · p95 1 min 56 · p99
+13 min 20 · pire cas 39 min 04 (référence : 36 min 20).
+
+Raisonnement attendu :
+- p50 / p95 : rejeter. Un start_offset de 2 min figerait 5 % des points
+  (toutes les liaisons dégradées) hors de la matérialisation ;
+- p99 ≈ 13-15 min : couvre 99 % des points. C'est la base ;
+- marge : la politique tourne toutes les schedule_interval ; un point
+  arrivé avec 13 min de retard doit encore trouver son seau DANS la
+  fenêtre au passage suivant → start_offset ≥ p99 + schedule_interval +
+  end_offset, arrondi large : 30 minutes (≈ 2 × p99) ;
+- pire cas (39 min) : le retenir doublerait la fenêtre recalculée à
+  chaque minute (30 → 45-60 min de seaux × 490 séries) pour 1 % des
+  points, qui sont des reprises d'incident — traitées par un refresh
+  manuel borné après l'incident (c'est l'étape 5).
+
+-- CE QU'ON ACCEPTE DE PERDRE : le pour-cent de points au-delà du p99
+-- (retard > 30 min, reprises d'incident) n'est PAS rattrapé par la
+-- politique ; il l'est par la procédure manuelle de l'étape 5.
+SELECT add_continuous_aggregate_policy('mistral_1min',
+  start_offset      => INTERVAL '30 minutes',
+  end_offset        => INTERVAL '1 minute',
+  schedule_interval => INTERVAL '1 minute');
+
+Toute valeur de 15 à 45 min est acceptable SI elle est justifiée par le
+p99 et si la perte est écrite. Ne passe pas : une valeur sans référence
+au tableau de M05, ou « le pire cas, pour être sûr » sans chiffrer ce
+que coûte la fenêtre.
+
+-------------------------------------------------------------------------
+3. Les niveaux heure et jour : un autre raisonnement
+-------------------------------------------------------------------------
+Leur source est l'agrégat du dessous. Ce qu'ils doivent couvrir, c'est
+le temps que met le niveau inférieur à devenir stable : sa fenêtre
+(start_offset) + sa période + une marge ; et la contrainte des 2 seaux.
+
+SELECT add_continuous_aggregate_policy('mistral_1h',
+  start_offset      => INTERVAL '4 hours',    -- ≥ 2 seaux ; couvre 30 min + 1 min du 1min avec marge
+  end_offset        => INTERVAL '5 minutes',
+  schedule_interval => INTERVAL '10 minutes');
+
+SELECT add_continuous_aggregate_policy('mistral_1j',
+  start_offset      => INTERVAL '3 days',     -- ≥ 2 seaux d'un jour ; couvre 4 h + 10 min du 1h
+  end_offset        => INTERVAL '1 hour',
+  schedule_interval => INTERVAL '1 hour');
+
+Vérification (critère) :
+  SELECT job_id, application_name, schedule_interval, next_start, config
+  FROM   timescaledb_information.jobs
+  WHERE  application_name LIKE '%Continuous Aggregate%';
+  → trois lignes, next_start dans les minutes qui viennent, config
+    {start_offset, end_offset, mat_hypertable_id}.
+
+-------------------------------------------------------------------------
+4. Le jeu est daté : ce que les politiques font VRAIMENT sur ce poste
+-------------------------------------------------------------------------
+now() = 17 septembre 2026. La fenêtre du 1min est donc [17/09 now−30 min,
+now−1 min] : un intervalle SITUÉ DANS l'historique déjà matérialisé (le
+jeu commence le 14/09). La politique recalcule chaque minute 30 seaux
+× 490 séries déjà justes — inoffensif, invisible. Elle ne touchera
+JAMAIS le 26 octobre (J-3), ni la « fin » du jeu (29/10). Conséquences :
+- l'étape 3 est évaluée sur l'ENREGISTREMENT des politiques et leur
+  justification, pas sur leur effet ;
+- l'étape 5 se fait entièrement en refresh manuel — ce qui est aussi le
+  cas en production pour toute donnée plus tardive que start_offset ;
+- run_job(job_id) « pour forcer » applique la même fenêtre relative à
+  now() : il ne rattrape rien non plus (vérifié sur la référence). Le
+  dire aux participants qui l'essaient : c'est la démonstration voulue.
+Verdict dur du kit : jeu daté → max(ts), jamais now() ; les politiques
+sont la seule partie de l'atelier où now() est incontournable.
+
+-------------------------------------------------------------------------
+5. Formulation attendue dans mesures.md §M08
+-------------------------------------------------------------------------
+  Politiques : 1min 30 min / 1 min / 1 min (p99 = 13 min 20 ; perte
+  acceptée : les retards > 30 min, ≈ 1 % des points, reprises d'incident
+  → refresh manuel borné) ; 1h 4 h / 5 min / 10 min ; 1j 3 j / 1 h /
+  1 h (≥ 2 seaux entre les offsets ; chaque niveau couvre la fenêtre du
+  niveau inférieur). Trois jobs enregistrés, next_start visible.
+
+Erreurs fréquentes :
+- start_offset ≤ end_offset + 1 seau : « start_offset must be at least
+  two buckets greater than end_offset » ;
+- justifier le 1h par le retard d'arrivée des mesures (il ne lit pas les
+  mesures) ;
+- end_offset = 0 : matérialise le seau courant, incomplet, figé jusqu'à
+  la prochaine écriture ;
+- schedule_interval du 1min à 10 s « pour être frais » : 6 passages par
+  minute sur le même seau, CPU pour rien ; la fraîcheur utile est bornée
+  par end_offset ;
+- s'inquiéter que next_start soit « aujourd'hui » alors que les données
+  sont « en octobre » : voir §4.

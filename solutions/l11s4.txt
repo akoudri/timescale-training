@@ -1,0 +1,81 @@
+L11 — ÉTAPE 4 : LES TROIS CONTRÔLES
+====================================
+
+Fiche : « Contrôle 1 — comptage global. Contrôle 2 — somme par période,
+sur series_id (un entier), jamais sur la valeur. Contrôle 3 —
+échantillonnage, cent lignes comparées champ par champ. Les trois doivent
+passer AVANT toute décision de bascule. »
+
+-------------------------------------------------------------------------
+1. Exécution (des deux côtés, puis diff)
+-------------------------------------------------------------------------
+  docker compose exec -T legacy      psql -U postgres -d mistral_legacy -At \
+      < l11/controles.sql > /tmp/ctl-source.txt
+  docker compose exec -T timescaledb psql -U postgres -d mistral_prod   -At \
+      < l11/controles.sql > /tmp/ctl-cible.txt
+  diff /tmp/ctl-source.txt /tmp/ctl-cible.txt
+
+(Le conteneur `legacy` ne montait pas /atelier avant le 17/09 : `\i`
+échouait côté source. Le compose le monte désormais ; par stdin, les deux
+formes marchent.)
+
+-------------------------------------------------------------------------
+2. Résultat du poste, flux actif
+-------------------------------------------------------------------------
+Contrôle 1 : source 41 858 963 / cible 41 779 963 → écart 79 000.
+  C'est le flux en transit depuis le dernier delta (≈ 40 s à 2 000/s
+  entre la fin de l'étape 3 et la lecture). Attendu tant que la
+  production tourne ; le contrôle devient STRICT à l'étape 5, une fois
+  le flux arrêté et le delta final joué.
+
+Contrôle 2 : 73 jours ; 72 identiques (576 000 lignes et somme
+  115 488 000 chaque jour — 400 séries × 1 440 minutes), le 19/07
+  partiel (47 963) identique aussi ; seul le 29/09 diverge (916 000
+  contre 836 000) : c'est le jour où le flux écrit. Un écart sur un jour
+  CLOS serait un trou de copie (plage sautée) ; un écart sur le jour en
+  cours est du transit.
+
+Contrôle 3 : 0 ligne différente sur l'échantillon.
+
+-------------------------------------------------------------------------
+3. Pourquoi des entiers, et pourquoi un échantillon se VÉRIFIE
+-------------------------------------------------------------------------
+sum(valeur) est une somme de double precision : PostgreSQL 16 et 17,
+deux plans, deux ordres de lecture (partitions déclaratives d'un côté,
+chunks de l'autre) → deux arrondis différents à ~10⁻¹³ relatif, donc
+« divergence » sans cause. count(*) et sum(series_id) sont exacts.
+C'est la même leçon que le contrôle de somme de L07 (l7s2).
+
+L'échantillon « au hasard » de la version antérieure du kit :
+  WHERE id % 414719 = 1  → 100 lignes, TOUTES du 29/09 entre 20:20 et
+  21:59, séries 4, 8, 12, …, 400.
+Cause : l'id de la legacy est structuré — un bloc de 103 680 minutes
+(72 jours) par série, et 414 719 = 4 × 103 680 − 1. Le modulo retombe
+donc sur une série sur quatre, à la même position dans le bloc, c'est-à-
+dire la fin de la fenêtre. Un échantillon qui ne contient ni juillet ni
+août ne détecte pas une plage sautée en août. Un tirage déterministe
+n'est pas forcément réparti : il faut LIRE sa couverture.
+
+Version corrigée (controles.sql, 17/09) :
+  WHERE mod(hashint8(id), 414719) = 0
+  → 98 lignes, 89 séries distinctes, du 20/07 23:32 au 29/09 ; même
+    empreinte md5 des deux côtés ; hashint8 est identique en PG 16 et 17,
+    donc l'échantillon est le même sur la source et sur la cible.
+Le script affiche désormais lignes / séries / min(ts) / max(ts) de
+l'échantillon : c'est à lire AVANT de comparer.
+
+-------------------------------------------------------------------------
+4. Seuils à consigner dans la checklist
+-------------------------------------------------------------------------
+  C1 : écart ≤ 1 min de flux avant bascule ; 0 à la bascule.
+  C2 : 0 jour clos divergent ; le jour en cours exclu.
+  C3 : 0 ligne divergente ; couverture ≥ 80 séries et toute la fenêtre.
+
+-------------------------------------------------------------------------
+5. Erreurs fréquentes
+-------------------------------------------------------------------------
+- Conclure « copie fausse » sur l'écart du contrôle 1 pendant le flux.
+- Comparer les fichiers à l'œil : `diff`, et un md5 sur la sortie.
+- Faire les contrôles une seule fois : ils se rejouent à la bascule
+  (C1 strict) et après (C2 sur la cible durcie, avant de supprimer la
+  source).

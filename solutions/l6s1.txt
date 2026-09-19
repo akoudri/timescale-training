@@ -1,0 +1,171 @@
+L06 — INDICATEUR 1 : PRODUCTION MENSUELLE PONDÉRÉE (corrigé)
+==============================================================
+
+Fiche : « Écrire les deux versions. Choisir une machine et un mois
+comportant un arrêt, produire le tableau côte à côte avec l'écart en
+pourcentage. Expliquer pourquoi la naïve surestime : la formulation
+attendue mentionne le pas d'échantillonnage, pas la qualité des
+données. Justifier LOCF ou linéaire en commentaire. »
+
+-------------------------------------------------------------------------
+1. Le problème : avg() pondère par le NOMBRE de points
+-------------------------------------------------------------------------
+`avg(puissance_kw)` = somme des valeurs / nombre de points. Elle n'est
+une moyenne temporelle que si chaque point couvre la MÊME durée. Sur
+MISTRAL le pas est de 10 s en production et passe à 3 600 s pendant un
+arrêt de maintenance : une heure d'arrêt ne pèse qu'UN point (à 0 kW)
+là où une heure de production en pèse 360. L'arrêt est sous-pondéré d'un
+facteur 360 ; la moyenne « oublie » l'arrêt et surestime la production.
+
+Ordre de grandeur attendu, à faire calculer de tête : octobre = 720 h,
+arrêt ≈ 44 h. Pondérée ≈ P × (720 − 44) / 720 = 0,939 P ; naïve ≈ P
+(44 points sur 259 000). Rapport naïve / pondérée ≈ 1 / 0,939 = +6,5 %.
+La référence mesure +6,4 / +6,5 / +6,7 % : l'écart EST la fraction du
+mois passée à l'arrêt, ni plus ni moins.
+
+Démonstration miniature (à montrer si un participant doute) :
+  WITH e(ts, v) AS (VALUES ('2026-01-01 00:00Z'::timestamptz, 100.0),
+                           ('2026-01-01 01:00Z', 0.0),
+                           ('2026-01-01 02:00Z', 0.0))
+  SELECT avg(v), average(time_weight('LOCF', ts, v)),
+         average(time_weight('Linear', ts, v)) FROM e;
+  → 33,3 · 50 · 25. Trois « moyennes » pour trois points.
+
+-------------------------------------------------------------------------
+2. Requête attendue (l06/indicateurs/production-ponderee.sql)
+-------------------------------------------------------------------------
+-- MÉTHODE : LOCF, pas linéaire. La télémétrie SCADA est un ÉTAT
+-- ÉCHANTILLONNÉ : la valeur lue reste la valeur connue jusqu'à la lecture
+-- suivante (bloc 6.2, ligne « consigne / état »). Linéaire inventerait
+-- une rampe d'une heure entre le dernier point de production et le
+-- premier point d'arrêt — et, pendant l'arrêt, des rampes entre points
+-- horaires à 0 kW (sans effet ici, mais faux par construction).
+-- POURQUOI LA NAÏVE SURESTIME : pas d'échantillonnage 10 s → 3 600 s
+-- pendant l'arrêt ; un point d'arrêt pèse 1/360 d'un point de production
+-- dans avg(), et la durée qu'il couvre dans time_weight.
+WITH source AS (
+    SELECT ts, machine_id, puissance_kw
+    FROM   mesures_production
+    WHERE  puissance_kw IS NOT NULL                 -- lignes energie_kwh de la vue
+      AND  machine_id IN (15, 28, 42)                -- l06/machines-avec-arret.sql
+      AND  ts >= '2026-10-01T00:00:00+02' AND ts < :'fin'
+)
+SELECT machine_id,
+       time_bucket(INTERVAL '1 month', ts, 'Europe/Paris')          AS mois,
+       round(avg(puissance_kw)::numeric, 1)                         AS moyenne_naive,
+       round(average(time_weight('LOCF', ts, puissance_kw))::numeric, 1)
+                                                                    AS moyenne_ponderee,
+       round((100 * (avg(puissance_kw)
+              - average(time_weight('LOCF', ts, puissance_kw)))
+              / average(time_weight('LOCF', ts, puissance_kw)))::numeric, 1)
+                                                                    AS ecart_pct
+FROM   source
+GROUP  BY 1, 2 ORDER BY 1, 2;
+
+Pourquoi `puissance_kw IS NOT NULL` : la vue produit une ligne par point
+source, donc les lignes `energie_kwh` portent puissance_kw NULL au même
+ts. avg() les ignore ; ne pas dépendre du traitement des NULL par
+time_weight — filtrer. Pourquoi la borne d'octobre en littéral local :
+le mois civil de Paris ; `:fin` vient de bornes.sql.
+
+Version « parc entier » pour le critère de cohérence : retirer le
+filtre machine_id (compter 40-60 s ; 42 éoliennes × 2 mois). Les 39
+machines sans arrêt donnent un écart ≈ 0,0 % : c'est la contre-épreuve
+(piège « la naïve donne presque le même résultat »).
+
+-------------------------------------------------------------------------
+3. La formulation attendue (deux ou trois phrases)
+-------------------------------------------------------------------------
+« La moyenne arithmétique donne le même poids à chaque point. Pendant
+l'arrêt, le pas d'échantillonnage passe de 10 s à 1 h : chaque heure
+d'arrêt n'est représentée que par un point au lieu de 360, l'arrêt pèse
+360 fois moins qu'il ne dure, et la moyenne surestime la production de
+la part du mois passée à l'arrêt (≈ 6,5 %). La pondération par le temps
+rend à chaque point la durée qu'il couvre. »
+
+Refuser : « les données de l'arrêt sont de mauvaise qualité », « il y a
+moins de données pendant l'arrêt donc c'est moins fiable ». Les points
+d'arrêt sont EXACTS (0 kW) ; c'est leur FRÉQUENCE qui change.
+
+Dans mesures.md §M07 :
+  Machine 15, octobre : naïve 702,3 kW · pondérée 659,8 kW · +6,4 %
+  (idem 28 : +6,5 %, 42 : +6,7 %). Méthode LOCF (état échantillonné).
+  Cause : pas 10 s → 1 h pendant l'arrêt.
+
+-------------------------------------------------------------------------
+4. Pièges et lecture du plan
+-------------------------------------------------------------------------
+- `time_weight` réclame un ordre par temps AU SEIN de chaque groupe. La
+  lecture par chunk garantit des plages disjointes, que la fonction de
+  combinaison sait fusionner ; un résultat aberrant (moyenne hors de
+  [min, max]) signale des points en désordre ou dupliqués (double
+  affectation — la jointure datée de L05 R1, encore elle).
+- `average()` est l'accesseur : `time_weight(...)` seul retourne un état
+  binaire (TimeWeightSummary). C'est cet état, pas la moyenne, que M08
+  stockera au niveau bas ; `rollup()` puis `average()` au niveau haut.
+- Machine sans arrêt : écart nul → le participant conclut « la naïve
+  suffit ». Elle suffit tant que le pas est régulier, et rien ne garantit
+  le pas en production (retards de L04, interruptions de L05 R3).
+- Comparer sur septembre : mois partiel (15 → 30), aucun arrêt, écart
+  nul ; la liste fournie dit octobre.
+
+-------------------------------------------------------------------------
+5. E1 — la moyenne de moyennes
+-------------------------------------------------------------------------
+  WITH h AS (SELECT time_bucket('1 hour', ts) AS heure,
+                    avg(puissance_kw) AS moy, count(*) AS n
+             FROM mesures_production
+             WHERE machine_id = 15 AND puissance_kw IS NOT NULL
+               AND ts >= '2026-10-03T00:00+02' AND ts < '2026-10-05T00:00+02'
+             GROUP BY 1)
+  SELECT time_bucket('1 day', heure, 'Europe/Paris') AS jour,
+         avg(moy)                     AS moyenne_des_moyennes,
+         sum(moy * n) / sum(n)        AS moyenne_directe,   -- = avg() brut
+         sum(n)                       AS points
+  FROM h GROUP BY 1 ORDER BY 1;
+
+Condition exacte de coïncidence : toutes les heures ont le MÊME nombre
+de points (n constant). Jour nominal : 24 × 360, égalité. Jour d'arrêt :
+des heures à 1 point pèsent autant que des heures à 360 dans la moyenne
+de moyennes — écart de plusieurs pour cent entre les deux colonnes. Le
+lire correctement : sur ce jour, c'est la moyenne DIRECTE (avg brut) qui
+est fausse, pour la raison de l'indicateur 1, et la moyenne de moyennes
+qui tombe juste par accident, parce qu'une heure d'arrêt à 1 point pèse
+exactement une heure. L'accident cesse dès qu'une heure est partielle
+(interruption de 35 min : 150 points pèsent une heure entière) ou qu'un
+seau n'est pas aligné sur le pas. Aucune des deux n'est une moyenne
+temporelle ; seule time_weight l'est. Sur MISTRAL la condition n'est
+jamais garantie : interruptions de collecte, retards, arrêts. D'où la
+règle de M08 : le niveau horaire stocke somme ET compte (ou l'état
+time_weight), jamais la moyenne.
+
+-------------------------------------------------------------------------
+6. E4 — sans Toolkit
+-------------------------------------------------------------------------
+  WITH p AS (
+      SELECT machine_id, ts, puissance_kw,
+             lead(ts) OVER (PARTITION BY machine_id ORDER BY ts) AS ts_suiv
+      FROM   mesures_production
+      WHERE  puissance_kw IS NOT NULL AND machine_id IN (15, 28, 42)
+        AND  ts >= '2026-10-01T00:00+02' AND ts < :'fin'
+  )
+  SELECT machine_id,
+         time_bucket('1 month', ts, 'Europe/Paris') AS mois,
+         sum(puissance_kw * extract(epoch FROM least(ts_suiv, :'fin'::timestamptz) - ts))
+         / sum(extract(epoch FROM least(ts_suiv, :'fin'::timestamptz) - ts)) AS ponderee_sql
+  FROM   p GROUP BY 1, 2 ORDER BY 1, 2;
+
+Cas limites à traiter à la main (à énumérer) : dernier point de la
+fenêtre (ts_suiv NULL → borne :fin, ou l'exclure : c'est le choix
+LOCF-jusqu'à-la-borne que time_weight NE fait PAS, il s'arrête au dernier
+point) ; premier point (rien avant : time_weight ignore aussi) ; point à
+cheval sur deux mois (attribué au mois de son ts alors qu'il couvre
+1 h dans l'autre) ; valeurs NULL (filtrées, sinon lead() saute par-dessus
+et la durée est attribuée au point précédent) ; trous longs (un point
+avant 8 h d'interruption « tient » 8 h : LOCF assumé, cf. R3 de L05 —
+avec time_weight aussi, à savoir). Durée : la fonction de fenêtrage
+impose un Sort par machine sur les points filtrés ; sur 3 machines ×
+1 mois c'est comparable au Toolkit, sur le parc entier le tri de 11 M de
+lignes coûte plus que l'agrégat en un passage. Le vrai coût est ailleurs :
+le résultat n'est pas un ÉTAT réagrégeable, donc pas de pyramide (M08)
+sans stocker soi-même somme(valeur × durée) et somme(durée).

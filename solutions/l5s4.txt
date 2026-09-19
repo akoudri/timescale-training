@@ -1,0 +1,105 @@
+L05 — R4 : COMPARAISON D'UN MOIS AVEC LE MOIS PRÉCÉDENT (corrigé)
+===================================================================
+
+Fiche : « Deux défauts à trouver : l'un touche au coût, l'autre à la
+justesse — et R2 vient d'en montrer un des deux. Les fonctions de
+fenêtrage du bloc 6.3 sont le bon outil pour le premier. »
+
+-------------------------------------------------------------------------
+1. Les deux défauts
+-------------------------------------------------------------------------
+COÛT — la même agrégation est calculée DEUX fois. Le plan avant le
+montre sans ambiguïté : deux sous-arbres identiques (Finalize
+GroupAggregate → Gather Merge → Partial HashAggregate → Hash Join →
+Parallel Append de 8 Seq Scan) sous un Hash Left Join. PostgreSQL ne
+factorise pas deux sous-requêtes identiques : 2 × 190 M de lignes lues et
+jointes au référentiel. La requête met 75 s pour retourner 2 lignes.
+Remède : agréger UNE fois (CTE ou sous-requête) et obtenir le mois
+précédent par `lag()` — fonction de fenêtrage, bloc 6.3 — au lieu d'une
+auto-jointure.
+
+JUSTESSE — le même bug de fuseau que R2, au mois. `date_trunc('month',
+ts)` suit le fuseau de session (Etc/UTC ici) : le mois d'octobre
+commence le 30 septembre à 22:00 UTC pour MISTRAL, le seau UTC le fait
+commencer deux heures plus tard. Deux heures de production imputées au
+mauvais mois ; total invariant, contrôle annuel aveugle — exactement R2.
+Et, comme en R2, `sum(energie_kwh)` sommait un compteur cumulatif : la
+réécriture dérive l'énergie de la puissance (`/ 360.0`).
+
+Défaut secondaire : aucune borne temporelle. Sans prédicat sur ts, pas
+d'exclusion de chunks — sans conséquence ici (on veut toute la fenêtre)
+mais à borner par principe (`:debut`, `:fin`), pour que la requête reste
+bornée quand la table aura trois ans.
+
+-------------------------------------------------------------------------
+2. Requête après (l05/apres/R4.sql)
+-------------------------------------------------------------------------
+-- Nœud responsable du gain : le second sous-arbre d'agrégation a DISPARU
+-- (un seul Parallel Append + HashAggregate au lieu de deux) ; le Hash
+-- Left Join est remplacé par un WindowAgg sur 2 lignes — coût nul.
+-- Justesse : time_bucket mensuel avec fuseau explicite (largeur variable,
+-- 30 ou 31 jours, alignée sur le calendrier civil de Paris).
+WITH mensuel AS (
+    SELECT time_bucket(INTERVAL '1 month', ts, 'Europe/Paris') AS mois,
+           sum(puissance_kw) / 360.0                           AS energie_kwh
+    FROM   mesures_production
+    WHERE  ts >= :'debut' AND ts < :'fin'
+    GROUP  BY 1
+)
+SELECT mois, energie_kwh,
+       lag(energie_kwh) OVER (ORDER BY mois) AS mois_precedent
+FROM   mensuel ORDER BY mois;
+
+Plan après (relevé sur ce poste) : WindowAgg → Finalize GroupAggregate →
+Gather Merge → Sort → Partial HashAggregate → Hash Join → Parallel Append
+(8 Seq Scan). Un seul balayage : le rapport attendu est ≈ × 2, la
+référence donne × 1,9 (75 563 → 40 631 ms). Le reste (40 s) est le prix
+de la vue : joindre 190 M de lignes au référentiel pour n'en garder que
+les 42 séries de puissance. C'est le sujet de M08 (agrégat continu
+journalier, puis mensuel par dessus), pas de L05.
+
+-------------------------------------------------------------------------
+3. Lecture du résultat
+-------------------------------------------------------------------------
+Deux lignes : septembre (du 15 au 30, 16 jours) et octobre (du 1er au
+30, 30 jours), mois_precedent NULL pour septembre. La comparaison
+septembre/octobre n'a de sens ni ici (mois partiels) ni en production
+sans normalisation (M07 : production pondérée par le temps disponible).
+Le participant doit le dire : « la requête est juste, la comparaison
+brute ne l'est pas ».
+
+`lag()` prend la LIGNE précédente, pas le MOIS précédent : si un mois
+manque entièrement (table vide, migration partielle), la comparaison
+glisse d'un mois sans le signaler. Parade : `time_bucket_gapfill` mensuel
+avant le lag, ou vérifier `mois - lag(mois) = interval '1 month'`.
+
+-------------------------------------------------------------------------
+4. E4 — largeur fixe contre largeur variable
+-------------------------------------------------------------------------
+`time_bucket('30 days', ts)` donne des seaux de largeur constante alignés
+sur l'origine 2000-01-03 (un lundi), sans rapport avec le calendrier :
+un « mois » civil pèse 28 à 31 jours, soit ±3,3 % d'énergie à production
+constante — un écart du même ordre que le bug de fuseau, mais assumé.
+Largeur fixe préférable quand on compare des PÉRIODES entre elles
+(tendance opérationnelle, moyenne glissante, seuils d'alerte, tout ce
+qui doit être homogène) ; largeur variable obligatoire quand la période
+est un objet CONTRACTUEL ou COMPTABLE (facture mensuelle, reporting
+réglementaire). Le seau `1 month` avec fuseau n'existe que depuis
+TimescaleDB 2.8 ; avant, on écrivait date_trunc et on subissait le fuseau
+de session.
+
+Formulation attendue dans mesures.md :
+  R4 : 75 563 → 40 631 ms, × 1,9. Nœud : un seul HashAggregate (CTE +
+  lag) au lieu de deux sous-requêtes identiques ; l'auto-jointure a
+  disparu. Fuseau explicite (Europe/Paris) : deux heures du 30 septembre
+  imputées à octobre dans l'avant.
+
+Erreurs fréquentes :
+- réécrire avec lag() mais garder date_trunc : le coût est réglé, pas
+  la justesse (la fiche annonce DEUX défauts) ;
+- time_bucket('1 month', ts) sans fuseau : seaux mensuels alignés sur
+  UTC, même bug ;
+- time_bucket('30 days') présenté comme « mois » ;
+- comparer le rapport de R4 à celui de R5 et conclure que lag() est
+  « moins efficace » : R4 reste dominé par le balayage de 190 M de lignes,
+  que la réécriture ne pouvait pas éviter.

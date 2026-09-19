@@ -1,0 +1,98 @@
+L15 — ÉTAPE 3 : VÉRIFIER LE SILENCE (le raisonnement écrit par alerte)
+=======================================================================
+
+Fiche : « Quatre minutes ne prouvent rien. Le vrai test est de reprendre
+chaque expression de seuil et de répondre par écrit : quelle situation
+NORMALE pourrait la franchir ? »
+
+Régime normal observé sur ce poste pendant l'atelier (hors provocations) :
+A1, A2, A4, P2, P3 inactives ; A3 en alerte permanente — voir ci-dessous.
+C'est le fichier `silence.md` attendu.
+
+-------------------------------------------------------------------------
+A1 — zéro worker
+-------------------------------------------------------------------------
+Situation normale qui franchit : tout redémarrage de l'instance
+(maintenance, montée de version de L12, `docker compose restart`) —
+pendant quelques secondes, zéro processus, puis la source est
+injoignable (état Error de la règle). Réponse : `for: 1m` (deux
+évaluations consécutives) absorbe le redémarrage ; une maintenance
+planifiée se DÉCLARE (silence programmé dans Grafana, « mute timing »),
+elle ne se filtre pas après coup. Un pic de charge ne la franchit pas :
+le lanceur est un processus permanent, pas une file.
+
+-------------------------------------------------------------------------
+A2 — job sans succès > 3 périodes (jobs échus)
+-------------------------------------------------------------------------
+Trois situations normales, deux vécues :
+1. Une politique jamais échue (compression à 7 j, rétention à 30 j,
+   columnstore par défaut à J+1) affiche last_successful_finish =
+   -infinity : « sans succès depuis toujours ». La référence s'y est fait
+   prendre ; sur ce poste, 1001 (première exécution seulement au
+   redémarrage de L14). Réponse : garde-fou `total_runs > 0`.
+2. Un job long légitime — matérialisation initiale (4 min pour 1min en
+   L07), copie de migration, bascule de 6 chunks (53 s en L09) — dépasse
+   sa période : le facteur 3 l'absorbe. Un job dont la durée normale
+   dépasse 3 × sa période n'est pas un cas d'alerte, c'est un problème
+   de dimensionnement à traiter en amont (période ou workers).
+3. Le lundi matin : aucune politique n'a de charge « métier » ; seul le
+   contrôle qualité (1 h) pourrait durer plus longtemps sur un parc en
+   panne — et c'est précisément ce qu'on veut savoir.
+Ce qui la franchirait à tort et qu'on accepte : une suspension VOLONTAIRE
+(alter_job scheduled=false pendant une migration) — elle doit être
+déclarée, sinon l'alerte a raison.
+
+-------------------------------------------------------------------------
+A3 — flux muet (60 × pas)
+-------------------------------------------------------------------------
+Situations normales :
+1. Un arrêt de maintenance long (contrainte 6.2 du jeu : trois éoliennes,
+   42-48 h en octobre, échantillonnage HORAIRE pendant l'arrêt) : à 10 s
+   de pas attendu, 1 h entre deux points = muet. Réponse : croiser avec
+   l'état machine (`evenements`, type changement_etat / maintenance) ; un
+   capteur d'une machine déclarée à l'arrêt n'alerte pas. C'est pour cela
+   que A3 et l'action de L10 partagent leur périmètre.
+2. La météo (famille meteo, 1 h de pas) : c'est le cas qui a imposé le
+   RELATIF ; en absolu 10 min, elle hurlerait en continu.
+3. Un flux dont la fréquence varie légitimement (saison, mode dégradé) :
+   le pas attendu vient du catalogue `signaux` — le changer là, pas dans
+   l'alerte.
+Le cas de ce poste : trois capteurs coupés en L10 = alerte PERMANENTE
+depuis sa création. Ce n'est pas du bruit, c'est une panne réelle non
+traitée ; mais tant qu'elle dure, A3 ne signale plus rien de nouveau
+(la provocation 490 n'a pas changé le voyant). Réponse d'exploitation :
+une notification PAR SÉRIE (requête retournant une ligne par série
+muette, label series_id) plutôt qu'un compte, et un acquittement
+(silence) par série traitée.
+
+-------------------------------------------------------------------------
+A4 — espace, seuil ET tendance
+-------------------------------------------------------------------------
+Situations normales :
+1. Reconstruction d'index (8,9 s ici, mais 2 × la taille de l'index en
+   transitoire), VACUUM FULL, sauvegarde de base locale (L12 : +21 Go
+   dans `archives/`), copie d'atelier (L03, L08) : l'occupation du
+   DISQUE double transitoirement. Réponse : la métrique porte sur
+   `pg_database_size`, pas sur `df` ; et la tendance sur 24 h lisse le pic.
+2. Un chargement initial ou une migration (L11 : +3 Go en 2 min) franchit
+   légitimement la tendance (« 5 jours restants à ce rythme ») : silence
+   programmé pendant l'opération déclarée.
+3. La rétention qui purge : pente NÉGATIVE → `jours` négatif → passe le
+   test `< 7` : faux positif de formule, à écrire `BETWEEN 0 AND 7`.
+Le seuil (85 %) ne se franchit par rien de normal — c'est sa force et
+sa faiblesse : quand il parle, il est déjà tard.
+
+-------------------------------------------------------------------------
+Formulation attendue
+-------------------------------------------------------------------------
+Une phrase par alerte, de la forme : « Situation normale S franchirait le
+seuil parce que P ; on l'évite par M (temporisation / garde-fou /
+croisement / silence déclaré), et on ACCEPTE que la situation T la
+déclenche parce qu'elle mérite d'être vue. » Une alerte dont on ne sait
+pas écrire cette phrase n'est pas prête.
+
+Erreurs fréquentes : « on l'a laissée tourner 4 min, rien ne s'est
+déclenché, donc c'est bon » ; répondre par un seuil plus lâche plutôt que
+par un garde-fou (A2 à 10 périodes « pour être tranquille » : elle ne
+verra plus la suspension du job à la minute avant 10 min) ; filtrer A3
+sur les trois capteurs connus au lieu de les réparer.

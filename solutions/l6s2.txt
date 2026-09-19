@@ -1,0 +1,143 @@
+L06 — INDICATEUR 2 : TAUX DE DISPONIBILITÉ (corrigé)
+======================================================
+
+Fiche : « Le dénominateur n'est pas la durée de la fenêtre. C'est la
+durée pour laquelle on dispose d'une information d'état. Écrire la
+requête qui distingue les deux, et vérifier que le taux ne dépasse
+jamais cent pour cent. »
+
+-------------------------------------------------------------------------
+1. Où est l'état, et ce que state_agg fait vraiment
+-------------------------------------------------------------------------
+Le snippet de la fiche écrit `state_agg(ts, etat)` sur `evenements` :
+il n'y a pas de colonne `etat`. L'état est dans `attributs->>'etat'`
+des lignes `type = 'changement_etat'` (2 319 lignes, 46 machines) ;
+les alarmes (696 524 lignes) n'ont pas d'état. Sans le filtre sur le
+type, on agrège 700 000 lignes dont 99,7 % portent NULL.
+
+Comportement de state_agg / duration_in, vérifié sur Toolkit 1.25 :
+- durée d'un état = du changement qui l'ouvre au changement suivant ;
+- le DERNIER état de chaque groupe a une durée NULLE : rien après lui ne
+  le ferme, la fonction ne l'étend ni à max(ts) ni à la borne. Même avec
+  la variante bornée duration_in(agg, état, start, interval) ;
+- une valeur NULL n'est PAS une erreur (contrairement au piège de la
+  fiche, écrit pour une version antérieure) : la ligne est ignorée en
+  silence et l'état précédent court jusqu'au changement suivant. C'est
+  pire qu'une erreur : une absence d'information devient un état sans
+  que rien ne le signale. Filtrer explicitement, ou nommer un état
+  'inconnu' — le décider.
+Démonstration en trois lignes (production 0h, arret 10h, production 12h) :
+duration_in production = 10 h, arret = 2 h ; la production reprise à 12 h
+pèse 0.
+
+Conséquence : somme des trois durées = dernier changement − premier
+changement, PAR MACHINE. Ce n'est ni la fenêtre (45 j) ni « le temps
+observé » au sens strict : c'est le temps entre deux informations.
+
+-------------------------------------------------------------------------
+2. Requête attendue (l06/indicateurs/disponibilite.sql)
+-------------------------------------------------------------------------
+-- DÉNOMINATEUR = temps couvert par une information d'état (somme des
+-- durées des états observés), PAS la durée de la fenêtre. Avant le
+-- premier changement et après le dernier, on ne sait rien : ce temps
+-- n'entre ni au numérateur ni au dénominateur. Le taux ne peut donc pas
+-- dépasser 100 %.
+WITH etats AS (
+    SELECT machine_id,
+           state_agg(ts, attributs->>'etat') AS etat
+    FROM   evenements
+    WHERE  type = 'changement_etat'
+      AND  ts >= :'debut' AND ts < :'fin'
+    GROUP  BY 1
+), durees AS (
+    SELECT machine_id,
+           duration_in(etat, 'production')  AS t_production,
+           duration_in(etat, 'arret')       AS t_arret,
+           duration_in(etat, 'maintenance') AS t_maintenance
+    FROM   etats
+)
+SELECT machine_id, t_production, t_arret, t_maintenance,
+       t_production + t_arret + t_maintenance                 AS t_observe,
+       :'fin'::timestamptz - :'debut'::timestamptz
+         - (t_production + t_arret + t_maintenance)           AS t_sans_information,
+       round(100.0 * extract(epoch FROM t_production)
+             / nullif(extract(epoch FROM t_production + t_arret + t_maintenance), 0), 2)
+                                                              AS disponibilite_pct
+FROM   durees
+ORDER  BY machine_id;
+
+Colonnes de contrôle : `t_observe` et `t_sans_information` EXPLICITENT
+le dénominateur (critère). Vérification imposée :
+  SELECT max(disponibilite_pct) FROM (...) → ≤ 100.
+La version fausse (dénominateur = fenêtre) donne un taux < 100 % qui
+paraît crédible — elle ne dépasse 100 % que si l'on compte l'état
+« inconnu » comme production ; c'est le cas quand on ferme le dernier
+état à la borne sans le décider. Le test « > 100 % » attrape ce cas ;
+le test « t_observe ≤ fenêtre » attrape tous les autres.
+
+Résultats de référence : 98,0 à 99,8 % pour les éoliennes. Cas à
+commenter sur ce jeu :
+- machine 44 (onduleur PV) : UN seul changement d'état → trois durées
+  nulles, dénominateur 0, taux NULL grâce à nullif. « Pas d'information »
+  est la bonne réponse ; 0 % ou 100 % seraient faux ;
+- machines 45 (PV, 5 événements, dernier le 2 octobre), 46 (poste de
+  livraison, dernier le 27 septembre), 5/7/19/25 (dernier le 25-26
+  octobre) : t_sans_information de 3 à 40 jours. Le taux reste juste sur
+  la période couverte ; c'est le t_sans_information qui doit remonter au
+  tableau de bord (M15), pas être absorbé ;
+- le plus long état observé : 22 j de production sur la machine 43
+  (PV). Rien ne distingue « 22 jours en production » de « collecteur
+  muet pendant 22 jours » : les changements d'état ne portent pas
+  d'information de vie du collecteur. C'est la limite de l'indicateur,
+  à dire explicitement.
+
+-------------------------------------------------------------------------
+3. Le collecteur coupé trois jours : ce que la requête voit et ne voit pas
+-------------------------------------------------------------------------
+Le dénominateur ci-dessus traite les BORDS (avant le premier changement,
+après le dernier) — c'est ce que le socle demande. Une coupure AU MILIEU
+n'est pas visible : le dernier état connu court jusqu'à la reprise et
+la coupure est comptée comme cet état. Deux façons de la traiter, à
+DÉCIDER :
+  a) le collecteur émet un état 'inconnu' à la coupure (et un changement
+     réel à la reprise) : state_agg fait le reste, 'inconnu' sort du
+     dénominateur. C'est la bonne pratique côté source ;
+  b) sans cet état, croiser avec un signal de vie : les mesures de la
+     machine. Une heure sans aucun point de `mesures` pour les séries de
+     la machine (gapfill + count = 0, cf. L05 R3 et E3) est une heure
+     sans information, à soustraire du temps observé. Le jeu contient
+     une vingtaine d'interruptions de 35 min à 8 h (L00 §5) : c'est le
+     matériau de M11 (contrôle qualité).
+La variante bornée `duration_in(agg, état, start, interval)` sert à
+découper le taux par jour ou par mois (M08 en fera un niveau) ; elle ne
+ferme pas non plus le dernier état.
+
+Alternative défendable, à condition de l'écrire : fermer le dernier état
+à :fin (LOCF de l'état, « un état reste vrai jusqu'au prochain ordre »,
+bloc 6.2). Se fait en ajoutant par machine un événement synthétique
+(UNION ALL du dernier état daté à :fin) avant state_agg. Le taux change
+peu sur les éoliennes (dernier changement à quelques heures de la fin),
+beaucoup sur 45 et 46. Le participant qui le fait doit dire qu'il a
+CHOISI d'assimiler 3 à 40 jours de silence à l'état précédent.
+
+-------------------------------------------------------------------------
+4. Formulation attendue dans mesures.md §M07
+-------------------------------------------------------------------------
+  Disponibilité = production / (production + arrêt + maintenance), les
+  trois durées issues de state_agg sur les changements d'état.
+  Dénominateur = temps couvert par une information d'état (dernier −
+  premier changement par machine), pas la fenêtre : t_sans_information
+  reporté à part. 98,0-99,8 % sur les éoliennes ; NULL pour la machine 44
+  (un seul événement) ; max = 99,8 % ≤ 100 %.
+
+Erreurs fréquentes :
+- `state_agg(ts, etat)` → « column etat does not exist » ; puis
+  `attributs->>'etat'` sans filtre sur le type ;
+- diviser par `:fin − :debut` : taux sous-estimé de 1 à 90 % selon la
+  machine, sans que rien ne le signale (sauf 44 : 0 %) ;
+- fermer le dernier état à :fin sans le dire ;
+- calculer `duration_in` trois fois sur trois `state_agg` (le snippet de
+  la fiche) : juste mais trois agrégations ; une CTE suffit ;
+- compter les lignes de type 'arret' (997, avec `duree_s`) au lieu des
+  changements d'état : ce sont des micro-arrêts (40 s à 12 h) déjà
+  reflétés dans les changements d'état — double compte.

@@ -1,0 +1,104 @@
+L03 — ÉTAPE 5 : TRANCHER L'INTERVALLE DE CHUNK ET L'INSCRIRE — CORRIGÉ FORMATEUR
+=================================================================================
+
+Ce que l'étape évalue : une décision justifiée par une mesure consignée,
+pas « la bonne valeur ». La variante de référence conserve 7 jours ; un
+participant qui retient 1 jour avec de bons arguments a raison pour son
+contexte, consigne son choix dans son plan d'application et poursuit sur
+la référence (la chaîne d'instantanés en dépend).
+
+-------------------------------------------------------------------------
+1. Les mesures de référence (environnement 2 vCPU / 8 Go, TimescaleDB 2.29.2)
+-------------------------------------------------------------------------
+Tables de comparaison : 50 séries, 45 jours, 19 428 181 lignes chacune.
+
+| Grandeur                   | 1 jour   | 7 jours  | 30 jours |
+|----------------------------|----------|----------|----------|
+| Nombre de chunks           | 46       | 8        | 2        |
+| Volume total               | 1 251 MB | 1 249 MB | 1 249 MB |
+| Planification (R2)         | 2,96 ms  | 3,32 ms  | 2,02 ms  |
+| R1 · point le plus récent  | 5 731 ms | 5 463 ms | 5 394 ms |
+| R2 · fenêtre de 3 jours    |  202 ms  |  326 ms  |  334 ms  |
+| R3 · agrégation j1-j5      |  224 ms  |  314 ms  |  377 ms  |
+
+Lecture :
+- R1 est insensible à l'intervalle (à l'écart-type près) : pas de
+  prédicat temporel, rien à exclure. Attendu, et le dire.
+- R2 favorise les petits chunks : la fenêtre de 3 jours lit 4-5 chunks
+  d'un jour au lieu de 2 chunks de 7 jours (dont un grande partie hors
+  fenêtre) ou d'un chunk de 30 jours entier. Gain × 1,6 entre 1 j et 7 j.
+- R3 (jours 1-5) favorise aussi les petits chunks ici, pour la même
+  raison : la fenêtre est courte devant les chunks larges.
+- Le temps de planification ne bouge presque pas sur 2 à 46 chunks. Il
+  ne trahit la prolifération qu'à partir de centaines de chunks — c'est
+  l'extension E1 (mesures_1h, ≈ 1 080 chunks) qui le montre.
+- Le volume total est identique : l'intervalle ne change pas ce qu'on
+  stocke, seulement comment on le découpe.
+
+-------------------------------------------------------------------------
+2. Le critère qui départage : le chunk actif doit tenir en mémoire
+-------------------------------------------------------------------------
+Règle du bloc 4.1 : l'ensemble des chunks activement écrits, index
+compris, tient dans environ UN QUART DE LA MÉMOIRE DISPONIBLE — 8 Go sur
+l'instance d'atelier, donc un budget d'environ 2 Go. (Pas un quart de
+shared_buffers : la règle raisonne sur la mémoire de la machine, cache
+de pages compris.)
+
+Taille d'un chunk de `mesures` (490 séries, pas complet) :
+- volume heap de mesures : ≈ 11 Go pour 45 jours (sans index secondaire),
+  soit ≈ 245 Mo par jour ;
+- chunk de 1 jour   ≈ 0,25 Go        → très en dessous du budget
+- chunk de 7 jours  ≈ 1,7 Go         → tient dans les 2 Go (index de
+                                       L05 compris, on frôle la limite)
+- chunk de 30 jours ≈ 7,3 Go         → déborde : exclu d'office
+
+À l'échelle de production (4 000 signaux, serveur de 64 Go, budget 16 Go)
+le calcul du slide 4.1 redonne le même ordre de grandeur : entre 5 et
+7 jours. La règle est un rapport, volume et mémoire croissent ensemble.
+
+-------------------------------------------------------------------------
+3. La décision de référence : 7 jours
+-------------------------------------------------------------------------
+Arbitrage :
+- 30 jours déborde la mémoire : éliminé.
+- 1 jour gagne × 1,6 sur R2, mais coûte 46 chunks sur 45 jours, soit
+  ≈ 1 100 chunks à trois ans ; le temps de planification, invisible ici,
+  devient sensible à cette échelle (E1), et chaque politique (bascule,
+  rétention, rafraîchissement) a 7 fois plus d'objets à traiter.
+- 7 jours tient dans le budget mémoire, garde ≈ 160 chunks à trois ans,
+  et ne coûte que 124 ms sur R2 — un rapport qui n'est pas celui d'une
+  requête lente.
+La référence retient 7 jours ; c'est aussi la valeur du squelette, donc
+rien à appliquer : la décision est la justification écrite.
+
+Commentaire attendu dans schema.sql, au-dessus de CREATE TABLE mesures :
+
+  -- Intervalle de chunk : 7 jours (TRANCHÉ EN M04).
+  -- R2 202 ms (1 j) contre 326 ms (7 j) ne paie pas 46 chunks contre 8
+  -- sur 45 jours (≈ 1 100 contre 160 à trois ans) ; chunk actif de 7 j
+  -- ≈ 1,7 Go ≤ budget 2 Go (un quart de 8 Go) ; 30 j déborde (≈ 7 Go).
+
+Si un participant retient 1 jour (défendable : lectures de fenêtre
+courtes dominantes, mémoire contrainte), il applique :
+
+  SELECT set_chunk_time_interval('mesures', INTERVAL '1 day');
+
+et note que les 8 chunks existants gardent 7 jours (visible dans
+timescaledb_information.chunks) — licite, et sans reconstruction.
+
+-------------------------------------------------------------------------
+4. Fin d'atelier
+-------------------------------------------------------------------------
+  DROP TABLE mesures_ord;             -- 11 Go, plus aucun usage
+  -- mesures_1j / _7j / _30j : à garder pour E1, sinon à supprimer
+
+Livrables : mesures.md §M04 (trois rapports contre mesures_ord, tableau
+des neuf mesures et trois relevés, gain de la Q5 corrigée : × 27),
+schema.sql avec le commentaire ci-dessus, l03/exclusion/classement.md.
+
+Erreurs fréquentes :
+- choisir 1 jour « parce que R2 est la plus rapide » sans regarder le
+  nombre de chunks à trois ans ni le budget mémoire ;
+- justifier par le volume total, qui est identique dans les trois cas ;
+- appliquer set_chunk_time_interval puis s'étonner que les chunks
+  existants n'aient pas changé de largeur.

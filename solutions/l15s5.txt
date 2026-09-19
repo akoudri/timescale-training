@@ -1,0 +1,129 @@
+L15 — EXTENSIONS : E1 RÉGRESSION, E2 ALERTES DE L14, E3 LISTE COURTE
+======================================================================
+
+-------------------------------------------------------------------------
+E1 — La régression de performance, vue par pg_stat_statements
+-------------------------------------------------------------------------
+Prérequis (piège de la fiche « l'instantané est vide ») : le module doit
+être PRÉCHARGÉ et l'extension CRÉÉE dans la base AVANT l'incident. Sur ce
+poste, `pg_stat_statements` n'a été créée qu'en L12 (L01 étape 2 non
+faite) : c'est la ligne à ajouter à la checklist de mise en service. Le
+rôle de supervision a reçu `pg_read_all_stats` pour lire le texte des
+requêtes des autres rôles (sinon « <insufficient privilege> »).
+
+Protocole : remise à zéro, 5 appels de R5 (dernière valeur par série,
+DISTINCT ON), instantané ; modification défavorable = DROP de l'index de
+L05 ; 3 appels, instantané ; recréation (8,85 s) ; 2 appels, instantané.
+
+  SELECT pg_stat_statements_reset();
+  -- R5 × 5
+  SELECT calls, round(total_exec_time) AS ms_total, round(mean_exec_time) AS ms_moy,
+         shared_blks_hit AS hit, shared_blks_read AS read, temp_blks_written AS temp
+  FROM   pg_stat_statements
+  WHERE  query LIKE 'SELECT DISTINCT ON (series_id) series_id, ts, valeur%';
+
+                    calls  ms_total  ms_moy   hit      read     temp
+  avec index          5       182      36    92 436    7 679        0
+  DROP INDEX, +3      8    26 900   3 362   234 186  653 966  419 325
+  index recréé, +2   10    26 960   2 696   272 661  655 521  419 325
+
+Lecture par appel (différences) : sans index, 8 906 ms, 215 429 blocs lus,
+139 775 blocs temporaires écrits ; avec index, 36 ms, ~1 500 blocs, 0.
+
+Laquelle des trois grandeurs révèle le plus clairement ?
+- Le TEMPS total : × 148 sur la moyenne — mais il est dilué par les appels
+  antérieurs (la moyenne cumulée ne redescend que lentement : 2 696 ms
+  après recréation alors que les deux derniers appels ont pris 30 ms) ;
+  il dépend aussi de la charge et du cache. C'est celle que tout le monde
+  regarde, et la moins fiable seule.
+- Le nombre d'APPELS : inchangé — il ne révèle rien ici ; il sert à
+  normaliser (par appel) et à détecter un changement de trafic, pas de
+  plan.
+- Les BLOCS : `shared_blks_read` × 140 par appel, et surtout
+  `temp_blks_written` qui passe de 0 à 139 775 par appel — un tri sur
+  disque là où il n'y en avait pas. C'est un signal BINAIRE, indépendant
+  de la charge : le plan a changé. Réponse attendue : les blocs (temp en
+  premier, read ensuite) révèlent la régression le plus clairement, le
+  temps la mesure, les appels la normalisent.
+
+Bonus observé : la règle P2 de L14 (index attendu absent) est passée
+« firing » pendant les 30 s sans index et « inactive » après recréation —
+l'alerte de structure a vu l'incident avant que l'instantané ne soit
+comparé.
+
+-------------------------------------------------------------------------
+E2 — Brancher les alertes de L14, puis en retirer pour revenir à quatre
+-------------------------------------------------------------------------
+P1 (job suspendu / sans succès) EST A2 : même requête, même garde-fou —
+elle n'ajoute rien. P2 (index attendu absent, reconnu par colonnes) et P3
+(capacité : réglage < 8, processus < 3, jobs en retard d'une période) ont
+été installées comme 5ᵉ et 6ᵉ règles (mistral-p2, mistral-p3), soumises
+aux mêmes tests : P2 déclenche sur le DROP INDEX de E1 et se tait après
+recréation ; P3 déclenche sur la provocation A1 (réglage 0) et se tait
+après remise en état ; silence en régime normal vérifié sur les deux.
+
+Laquelle retirer pour revenir à quatre ?
+- P2 est la seule alerte de STRUCTURE de la liste ; elle ne recouvre
+  aucune des quatre (une dérive de schéma ne produit ni job en échec, ni
+  flux muet). Elle remplace avantageusement… A4 ? Non : A4 est la seule
+  irréversible. Elle mérite la 5ᵉ place si la liste peut s'allonger.
+- P3 recouvre A1 (processus < 3 contient « = 0 ») et partiellement A2
+  (jobs en retard ⇒ bientôt sans succès). Retirer P3 : on perd le seul
+  signal « tout tourne mais en retard » (incident 3 de L14), qu'on
+  récupère en élargissant A1 à « processus < 3 » (lanceur + ordonnanceur
+  + un worker) — la fusion proposée en L14 E3.
+Réponse attendue : retirer P3 en fusionnant son premier terme dans A1 ;
+garder P2 hors liste du premier jour (elle demande un schéma de
+référence maintenu — `schema.sql` — qui n'existe pas encore au jour 1).
+La question à poser à la salle : « laquelle des six n'a PAS de
+propriétaire capable de décider de la retirer ? » — c'est celle-là qui
+part.
+
+-------------------------------------------------------------------------
+E3 — Défendre la liste courte (note d'une page)
+-------------------------------------------------------------------------
+Objet : les quatre alertes du premier jour de production de MISTRAL, et
+ce qui en est exclu.
+
+Ce que la liste couvre. Quatre pannes qui ne se voient pas autrement :
+le moteur d'exécution arrêté (A1 — rien n'échoue, rien ne tourne), un
+travail qui n'aboutit plus (A2 — échec répété OU suspension, toutes deux
+silencieuses), un collecteur arrêté (A3 — avant la courbe, avant le
+client), un disque qui se remplit (A4 — la seule irréversible). Chacune a
+un propriétaire qui peut la retirer, une action écrite, un seuil relatif
+ou une tendance, et une réponse écrite à « quelle situation normale la
+franchirait ».
+
+Ce qui est exclu, et pourquoi.
+- Pas d'alerte sur la DURÉE DES REQUÊTES : elle dépend de la charge, du
+  cache et de l'heure ; elle sonnerait le lundi matin et se tairait
+  pendant une régression nocturne. La régression se détecte par
+  COMPARAISON d'instantanés (E1 : blocs temporaires, blocs lus), qui est
+  un contrôle périodique de non-régression, pas une alerte.
+- Pas d'alerte sur le RATIO DE COMPRESSION : il ne varie qu'avec les
+  données (cardinalité, L08) ; sa baisse est une information de
+  dimensionnement, jamais une urgence ; et il est nul sur les chunks
+  récents par conception (délai de bascule).
+- Pas d'alerte sur le NOMBRE DE CHUNKS : il croît par construction (un
+  par intervalle) et décroît par rétention ; un nombre « anormal » n'est
+  qu'un intervalle mal choisi en M04, visible une fois pour toutes.
+- Pas d'alerte sur l'ANCIENNETÉ DES AGRÉGATS (M3) : elle est la
+  conséquence de A1 ou A2 (le rafraîchissement ne tourne plus), et sur
+  un jeu daté elle est structurelle (le niveau jour a 23 h de « retard »
+  normal) ; l'alerter doublerait A2.
+- Pas d'alerte sur le TAUX DE CACHE (M8) : 98 % ou 92 % ne changent rien
+  à ce que fait l'exploitant à 3 h du matin.
+- Pas d'alerte de STRUCTURE (P2) le premier jour : elle exige un schéma de
+  référence tenu ; elle vient au jour 30, avec `schema.sql` versionné.
+
+Le principe : une alerte n'entre dans la liste que si (1) personne ne
+verrait la panne autrement, (2) quelqu'un sait quoi faire en la
+recevant, (3) on sait écrire ce qui la franchirait à tort. Les six
+métriques exclues échouent au moins à l'un des trois. La liste courte se
+défend par ses exclusions ; la liste longue se filtre, puis s'ignore.
+
+Erreurs fréquentes (E3) : justifier les inclusions et sauter les
+exclusions ; exclure « la durée des requêtes » sans dire par quoi on la
+remplace (la non-régression périodique de E1) ; ajouter M3 « parce que
+c'est le tableau de bord qui se fige » — c'est le symptôme de L14, dont
+la cause est A2.

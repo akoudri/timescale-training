@@ -1,0 +1,136 @@
+L14 — PANNES INJECTÉES — PROTOCOLE COMMUN (corrigé formateur)
+===============================================================
+
+Fichiers : l14s1 (étape 1, symptômes reformulés), l14s2 (étape 2, journal
+de l'incident 1), l14s3 (étape 3, journal de l'incident 2), l14s4 (étape
+4, restitution + prevention.sql attendu), l14s5 (extensions E1 incident 3,
+E2 préventions éprouvées, E3 alertes).
+
+-------------------------------------------------------------------------
+1. Ce que l'atelier vérifie
+-------------------------------------------------------------------------
+Pas la résolution : la MÉTHODE. Pour chaque incident, le binôme doit
+nommer la requête de diagnostic qui l'a révélé (famille + fichier) et
+refaire le chemin devant la salle. Les cinq temps : symptôme (sans
+hypothèse), hypothèses (classées par coût de vérification), UNE requête
+discriminante, correction MESURÉE, prévention (la requête qui aurait vu
+l'incident trois jours plus tôt). Les deux incidents relèvent de deux
+familles différentes (automatisation / structure) ; l'incident 3 de
+l'extension relève d'une troisième (activité) et n'a aucun symptôme
+utilisateur.
+
+Règles du jeu à faire respecter : interdiction de restaurer, interdiction
+de deviner en modifiant, le formateur ne confirme rien avant la
+restitution.
+
+-------------------------------------------------------------------------
+2. Rôle formateur : l'injection jouée sur ce poste (17/09/2026)
+-------------------------------------------------------------------------
+État sain de départ (mistral-M14) : `mesures` 151 609 294 lignes, 24/09 →
+29/10 21:59:50 UTC, 6 chunks (4 columnstore, 2 rowstore), 2 index
+(`mesures_ts_idx1`, `mesures_series_id_ts_idx`), 3 agrégats, jobs
+1000-1008 (1003 = rafraîchissement mistral_1min), workers 8/16,
+3 processus TimescaleDB, `alertes_qualite` 3 lignes, 128 Go libres.
+Ligne de base saine relevée AVANT injection : R5 (dernière valeur par
+série, l05/apres/R5.sql de la référence) = 126 ms (mesure.sh, 5 runs).
+
+`-sol/atelier/l14/injecter.sh` code en dur `alter_job(1002, …)` et
+`DROP INDEX IF EXISTS mesures_series_ts_idx` : sur ce poste il n'aurait
+RIEN injecté (job 1003, index `mesures_series_id_ts_idx`) et n'aurait
+rien dit (`IF EXISTS`). Injection jouée à la main, identifiants résolus
+par requête (à reporter dans le script — voir NOTES-PRODUCTION §L14) :
+
+  SELECT job_id AS job_1min FROM timescaledb_information.jobs
+  WHERE  proc_name = 'policy_refresh_continuous_aggregate'
+    AND  hypertable_name = 'mistral_1min' \gset          -- → 1003
+  SELECT indexname AS idx_l05 FROM pg_indexes
+  WHERE  tablename = 'mesures'
+    AND  indexdef ILIKE '%(series_id, ts DESC)%' \gset  -- → mesures_series_id_ts_idx
+
+  -- Incident 1 (famille automatisation) : suspension + statistiques
+  -- reculées de 3 jours (superutilisateur, catalogue interne)
+  SELECT alter_job(:job_1min, scheduled => false);
+  UPDATE _timescaledb_internal.bgw_job_stat
+  SET    last_start = last_start - interval '3 days',
+         last_finish = last_finish - interval '3 days',
+         last_successful_finish = last_successful_finish - interval '3 days',
+         next_start = next_start - interval '3 days'
+  WHERE  job_id = :job_1min;
+  -- Jeu daté : pour que « n'a pas bougé depuis ce matin » soit
+  -- observable, une heure de points « du matin » pour 5 séries du site 2
+  INSERT INTO mesures (ts, series_id, valeur, qualite)
+  SELECT (SELECT max(ts) FROM mesures) + make_interval(secs => 10 * g),
+         s, 100 + random() * 10, 2
+  FROM   generate_series(1, 360) g, generate_series(151, 155) s;   -- 1 800 points
+  -- Incident 2 (famille structure)
+  DROP INDEX :idx_l05;
+
+Ce que le formateur voit (à ne pas montrer) : job 1003 `scheduled = f`,
+`next_start` 2026-09-14 19:18 (gelé, 3 j dans le passé), `job_status`
+Paused, `last_successful_finish` 2026-09-14, Success, 0 échec ; un seul
+index sur `mesures` ; brut à 22:59:50, niveau minute à 21:59.
+
+Incident 3 (extension E1, famille activité), injecté APRÈS correction des
+deux premiers : `ALTER SYSTEM SET timescaledb.max_background_workers = 1`
++ restart. Sur 2.29.2 le résultat diffère de la note de production : seul
+le LANCEUR démarre, l'ordonnanceur de la base ne peut pas (journal au
+démarrage : « TimescaleDB background worker limit of 1 exceeded »), et
+plus AUCUN job ne s'exécute — pas de file, pas de retard croissant : le
+silence complet. Laissé actif 2 h 10 ; voir l14s5.
+
+-------------------------------------------------------------------------
+3. Corrections du kit faites le 17/09 (à connaître)
+-------------------------------------------------------------------------
+Aucun fichier du kit apprenant modifié (symptomes.md, journal-modele.md,
+l15/diagnostic/*.sql fonctionnent tels quels). Côté formateur, consigné
+dans NOTES-PRODUCTION §L14 sans modifier les fichiers de -sol :
+- `injecter.sh` : identifiants à résoudre par requête (ci-dessus), points
+  « du matin » à injecter sur un jeu daté, et à retirer après ;
+- `l15/diagnostic/prevention.sql` de référence : contrôle des index par
+  NOM (faux positif : les deux index « ABSENT » sur ce poste) → par
+  colonnes ; « sans succès depuis » sans garde-fou → remonte le job 1001
+  jamais échu (`last_successful_finish = -infinity`, `last_run_started_at
+  = -infinity`, pas NULL) → garde-fou `total_runs > 0` ;
+- `journal-incident-1.md` de référence : « run_job de rattrapage » ne
+  rattrape rien sur un jeu daté (fenêtre relative à now()) → refresh
+  borné, propagé niveau par niveau ;
+- note de production, incident 3 : à réécrire (voir §2).
+
+-------------------------------------------------------------------------
+4. Référence vs poste
+-------------------------------------------------------------------------
+                          référence (mesures.md §M15)     ce poste
+  R5 pendant l'incident 2  9 458 ms (stable)              9 263 ms (σ 1,8 %)
+  recréation de l'index    9,1 s                          8,46 s (E2 : 8,12 s)
+  R5 après                 122 ms                         125 ms (× 74 ; sain : 126)
+  incident 1 discriminant  scheduled=f, next_start gelé   idem, + « depuis 3 jours »
+  correction incident 1    alter_job + run_job            alter_job + refresh BORNÉ 1min
+                                                          (376 ms) → 1h → 1j ; run_job
+                                                          sans effet (12 ms)
+  incident 3               « jobs en file, retard          aucun job ne tourne, 4 jobs
+                           croissant »                    en retard de 1 h 20 à 2 h 10,
+                                                          1 seul processus TimescaleDB
+  préventions (E2)         « vérifiées »                  P1, P2, P3 : chacune se
+                                                          déclenche sur son incident,
+                                                          silence après correction
+
+-------------------------------------------------------------------------
+5. État de sortie mistral-M15 (vérifié le 17/09 21:33 UTC)
+-------------------------------------------------------------------------
+- Incidents corrigés : job 1003 `scheduled = t`, replanifié (total_runs
+  95, next_start +1 min) ; index `mesures_series_id_ts_idx` recréé ;
+  `timescaledb.max_background_workers` remis à 8 (ALTER SYSTEM RESET +
+  restart), 3 processus TimescaleDB, tous les jobs repartis dans la
+  seconde (1001 a fait sa première exécution à cette occasion).
+- Points de démonstration supprimés (DELETE 1 800, zone rowstore) et les
+  trois niveaux rafraîchis, bornés, sur la plage : `mesures` 151 609 294,
+  max(ts) 29/10 21:59:50, max(seau) 1min 21:59 / 1h 21:00 / 1j 28/10 23:00
+  — identiques à l'entrée.
+- `alertes_qualite` : 3 lignes (137, 208, 451) après TRUNCATE + run_job ;
+  le job 1008 AJOUTE trois lignes à chaque passage horaire (l'action de
+  L10 ne dédoublonne pas) — le compte grossit seul, c'est attendu.
+- Jobs 1000-1008 tous Scheduled avec une prochaine échéance ; requêtes de
+  prévention P1-P3 : sortie vide.
+- Érosion de mistral_1min/1h (14-24 sept) : reprise avec le job 1003,
+  hors périmètre, inchangée.
+- 128 Go libres.

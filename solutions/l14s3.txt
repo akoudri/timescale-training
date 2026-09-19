@@ -1,0 +1,130 @@
+L14 — ÉTAPE 3 : JOURNAL DE DIAGNOSTIC — INCIDENT 2 (l'état du parc en 8 s)
+============================================================================
+
+Fiche : « Même démarche, journal séparé. Échanger les rôles dans le
+binôme. Un indice de méthode, et un seul : les deux incidents ne relèvent
+pas de la même famille de requêtes. »
+
+-------------------------------------------------------------------------
+1. Le journal attendu (l14/journal-incident-2.md)
+-------------------------------------------------------------------------
+SYMPTÔME (reformulé)
+  L'écran « état du parc » — dernière valeur de chaque capteur, requête
+  R5 de M06 — répond en 7 à 8 s au lieu d'un temps sub-seconde. Périmètre :
+  cette requête ; depuis : deux jours ; « rien n'a été déployé » (à
+  vérifier, pas à croire).
+
+REPRODUCTION (avant toute hypothèse : le symptôme est-il stable ?)
+   ./mesure.sh <R5.sql> --table mesures --bornes complet
+   → runs 9642 9296 9263 9226 9178 ms | médiane 9 263 ms, écart-type 1,8 %
+  Stable à 2 % : ce n'est pas une charge intermittente. Référence tenue
+  (M06 / ligne de base saine relevée avant l'injection) : 126 ms. Rapport
+  × 74. Le chiffre est reproductible, donc STRUCTUREL : le plan a changé.
+
+HYPOTHÈSES, par coût de vérification croissant
+  1. Un objet de structure a disparu — index, agrégat — : UNE requête
+     d'inventaire (famille STRUCTURE), comparée à la référence
+     (schema.sql / l'index posé en L05).
+  2. « C'est la compression » — l'hypothèse réflexe : des chunks récents
+     basculés trop tôt, ou une politique modifiée : une requête sur
+     l'état des chunks (famille STRUCTURE aussi, deuxième bloc).
+  3. Une charge concurrente sature l'instance : événements d'attente et
+     top des requêtes (famille ACTIVITÉ) — plus long à établir (boucler
+     la requête), et déjà peu probable vu la stabilité de la mesure.
+
+REQUÊTE DE VÉRIFICATION (une seule a départagé)
+  Famille : STRUCTURE — fichier l15/diagnostic/structure.sql, troisième
+  requête (inventaire des index de l'hypertable principale). Résultat :
+
+    indexname       | indexdef
+    mesures_ts_idx1 | CREATE INDEX mesures_ts_idx1 ON public.mesures USING btree (ts DESC)
+
+  Un seul index. L'index (series_id, ts DESC) posé en L05 — celui qui fait
+  R5 — a disparu. Référence : l'inventaire de M06 (deux index) ou
+  schema.sql.
+
+  Hypothèse 2, vérifiée ET écartée par la même famille, deuxième bloc :
+
+    hypertable_name | chunks | columnstore
+    mesures         |      6 |           4
+
+  C'est l'état de M10 (4 columnstore 24/09 → 22/10, 2 rowstore), inchangé.
+  La compression n'a pas bougé. Écartée en une ligne.
+
+  Hypothèse 3, tombée sans requête dédiée : le top de pg_stat_statements
+  (famille ACTIVITÉ) montre bien R5 en tête… parce que c'est elle qu'on
+  vient de mesurer cinq fois (13 appels, 3 543 ms de moyenne) ; aucun
+  événement d'attente actif ; workers présents. Rien de concurrent.
+
+  Ce que le plan montre (EXPLAIN ANALYZE, avant correction) :
+    Unique → Merge Append (actual rows = 33 601 200)
+      4 chunks columnstore : SkipScan → ColumnarScan → Index Scan sur
+        l'index INTERNE des chunks compressés (series_id, ts_meta) :
+        490 lignes chacun, ~3 900 blocs — INTACTS
+      2 chunks rowstore (22/10 → 05/11, 33,6 M lignes) : parcours
+        complet + tri sur disque (temp read/written ≈ 140 000 blocs)
+    Buffers : shared hit 112 347 / read 150 332, temp written 139 784.
+  Lecture importante : les chunks columnstore n'ont PAS BESOIN de l'index
+  de L05 (le columnstore porte son propre index de segment, par
+  series_id, avec les métadonnées de ts) — le coût vient entièrement des
+  deux chunks rowstore, qui sont exactement ceux où arrivent les données
+  récentes. C'est pour cela que l'écran « état du parc », qui veut la
+  DERNIÈRE valeur, est le seul à souffrir : R2/R3 lisent des fenêtres,
+  par l'index ts, et n'ont rien vu.
+
+CAUSE RACINE
+  L'index `mesures_series_id_ts_idx (series_id, ts DESC)` a été supprimé
+  — DROP INDEX, pas une corruption : rien dans les journaux, aucune
+  erreur. « Rien n'a été déployé » était faux au sens de l'inventaire :
+  une commande DDL est un déploiement.
+
+CORRECTION, et effet mesuré
+   CREATE INDEX mesures_series_id_ts_idx ON mesures (series_id, ts DESC);
+   → 8 461 ms (référence 9,1 s) — sur 151,6 M lignes dont 118 M en
+     columnstore : l'index n'est construit QUE sur les chunks rowstore
+     (les chunks compressés ne le reçoivent pas), d'où ce temps court.
+   ./mesure.sh <R5.sql> … → runs 126 124 125 125 125 | médiane 125 ms (0,8 %)
+   → × 74 ; plan corrigé : Merge Append actual rows = 2 940 (490 par
+     chunk), chunks rowstore en SkipScan → Index Scan using
+     _hyper_8_9x_chunk_mesures_series_id_ts_idx ; buffers shared hit
+     20 015, zéro temp. Le symptôme a disparu à la première exécution.
+
+PRÉVENTION
+  Inventaire périodique des index de l'hypertable principale comparé à
+  une référence — reconnus par leurs COLONNES, pas par leur nom (le nom
+  dépend du poste) — voir l14s4 (P2). Avant correction : « (series_id,
+  ts DESC) ABSENT » ; après : vide. Elle deviendrait une alerte de
+  structure (L15 E2) ; en production, elle se double d'une revue des DDL
+  (journalisation des DROP par event trigger ou log_statement = 'ddl').
+
+-------------------------------------------------------------------------
+2. Ce qu'il faut faire comprendre
+-------------------------------------------------------------------------
+- REPRODUIRE avant de chercher : une médiane stable à 2 % oriente vers
+  la structure ; une mesure qui oscille de 1 à 10 oriente vers l'activité.
+  Ce seul chiffre ordonne les hypothèses.
+- « C'est la compression » est l'hypothèse réflexe dès qu'une lecture
+  ralentit. Elle se vérifie en UNE requête (état des chunks, inchangé) ;
+  la vérifier et l'écarter coûte dix secondes, s'y installer coûte
+  l'atelier. Ici le columnstore est même la partie du plan qui va BIEN.
+- L'inventaire comparé à une référence est la requête discriminante de
+  toute la famille STRUCTURE : sans référence (schema.sql, l'inventaire
+  de M06), on ne sait pas ce qui manque. C'est le rappel direct de L05 :
+  c'est l'index qui fait le travail, pas la syntaxe DISTINCT ON.
+- La correction est banale (8 s) ; ce qui compte est d'avoir NOMMÉ la
+  requête qui a montré l'absence, pour la refaire devant la salle.
+
+-------------------------------------------------------------------------
+3. Erreurs fréquentes
+-------------------------------------------------------------------------
+- Partir sur « c'est la compression » et décompresser un chunk « pour
+  voir » : interdiction de deviner en modifiant (règles du jeu), et un
+  chunk décompressé est une seconde panne à corriger.
+- Lancer EXPLAIN ANALYZE sans avoir reproduit avec mesure.sh : le plan
+  seul ne dit pas si le symptôme est stable ; et EXPLAIN ANALYZE coûte 9 s
+  à chaque essai.
+- Recréer l'index sous un autre nom et laisser la prévention par NOM
+  (référence -sol) hurler pour toujours : comparer les colonnes.
+- Conclure que la lenteur touche « toutes les lectures » sans mesurer
+  R2/R3 : seules les requêtes dernière-valeur sur les chunks rowstore
+  dépendent de cet index.

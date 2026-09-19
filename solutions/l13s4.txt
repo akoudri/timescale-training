@@ -1,0 +1,134 @@
+L13 — ÉTAPE 4 : MESURER LE SURCOÛT
+==================================
+
+Fiche : « Protocole de M02, appliqué à quatre configurations. Les trois
+rapports ne vont pas forcément dans le même sens. Pour chacun, comparer
+les deux plans et dire ce que la vue a changé — puis en tirer une règle
+d'exploitation. »
+
+-------------------------------------------------------------------------
+1. Protocole
+-------------------------------------------------------------------------
+for r in R1-dernier-point R2-fenetre-3j R3-agregation-fenetre; do
+  ./mesure.sh requetes/$r.sql --table mesures      --role mistral_admin
+  ./mesure.sh requetes/$r.sql --table mesures_site --role mistral_lecture
+done
+mesure.sh ajoute en prélude `SET ROLE <rôle>; SET mistral.site = 2;` et
+calcule les bornes SUR LA TABLE DONNÉE (donc sur la vue, site 2, pour
+le second cas) : bornes de référence j1-j5 = 24/09 → 29/09, fen3 =
+26/09 → 29/09. Toute la fenêtre est dans le chunk columnstore 24/09→01/10.
+Ce détail compte : R2 et R3 mesurent ici la lecture de lots compressés.
+
+-------------------------------------------------------------------------
+2. Résultats du poste (médiane de 5, écart-type)
+-------------------------------------------------------------------------
+| Grandeur                | Accès direct    | Via la vue        | Rapport |
+|-------------------------|-----------------|-------------------|---------|
+| R1 · point le plus récent | 114 ms (1,8 %) | 16 793 ms (2,6 %) | × 147   |
+| R2 · fenêtre de 3 jours   | 1 057 ms (3,7 %) |   888 ms (0,8 %) | × 0,84  |
+| R3 · agrégation j1-j5     | 1 434 ms (0,7 %) |   955 ms (0,3 %) | × 0,67  |
+Référence : × 143 / × 0,8 / × 0,7. Reproduit.
+
+-------------------------------------------------------------------------
+3. Les plans (EXPLAIN ANALYZE, BUFFERS, COSTS off, TIMING off)
+-------------------------------------------------------------------------
+R1 direct (mistral_admin, mesures) — 42,7 ms d'exécution :
+  Unique → Merge Append → 6 × Custom Scan (SkipScan) : sur les 4 chunks
+  columnstore, SkipScan sur ColumnarScan alimenté par l'index de segment
+  `…_compressed_series_id__ts_meta_v2_first_ts_idx` (490 lignes lues par
+  chunk = une par série) ; sur les 2 chunks rowstore, SkipScan sur
+  l'index (series_id, ts DESC). 2 940 lignes au total, 490 en sortie.
+R1 via la vue (mistral_lecture, mesures_site) — 19 075 ms :
+  Unique → Sort (55 711 406 lignes !) → Nested Loop
+    ← HashAggregate (180 séries du site : Hash Join actifs × affectation)
+    ← Append : par série, Index Scan complet des 6 chunks (309 508 lignes
+      par série). Le DISTINCT ON est appliqué AU-DESSUS de la jointure
+      de la vue ; le planificateur ne sait plus que « la première ligne
+      par série dans l'ordre de l'index » suffit : il lit tout, trie
+      tout, garde 180 lignes. C'est la perte du parcours par saut.
+R2 direct — 1 129 ms :
+  Gather Merge → Parallel Append → ColumnarScan du chunk 24/09→01/10 :
+  Vectorized Filter sur ts, 12 692 974 lignes décompressées ; côté
+  lots : Parallel Seq Scan sur le chunk compressé, 6 610 × 2 lots lus,
+  8 326 × 2 lots ÉLIMINÉS par le filtre ts sur les métadonnées de lot
+  (min/max de ts). Aucun prédicat de série : tous les segments.
+R2 via la vue — 854 ms :
+  HashAggregate → Nested Loop ← HashAggregate (180 séries)
+    ← ColumnarScan paramétré : Index Scan sur l'index de segment du chunk
+      compressé, 27 lots par série (× 180 = 4 860 lots), 4 661 996 lignes
+      décompressées. Le prédicat de site EST poussé jusqu'aux lots — par
+      l'index de segment, série par série — et 3 lots sur 4 ne sont
+      jamais décompressés. Moins de lots, moins de décompression, moins
+      de temps : la sélectivité (180/490) paie plus que le coût de la
+      jointure. Même mécanisme pour R3.
+
+Réponses aux deux questions de la fiche :
+- Le prédicat de cloisonnement n'est PAS un filtre tardif : la vue
+  security_barrier le laisse traverser sous forme d'égalité sur
+  series_id (opérateur LEAKPROOF), et la boucle imbriquée le transforme
+  en accès indexé par série.
+- Sur les chunks columnstore, le nombre de lots traités CHANGE : 13 220
+  lus (direct) → 4 860 (vue). NB : la référence (resultats.md, mesures.md
+  §M14) écrivait le contraire — « ne participe pas à l'élimination » ;
+  le plan du poste montre que si, via l'index de segment. À corriger
+  dans la référence.
+
+-------------------------------------------------------------------------
+4. Pourquoi les rapports divergent, et la règle d'exploitation
+-------------------------------------------------------------------------
+Deux motifs, deux effets opposés :
+- Les FENÊTRES (R2, R3) lisent une plage et agrègent : le prédicat de
+  site réduit le volume lu (moins de segments), et cette réduction
+  dépasse le coût de la sous-requête. Surcoût négatif — réel, pas un
+  artefact.
+- Le DERNIER POINT (R1) ne lit qu'une ligne par série : sa vitesse tient
+  entièrement au parcours par saut sur l'index. La vue interpose une
+  jointure qui casse ce raccourci ; le prédicat, même sélectif, ne
+  compense pas une lecture de 55 M lignes contre 2 940.
+
+Variantes mesurées pour établir la règle (site 2, mistral_lecture) :
+| Forme de R1 cloisonné                                   | durée     |
+|----------------------------------------------------------|-----------|
+| DISTINCT ON sur mesures_site                             | 16 793 ms |
+| référentiel d'abord, puis LATERAL (… LIMIT 1) sur mesures_site | 6 470 ms |
+| DISTINCT ON sur mistral_1min_site (agrégat minute, 31 M lignes) | 34 286 ms |
+| DISTINCT ON sur mistral_1h_site (529 026 lignes)          | 55 ms     |
+| DISTINCT ON sur mistral_1j_site (22 050 lignes)           | 3 ms      |
+| liste LITTÉRALE des 180 séries, sur mesures (admin)       | 11 ms     |
+
+Règle d'exploitation (une phrase) : sur un tableau de bord cloisonné,
+le motif dernière-valeur ne se lit JAMAIS à travers la vue barrière sur
+le brut ni sur l'agrégat minute — il se lit sur l'agrégat HEURE (ou
+jour) cloisonné, avec une fraîcheur d'une heure assumée, ou bien en
+deux temps (le référentiel donne la liste des séries du site, la requête
+passe cette liste en littéral : le SkipScan revient, 11 ms). Les
+fenêtres et agrégations, elles, passent par la vue sans surcoût.
+
+Nuance sur l'agrégat minute : plus petit que le brut (31 M contre 151 M)
+mais SANS SkipScan possible à travers la vue → pire que le brut direct.
+La taille ne fait pas la vitesse ; le plan la fait.
+
+-------------------------------------------------------------------------
+5. mesures.md attendu (§ M14 — coût du cloisonnement)
+-------------------------------------------------------------------------
+## M14 — coût du cloisonnement
+RLS refusée (hypertable columnstore, matérialisations) → vues
+security_barrier. Site 2 = 180 séries / 490.
+| | direct | via la vue | rapport |
+| R1 dernier point | 114 ms | 16 793 ms | × 147 |
+| R2 fenêtre 3 j   | 1 057 ms | 888 ms  | × 0,84 |
+| R3 j1-j5         | 1 434 ms | 955 ms  | × 0,67 |
+Lots columnstore traités par R2 : 13 220 → 4 860 (index de segment).
+R1 : perte du SkipScan (55,7 M lignes triées). Règle : dernière valeur
+cloisonnée = agrégat heure cloisonné (55 ms) ou liste littérale (11 ms).
+
+-------------------------------------------------------------------------
+6. Erreurs fréquentes
+-------------------------------------------------------------------------
+- Mesurer les deux configurations sous postgres : rapport 1,0 partout
+  (piège « surcoût nul »).
+- Oublier `--role` : mesure.sh ne positionne alors ni le rôle ni le site
+  → sur mesures_site, `current_setting` NULL → 0 ligne, durée nulle.
+- Conclure de R2/R3 que « le cloisonnement accélère » en général : il
+  accélère parce que le site 2 est 37 % du parc ; un site à 90 % du
+  parc paierait la jointure sans le gain.

@@ -1,0 +1,85 @@
+L12 — ÉTAPE 5 : CHIFFRER, CONSIGNER, NETTOYER
+===============================================
+
+Fiche : « Reporter dans mesures.md, sous ## M13 — restauration, les cinq
+durées, puis écrire une phrase d'extrapolation. »
+
+-------------------------------------------------------------------------
+1. Le tableau attendu (mesures.md §M13, valeurs du poste du 17/09/2026)
+-------------------------------------------------------------------------
+## M13 — restauration
+Contexte : Docker 2 vCPU / 8 Go, NVMe local, TimescaleDB 2.29.2 / PG 17.
+
+| Grandeur | Valeur |
+|---|---|
+| Durée de la sauvegarde de base | **36,9 s** (pg_basebackup plain, WAL en flux) |
+| Volume de la sauvegarde | **21 Go** (dont 12 Go de `mesures_avant`, hors kit) |
+| Incident | DELETE de 12 696 679 lignes (3 derniers jours, zone rowstore), 20,1 s, 1,5 Go de WAL |
+| Fenêtre de journaux rejouée | sauvegarde (A9/8C000028, 18:49:59) → instant cible (18:50:44,82) : **91 segments, 1,4 Go** |
+| Durée du rejeu seul | **5,05 s** (redo starts → redo done) |
+| Durée totale, arrêt → instance promue | **24,3 s** (dont ≈ 18 s de copie de la sauvegarde) |
+| Timeline après restauration | 2 |
+
+Référence : 33,6 s / 17 Go · 21,4 s total · ~8 s de rejeu.
+
+-------------------------------------------------------------------------
+2. La phrase d'extrapolation (formulation attendue)
+-------------------------------------------------------------------------
+« Sur 45 jours et 21 Go, la restauration a pris 24 s sur NVMe local, dont
+5 s de rejeu pour 1,4 Go de journaux. À l'échelle de production (≈ 3 To
+sans chaîne, ≈ 320 Go avec), la sauvegarde de base et sa remise en place
+croissent avec le VOLUME de l'instance — 21 Go en 37 s donne des heures
+pour plusieurs téraoctets, et la copie de la sauvegarde vers PGDATA
+autant — tandis que le rejeu croît avec la FENÊTRE de journaux entre la
+dernière sauvegarde de base et l'instant cible, indépendamment de la
+taille de la base : ici 20 s d'activité massive ont produit 1,4 Go et
+5 s de rejeu ; une journée d'ingestion à 574 000 points/s (M05, ≈ 115
+octets de WAL par ligne) produirait ≈ 5,7 To de journaux. C'est donc la
+FRÉQUENCE des sauvegardes de base qui borne le pire cas de restauration,
+et la rétention des archives qui borne le disque. »
+
+Deux conséquences à faire écrire :
+- l'objectif de délai de restauration (RTO) se négocie en fréquence de
+  sauvegarde de base, pas en « vitesse du disque » ;
+- la chaîne de M10 réduit le volume à sauvegarder (columnstore ×9,3) ET
+  le volume de journaux (les chunks compressés ne bougent plus) — un
+  argument de plus pour la compression, qui n'était pas dans L08.
+
+-------------------------------------------------------------------------
+3. Nettoyage — dans le bon ordre (correction de la fiche du 17/09)
+-------------------------------------------------------------------------
+Ce qu'a laissé l'atelier sur le poste : pgdata/data.incident 22 Go,
+archives/base 21 Go, archives/wal 1,8 Go (114 segments) → 84 Go libres
+au lieu de 128.
+
+Ordre CORRECT :
+  ALTER SYSTEM SET archive_mode = off;      -- une instruction par psql -c
+  ALTER SYSTEM RESET archive_command;
+  docker compose restart timescaledb
+  rm -rf pgdata/data.incident archives/base archives/wal
+  → 43 Go rendus en 0,6 s ; SHOW archive_mode = off ; jobs 8/8 repartis.
+
+Vécu sur le poste, dans l'ordre de la fiche d'origine (rm d'abord) :
+entre le `rm` d'archives/wal et le redémarrage avec archive_mode = off,
+l'archiveur a tenté de copier un segment vers /archives/wal disparu :
+`pg_stat_archiver.failed_count` est passé à 1 et le segment est resté
+retenu dans pg_wal. Sans conséquence ici (archivage arrêté juste après),
+mais c'est le piège de l'étape 1 provoqué par le nettoyage lui-même —
+d'où l'inversion dans la fiche.
+
+Deuxième vécu : `psql -c "ALTER SYSTEM SET …; ALTER SYSTEM RESET …;"`
+échoue (« ALTER SYSTEM cannot run inside a transaction block ») : un `-c`
+à plusieurs instructions est une transaction implicite. Une instruction
+par `-c`.
+
+Troisième point, réglé dans restaurer.sh : `restore_command`,
+`recovery_target_time` et `recovery_target_action` restaient dans
+postgresql.auto.conf après la promotion. Ignorés tant qu'aucun
+recovery.signal n'existe, mais une restauration ultérieure les aurait
+empilés (la dernière valeur gagne — ça marche par accident). Le script
+les retire désormais (étape 6). Après nettoyage, postgresql.auto.conf ne
+contient plus que `archive_mode = 'off'`.
+
+En production, la question à écrire : rétention des archives (7 jours ?
+deux sauvegardes de base ?) — c'est elle qui borne archives/wal, qui
+grossit de 16 Mo par segment sans limite tant que l'archivage tourne.

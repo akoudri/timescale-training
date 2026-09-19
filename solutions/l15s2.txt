@@ -1,0 +1,181 @@
+L15 — ÉTAPE 1 : LES QUATRE ALERTES DU PREMIER JOUR
+====================================================
+
+Fiche : « Quatre rubriques par alerte, aucune ne reste vide. A2 et A3
+doivent être exprimées en relatif ; A2 se limite aux jobs déjà échus ;
+A4 combine seuil et tendance. »
+
+Chaque expression ci-dessous a été TESTÉE sous le rôle de supervision,
+puis installée comme règle Grafana par l'API de provisioning (§5) : une
+requête SQL (A) → réduction « last » (B) → seuil (C). Les règles sont
+exportées telles quelles dans l15-regles-alertes-export.yaml.
+
+-------------------------------------------------------------------------
+A1 — Aucun worker actif (binaire)
+-------------------------------------------------------------------------
+1. Seuil : nombre de processus TimescaleDB < 1
+     SELECT count(*) AS workers FROM pg_stat_activity
+     WHERE  application_name LIKE 'TimescaleDB%';
+   (application_name est visible à tout rôle, même sans pg_read_all_stats
+   — vérifié : 3 en régime normal = lanceur + ordonnanceur + 1 worker.)
+2. Action : SHOW timescaledb.max_background_workers et max_worker_processes,
+   journal du serveur (« TimescaleDB background worker is set to 0 »,
+   « launcher shutting down », « worker limit … exceeded »), corriger,
+   redémarrer. Panne muette n° 7 du catalogue.
+3. Propriétaire : exploitant de la plateforme données.
+4. Pourquoi : quand elle tombe, TOUT le reste (rafraîchissements, bascule,
+   rétention, contrôle qualité) s'arrête sans une seule erreur ; aucune
+   autre alerte ne la remplace, A2 ne la verrait qu'après 3 périodes.
+
+-------------------------------------------------------------------------
+A2 — Job sans succès (RELATIF à la période, jobs déjà échus)
+-------------------------------------------------------------------------
+1. Seuil : job suspendu, OU dernier succès plus vieux que 3 × sa période,
+   parmi les jobs exécutés au moins une fois :
+     SELECT count(*) AS jobs_en_anomalie
+     FROM   timescaledb_information.jobs j
+     LEFT   JOIN timescaledb_information.job_stats s USING (job_id)
+     WHERE  NOT j.scheduled
+        OR (s.total_runs > 0
+            AND s.last_successful_finish < now() - 3 * j.schedule_interval);
+   → déclenche si > 0. C'est P1 de L14, à l'identique.
+   Le garde-fou `total_runs > 0` (et non `last_run_started_at IS NOT
+   NULL`, qui ne filtre rien : un job jamais échu porte -infinity, pas
+   NULL) écarte les politiques à J+1 jamais exécutées — le faux positif
+   vécu par la référence. Le facteur 3 absorbe un passage long légitime.
+2. Action : `timescaledb_information.job_errors` d'abord (échec répété :
+   sqlerrcode, message) ; si vide, c'est une SUSPENSION (`scheduled`,
+   `next_start`) — leçon de L10/L14 : Success + suspendu = piège.
+3. Propriétaire : exploitant de la plateforme données.
+4. Pourquoi : une seule alerte couvre l'échec répété ET la suspension
+   oubliée ; un seuil absolu (« 1 jour ») serait aveugle sur le job à la
+   minute et bruyant sur la rétention quotidienne, et faux à la première
+   modification de période — que personne ne pensera à répercuter.
+
+-------------------------------------------------------------------------
+A3 — Flux muet (RELATIF au pas attendu du flux)
+-------------------------------------------------------------------------
+1. Seuil : dernier point d'une série plus vieux que 60 × le pas attendu
+   de son flux, le pas étant lu au catalogue (famille du signal : 10 s
+   pour les signaux machine, 1 h pour la famille météo) et l'ancienneté
+   mesurée au DERNIER POINT DU PARC, jamais à l'horloge murale :
+     SELECT count(*) AS flux_muets FROM (
+       SELECT af.series_id,
+              CASE WHEN g.famille = 'meteo' THEN interval '1 hour'
+                   ELSE interval '10 seconds' END       AS pas,
+              max(m.ts)                                 AS dernier
+       FROM   affectation_capteur af
+       JOIN   signaux g ON g.signal_id = af.signal_id
+       LEFT   JOIN mesures m ON m.series_id = af.series_id
+                            AND m.ts >= (SELECT max(ts) - interval '1 day' FROM mesures)
+       WHERE  af.fin IS NULL
+       GROUP  BY 1, 2) s
+     WHERE  s.dernier IS NULL
+        OR  s.dernier < (SELECT max(ts) FROM mesures) - 60 * s.pas;
+   → déclenche si > 0. Le LEFT JOIN depuis le référentiel attrape aussi
+   la série qui n'a JAMAIS émis dans la journée (dernier IS NULL) ; une
+   requête partant de `mesures` ne peut pas la voir. La borne `max(ts)
+   − 1 day` rend la requête bornée (index (series_id, ts DESC) + chunks
+   récents), donc évaluable toutes les 10 s.
+   Sur ce poste : 3 en régime « normal » (137, 208, 451 coupées en L10).
+2. Action : croiser avec `alertes_qualite` (l'action de L10, seuil 1 h,
+   l'aura ou non déjà consignée : ici A3 à 10 min voit 490, l'action ne
+   la voit pas) et avec l'état machine (`evenements`) : un arrêt de
+   maintenance déclaré (contrainte 6.2 du jeu) n'est pas une liaison
+   coupée.
+3. Propriétaire : exploitation du parc (le remède est sur site : liaison,
+   carte, collecteur), pas la plateforme.
+4. Pourquoi : c'est la seule des quatre qui parle du MÉTIER, et elle voit
+   le collecteur arrêté avant que quelqu'un ne regarde une courbe ; par
+   flux, sinon la météo horaire hurlerait en continu.
+
+-------------------------------------------------------------------------
+A4 — Espace disponible (SEUIL et TENDANCE)
+-------------------------------------------------------------------------
+1. Seuil : > 85 % du volume alloué (200 Go dans le kit) ; tendance :
+   moins de 7 jours restants au rythme de croissance des 24 dernières
+   heures. La tendance exige un HISTORIQUE de la taille : M7 ne le fournit
+   pas (Grafana n'archive pas une requête SQL), donc on l'écrit dans la
+   base — un relevé horaire par job, comme l'action de L10 E3 :
+     CREATE TABLE supervision_taille (ts timestamptz NOT NULL DEFAULT now(),
+                                      octets bigint NOT NULL);
+     CREATE PROCEDURE relever_taille(job_id int, config jsonb)
+     LANGUAGE plpgsql AS $$
+     BEGIN
+       INSERT INTO supervision_taille (ts, octets)
+       VALUES (now(), pg_database_size(current_database()));
+       DELETE FROM supervision_taille WHERE ts < now() - interval '30 days';
+     END $$;
+     SELECT add_job('relever_taille', INTERVAL '1 hour');   -- job 1031 ici
+     GRANT SELECT ON supervision_taille TO mistral_supervision;
+   Expression de la règle :
+     SELECT CASE WHEN pct > 85 OR jours < 7 THEN 1 ELSE 0 END AS alerte
+     FROM (SELECT round(100.0 * o.octets / (200.0*1024^3)::numeric, 1) AS pct,
+                  ((200.0*1024^3) - o.octets) / nullif(t.pente_par_jour, 0) AS jours
+           FROM (SELECT octets FROM supervision_taille ORDER BY ts DESC LIMIT 1) o,
+                (SELECT regr_slope(octets, extract(epoch FROM ts)) * 86400
+                        AS pente_par_jour
+                 FROM supervision_taille
+                 WHERE ts >= now() - interval '24 hours') t) x;
+   Sur ce poste : 10,4 %, pente NULL (2 relevés) → 0. La pente négative
+   (rétention qui vient de purger) donne `jours` négatif : il faut
+   lire `jours < 7` comme `jours BETWEEN 0 AND 7` en production — piège
+   à énoncer.
+2. Action : d'abord M6 — compression et rétention se sont-elles exécutées
+   (l'espace qui ne se libère pas est la panne n° 6) ; ensuite seulement
+   étendre le volume.
+3. Propriétaire : exploitant infrastructure — la seule qui réveille la
+   nuit.
+4. Pourquoi : irréversible en heures (instance en lecture seule, puis
+   arrêt) ; toutes les autres pannes se réparent après coup. Le seuil
+   seul se franchit quand il est trop tard ; la tendance donne le DÉLAI
+   d'action, qui est l'information utile à 3 h du matin.
+
+-------------------------------------------------------------------------
+5. Installer les règles par l'API (Grafana 12.1)
+-------------------------------------------------------------------------
+  curl -u admin:mistral -X POST http://127.0.0.1:3000/api/folders \
+       -d '{"uid":"mistral","title":"MISTRAL"}'
+  # une règle = 3 nœuds : A (SQL, source mistral-supervision, format
+  # table), B (reduce last de A), C (threshold sur B) ; condition = C
+  curl -u admin:mistral -H 'Content-Type: application/json' \
+       -H 'X-Disable-Provenance: true' \
+       -X POST http://127.0.0.1:3000/api/v1/provisioning/alert-rules -d '{
+    "uid":"mistral-a2","title":"A2 · Job sans succès (3 × période, jobs échus)",
+    "folderUID":"mistral","ruleGroup":"mistral-alertes","condition":"C","for":"0s",
+    "noDataState":"NoData","execErrState":"Error",
+    "data":[
+      {"refId":"A","datasourceUid":"mistral-supervision",
+       "relativeTimeRange":{"from":600,"to":0},
+       "model":{"refId":"A","rawSql":"<la requête A2>","format":"table","rawQuery":true}},
+      {"refId":"B","datasourceUid":"__expr__","relativeTimeRange":{"from":600,"to":0},
+       "model":{"refId":"B","type":"reduce","expression":"A","reducer":"last"}},
+      {"refId":"C","datasourceUid":"__expr__","relativeTimeRange":{"from":600,"to":0},
+       "model":{"refId":"C","type":"threshold","expression":"B",
+                "conditions":[{"evaluator":{"type":"gt","params":[0]}}]}}]}'
+  # A1 : evaluator lt 1 ; A3, A4, P2, P3 : gt 0
+  # période d'évaluation du groupe : 10 s
+  curl -u admin:mistral -H 'Content-Type: application/json' -H 'X-Disable-Provenance: true' \
+       -X PUT http://127.0.0.1:3000/api/v1/provisioning/folder/mistral/rule-groups/mistral-alertes \
+       -d '{"interval":10,"title":"mistral-alertes","folderUid":"mistral"}'
+  # état : GET /api/prometheus/grafana/api/v1/rules  (state firing/inactive)
+  # export : GET /api/v1/provisioning/alert-rules/export?format=yaml
+
+`for: 0s` pour l'atelier (déclenchement immédiat, observable en 10-20 s) ;
+en production A1 prend `for: 1m` (temporisation de deux évaluations, voir
+l15s4) et A3 `for: 2m`.
+
+-------------------------------------------------------------------------
+6. Erreurs fréquentes
+-------------------------------------------------------------------------
+- A2 sur `last_run_status <> 'Success'` : un job suspendu reste
+  « Success » à jamais (L14, incident 1) ; l'alerte ne voit rien.
+- A3 en durée absolue (« 10 minutes ») pour tous les flux : la météo
+  horaire est en alerte permanente ; ou mesurée à now() sur un jeu daté :
+  490 séries muettes dès la première évaluation.
+- A4 seuil seul ; ou tendance sur la taille du DISQUE (`df`) au lieu de la
+  base : le disque porte aussi les archives WAL de L12 et les copies
+  d'atelier — un pic qui n'est pas la base.
+- Une règle sans réduction (« reduce ») sur une requête qui retourne
+  plusieurs lignes : Grafana refuse la comparaison ; retourner UN nombre
+  (count) est la forme robuste.

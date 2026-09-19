@@ -1,0 +1,87 @@
+L12 — ÉTAPE 4 : VÉRIFIER, ET PAS SEULEMENT LES DONNÉES
+========================================================
+
+Fiche : « Un seul de ces quatre contrôles en échec invalide la
+restauration, même si les données sont là. »
+
+-------------------------------------------------------------------------
+1. Résultats du poste (\i l12/verifier-apres.sql)
+-------------------------------------------------------------------------
+1) Données : 151 609 294 lignes, 2026-09-24 00:00 → 2026-10-29 21:59:50
+   — exactement l'état d'avant incident (138 912 615 + 12 696 679).
+2) Hypertables : evenements, mesures, mesures_avant, mesures_charge,
+   mesures_hc (num_dimensions 1) — la vue d'information n'affiche pas
+   les matérialisations des agrégats ; les vérifier à part :
+     SELECT view_name, materialization_hypertable_name
+     FROM timescaledb_information.continuous_aggregates;
+   → mistral_1min→_materialized_hypertable_12, 1h→13, 1j→14.
+3) Jobs : 10 lignes (1 télémétrie, 3 purge d'historique, 1000-1008),
+   tous scheduled = t, tous avec next_start. Les échéances sont celles
+   d'AVANT la restauration (job 1003 : 18:52:45, soit une minute après la
+   promotion) : le catalogue des jobs est dans la base, il revient avec
+   elle ; l'ordonnanceur relit ce catalogue au démarrage.
+4) Contrôle de somme L07 sur J-3 (26 octobre, jour de Paris) :
+     brut 4 332 767 · 1min 4 332 767 · 1h 4 332 767 · 1j 4 332 767
+   comptes identiques, sommes égales à 10⁻¹³ relatif.
+
+Compléments relevés : timeline 2 (pg_control_checkpoint), 3 processus
+TimescaleDB, alertes_qualite 3 lignes, index mesures_series_id_ts_idx
+présent, 4/6 chunks compressés, pg_stat_statements présente.
+
+-------------------------------------------------------------------------
+2. Pourquoi quatre contrôles et pas un comptage
+-------------------------------------------------------------------------
+Une restauration PHYSIQUE (celle-ci) ramène tout : catalogue de
+l'extension, chunks, jobs, agrégats — parce que PGDATA est copié bloc par
+bloc. Les contrôles 2 à 4 passent donc « naturellement »… et c'est
+précisément pour cela qu'on les fait : ils sont le filet qui distingue
+une restauration physique réussie d'une restauration LOGIQUE mal faite
+(E1 : un pg_restore sans les deux appels de l'extension perd
+silencieusement des chunks) ou d'une bascule de réplica où les jobs
+sont suspendus. Chaque contrôle correspond à un mode de défaillance
+réel :
+  - données : mauvais instant cible, segment manquant ;
+  - hypertables : dump logique sans pre/post_restore, extension absente
+    sur l'instance de restauration ;
+  - jobs : catalogue revenu mais ordonnanceur non redémarré, workers
+    insuffisants (M15), `scheduled = false` laissé par un test ;
+  - agrégats : rafraîchissement raté entre la sauvegarde et l'incident,
+    agrégat vide (L09 E1). Le contrôle de somme est le seul des quatre
+    qui vérifie une COHÉRENCE et pas une présence.
+
+-------------------------------------------------------------------------
+3. Le livrable : l12/verification-post-restauration.md (contenu attendu)
+-------------------------------------------------------------------------
+# Vérification post-restauration — checklist réutilisable
+
+Préalable : l'instance est promue (`SELECT pg_is_in_recovery()` = false),
+la timeline a changé (`SELECT timeline_id FROM pg_control_checkpoint()`),
+les journaux ne montrent ni « could not restore file » ni erreur après
+« database system is ready ».
+
+| # | Contrôle | Requête | Critère de passage |
+|---|---|---|---|
+| 1 | Données revenues | `SELECT count(*), min(ts), max(ts) FROM mesures;` | count et bornes = valeurs consignées AVANT l'incident (à relever en même temps que l'instant) |
+| 2 | Hypertables encore hypertables | `SELECT hypertable_name FROM timescaledb_information.hypertables;` + `continuous_aggregates` | même liste qu'avant ; aucune table du schéma n'est redevenue ordinaire ; chunks columnstore lisibles (`SELECT count(*)` sur une plage compressée) |
+| 3 | Jobs replanifiés | `SELECT job_id, proc_name, scheduled, next_start FROM timescaledb_information.jobs;` | tous `scheduled = t`, `next_start` non nul et dans le futur ; `pg_stat_activity` montre les processus TimescaleDB |
+| 4 | Agrégats cohérents | `\i l07/controle-somme.sql` (ou le contrôle de cohérence de L10 E4) | comptes identiques aux quatre niveaux sur une journée pleine |
+| 5 | Journaux et archivage | `pg_stat_archiver`, nouvelle sauvegarde de base | après une promotion, l'ancienne sauvegarde (timeline 1) ne couvre plus l'instance : REPRENDRE une sauvegarde de base sur la timeline 2 avant de rendre le service |
+| 6 | Applicatif | une lecture et une écriture réelles (insertion puis suppression d'un point de test) | la séquence/les contraintes acceptent l'écriture ; le tableau de bord de L07 répond |
+
+À consigner avec : instant cible, LSN de début (backup_label) et d'arrêt
+(« redo done at »), timeline, durée totale, durée du rejeu, nom de la
+personne qui a validé chaque ligne.
+
+Le point 5 est celui que la fiche ne demande pas et qu'il faut ajouter en
+salle : une restauration à un instant donné consomme la sauvegarde. La
+suivante repart de zéro.
+
+-------------------------------------------------------------------------
+4. Erreurs fréquentes
+-------------------------------------------------------------------------
+- S'arrêter au count(*) : c'est le contrôle qui rassure, et le seul qui
+  ne détecte aucun des modes de défaillance de l'extension.
+- Chercher les matérialisations dans `hypertables` et conclure qu'elles
+  ont disparu : elles ne s'y affichent jamais.
+- Prendre `last_run_status = Success` pour « job replanifié » : la
+  colonne qui compte est `next_start` (leçon de L10).

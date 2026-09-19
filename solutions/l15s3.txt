@@ -1,0 +1,112 @@
+L15 — ÉTAPE 2 : LES DÉCLENCHER — ET LES VOIR RETOMBER
+======================================================
+
+Fiche : « Vérifier pour chacune : l'alerte se déclenche, elle se déclenche
+POUR LA BONNE RAISON (lire la valeur qui a franchi le seuil, pas
+seulement le voyant), elle retombe une fois la situation rétablie. »
+
+Protocole joué : provocation → 25 s (deux évaluations à 10 s) → lecture de
+l'état des règles par `GET /api/prometheus/grafana/api/v1/rules` ET de la
+valeur par la requête SQL du seuil → remise en état → 25 s → relecture.
+
+-------------------------------------------------------------------------
+A2 — job suspendu (provocation tenue 25 s, puis le script)
+-------------------------------------------------------------------------
+  SELECT alter_job(1003, scheduled => false);      -- job résolu par requête
+                   avant     pendant                   après
+  valeur SQL       0         1  (1003 : scheduled=f,   0
+                                 next_start gelé)
+  règle Grafana    inactive  firing (Alerting)         inactive
+  SELECT alter_job(1003, scheduled => true);
+
+Bonne raison : la ligne remontée est 1003 (`scheduled = f`, `next_start`
+= 21:41 figé) — pas un job « sans succès » : c'est la branche suspension
+de la règle, la valeur lue le dit. Retombée : immédiate à la
+réactivation (la condition NOT scheduled cesse ; la branche « dernier
+succès > 3 périodes » n'était pas atteinte en 25 s — sur une suspension
+longue, ELLE aussi retomberait seulement APRÈS un passage réussi, pas à
+la réactivation : c'est le piège « ne retombe pas » de la fiche, et il
+est normal).
+
+Le script corrigé fait la même chose en une seconde (trop vite pour
+Grafana, assez pour la valeur) :
+  ./l15/provoquer.sh --alerte A2
+  A2 · job suspendu puis réactivé : 1003
+  A2 · anomalies : avant=0 pendant=1 apres=0 (attendu 0/≥1/0)
+
+-------------------------------------------------------------------------
+A3 — flux muet (le script ; pas de remise en état par construction)
+-------------------------------------------------------------------------
+  ./l15/provoquer.sh --alerte A3      # couper-capteurs.sh --series 490 --depuis "30 minutes"
+  A3 · flux muets : avant=3 pendant=4 (attendu : pendant > avant)
+  règle Grafana : firing AVANT déjà (3 muets de L10), firing après (4).
+
+Bonne raison : la valeur passe de 3 à 4 et la 4ᵉ ligne est 490 avec
+30 min d'ancienneté (seuil 10 min = 60 × 10 s). Le voyant, lui, ne change
+pas : il était déjà rouge. C'est la démonstration involontaire la plus
+utile de l'atelier — UNE ALERTE PERMANENTE NE SIGNALE PLUS RIEN. Deux
+issues à écrire : (a) les trois capteurs de L10 sont une panne réelle à
+traiter (le remède est sur site), pas un bruit à filtrer ; (b) tant
+qu'ils ne le sont pas, l'alerte doit porter sur la VARIATION (nombre de
+muets > nombre acquitté) ou grouper par série (une notification par
+série, Grafana le fait si la requête retourne une ligne par série avec un
+label). Retombée : impossible ici — les points supprimés ne reviennent
+pas ; en production elle retombe au retour du flux. Note : l'action de
+L10 (seuil 1 h) ne voit pas 490 (30 min) — deux seuils, deux usages
+(alerte rapide / consignation).
+
+-------------------------------------------------------------------------
+A1 — zéro worker (provocation RÉELLE, avec remise en état vérifiée)
+-------------------------------------------------------------------------
+Le script ne fait que lire l'expression (3 workers actifs) : la
+provocation réelle est un double redémarrage, à faire sur l'instance du
+binôme, pas sur un poste partagé. Faite ici :
+  ALTER SYSTEM SET timescaledb.max_background_workers = 0;
+  docker compose restart timescaledb
+  SHOW timescaledb.max_background_workers;   → 0
+  SELECT count(*) FROM pg_stat_activity WHERE application_name LIKE 'TimescaleDB%';  → 0
+  journal : « TimescaleDB background worker is set to 0 » / « launcher
+  shutting down » / « Scheduler (PID 33) exited with exit code 1 »
+                   avant       pendant                  après
+  processus        3           0                        3
+  règle A1         inactive    firing (Alerting)        inactive
+  règle P3 (L14)   inactive    firing (réglage < 8)     inactive
+  jobs planifiés   9/9         9/9 (mais rien ne tourne) 9/9
+  ALTER SYSTEM RESET timescaledb.max_background_workers;
+  docker compose restart timescaledb   → 8, 3 processus, 9/9 jobs
+
+Bonne raison : la valeur est 0 (et non « 1 » comme en L14 avec un seul
+worker : à 0, le lanceur lui-même s'arrête). Retombée : au redémarrage
+corrigé, en deux évaluations. Pendant la coupure de connexion du
+redémarrage, la règle passe transitoirement en état Error (execErrState)
+— en production, cet état doit notifier aussi : une source injoignable
+est une panne.
+
+-------------------------------------------------------------------------
+A4 — espace (expression seulement)
+-------------------------------------------------------------------------
+  ./l15/provoquer.sh --alerte A4
+  10.4 % d'un volume de 200 Go (déclenche si > 85 %)
+  tendance : 2 relevés dans supervision_taille → pente NULL → jours NULL
+  règle : inactive (avant = pendant = après)
+
+Remplir un disque partagé est proscrit ; la vérification est celle de
+l'expression, plus un test de la branche tendance par insertion de
+relevés fictifs dans une COPIE de supervision_taille (deux lignes à
+24 h d'écart avec +30 Go → jours_restants ≈ 5 → 1). À faire en salle
+sur la copie, jamais sur la table alimentée par le job.
+
+-------------------------------------------------------------------------
+Formulation attendue
+-------------------------------------------------------------------------
+« A2 : valeur 0 → 1 (job 1003 suspendu) → 0. A3 : 3 → 4 (série 490,
+30 min) ; le voyant était déjà rouge : trois muets permanents. A1 : 3 → 0
+→ 3 processus, en double redémarrage. A4 : 10,4 %, tendance sans
+historique suffisant. Chaque valeur lue, chaque retombée constatée ou
+expliquée. »
+
+Erreurs fréquentes : lire le voyant sans la valeur (A3 aurait « marché »
+sans rien prouver) ; provoquer A2 par `CALL run_job()` d'une config
+fautive (l'erreur remonte au client, rien dans job_errors — L10) ;
+oublier de remettre en état (A1 à 0 worker laisse 9 jobs planifiés qui
+ne tourneront jamais, sans une erreur).

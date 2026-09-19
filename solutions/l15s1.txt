@@ -1,0 +1,116 @@
+L15 — ÉTAPE 0 : LE RÔLE DE SUPERVISION ET L'IMPORT DU TABLEAU DE BORD
+======================================================================
+
+Fiche : « La source de données est provisionnée sur le rôle
+mistral_supervision, qui n'existe pas encore. Le créer avec le strict
+nécessaire pour les huit requêtes de l15/metriques.sql — et rien de plus.
+Tant qu'il manque un droit, un panneau reste vide. »
+
+-------------------------------------------------------------------------
+1. Démarrer Grafana et constater le piège
+-------------------------------------------------------------------------
+  docker compose --profile outils up -d grafana
+  curl -s -u admin:mistral http://127.0.0.1:3000/api/health
+  curl -s -u admin:mistral \
+       http://127.0.0.1:3000/api/datasources/uid/mistral-supervision/health
+  → {"status":"ERROR", … "password authentication failed for user
+     \"mistral_supervision\""}
+
+Avant tout droit manquant, c'est la CONNEXION qui échoue : le rôle
+n'existe pas. Dans l'interface, tous les panneaux affichent une erreur de
+source, pas « no data » — c'est le premier diagnostic à faire (page de la
+source, bouton « Save & test »), avant de chercher un GRANT.
+
+-------------------------------------------------------------------------
+2. Le strict nécessaire, établi par l'essai (pas par réflexe)
+-------------------------------------------------------------------------
+Méthode attendue : créer le rôle NU, exécuter les huit métriques sous ce
+rôle, et n'accorder que ce qui manque. Résultat sur 2.29.2 / PG 17 :
+
+  CREATE ROLE mistral_supervision LOGIN PASSWORD 'supervision';
+  GRANT USAGE ON SCHEMA public TO mistral_supervision;
+  -- test sous le rôle : psql -U mistral_supervision -d mistral -f metriques.sql
+
+  rôle nu →  M1  ERROR permission denied for table mesures
+             M2  ERROR (mesures)
+             M3  ERROR permission denied for view mistral_1min
+             M4  OK   timescaledb_information.chunks
+             M5  OK   hypertable_compression_stats('mesures')
+             M6  OK   timescaledb_information.jobs + job_stats
+             M7  OK   pg_database_size(current_database())
+             M8  OK   pg_stat_database
+
+Cinq métriques sur huit répondent SANS AUCUN GRANT : les vues
+d'information de l'extension, les fonctions de taille et les statistiques
+de base sont lisibles par tout rôle connecté. Ce que le rôle doit recevoir
+tient en une ligne :
+
+  GRANT SELECT ON mesures, mistral_1min, mistral_1h, mistral_1j,
+                  affectation_capteur, signaux TO mistral_supervision;
+
+  rôle doté → les huit répondent (M1 2 954 pts/min ; M2 quatre familles à
+  0 s d'ancienneté ; M3 retards 50 s / 59 min 50 / 22 h 59 — le niveau
+  jour porte le fuseau de Paris, son « retard » apparent est structurel ;
+  M4 7 hypertables ; M5 ratio 16,1, part rowstore 0,33 ; M6 10 jobs ;
+  M7 22,4 Go ; M8 98,64 %).
+
+Ce qu'on N'accorde PAS, et pourquoi :
+- pas de GRANT sur les vues `_site` de L13 ni sur `alertes_qualite` : la
+  supervision mesure des débits, des retards et des comptes, elle ne lit
+  pas de valeurs métier (M1-M3 ne retournent que des comptes et des
+  horodatages — mais le GRANT SELECT sur mesures permettrait de lire les
+  valeurs : c'est le compromis à ÉCRIRE ; l'alternative stricte est une
+  vue par métrique, à laquelle seul le rôle a accès) ;
+- pas de INSERT/UPDATE nulle part, pas de BYPASSRLS, pas de superuser ;
+- `pg_read_all_stats` seulement si le tableau de bord (ou E1) lit
+  `pg_stat_statements` : sans ce rôle, la vue retourne les lignes mais
+  masque le texte des autres utilisateurs (« <insufficient privilege> »
+  sur 330 lignes sur 351 ici). Accordé pour E1, à retirer si E1 n'est
+  pas jouée :
+    GRANT pg_read_all_stats TO mistral_supervision;
+
+Vérification par bascule, comme en L13 : `SET ROLE mistral_supervision;`
+puis un INSERT sur mesures → permission denied ; un SELECT valeur → passe
+(c'est le compromis écrit ci-dessus).
+
+Santé de la source après : {"status":"OK","message":"Database Connection OK"}
+
+-------------------------------------------------------------------------
+3. Importer le tableau de bord (par l'API, sans cliquer)
+-------------------------------------------------------------------------
+Les panneaux du JSON portent `datasource: null` : ils prennent la source
+par défaut (isDefault: true dans datasources.yml) — c'est pour cela que
+l'import « demande » la source dans l'interface et qu'il ne la demande pas
+par l'API.
+
+  python3 - <<'EOF'
+  import json; d = json.load(open('l15/tableau-de-bord.json')); d.pop('id', None)
+  json.dump({"dashboard": d, "overwrite": True, "folderUid": ""}, open('/tmp/import.json', 'w'))
+  EOF
+  curl -s -u admin:mistral -H 'Content-Type: application/json' \
+       -X POST http://127.0.0.1:3000/api/dashboards/db -d @/tmp/import.json
+  → {"status":"success","uid":"mistral-supervision","version":1,
+     "url":"/d/mistral-supervision/mistral-e28094-supervision-timescaledb"}
+
+Preuve que les huit panneaux s'alimentent (ce que l'œil ferait dans
+l'interface) : POST /api/ds/query avec les huit `rawSql` des panneaux,
+format table → huit résultats status 200, 1/4/3/7/1/10/1/1 lignes.
+
+-------------------------------------------------------------------------
+4. Formulation attendue du participant
+-------------------------------------------------------------------------
+« Le rôle de supervision reçoit SELECT sur les six objets que M1-M3
+lisent ; les vues d'information et les statistiques n'exigent rien. Il
+n'écrit rien, ne contourne rien. Le premier "panneau vide" était la
+source entière : rôle absent, pas droit manquant. »
+
+-------------------------------------------------------------------------
+5. Erreurs fréquentes
+-------------------------------------------------------------------------
+- Réutiliser `mistral_lecture` (L13) pour Grafana : il ne voit qu'un site
+  (vues _site) et exige `mistral.site` en session → M1-M3 vides ou en
+  erreur, et la supervision devient cloisonnée, ce qui n'a pas de sens.
+- Accorder `pg_monitor` ou superuser « pour être tranquille » : c'est
+  l'anti-leçon de L13.
+- Oublier `affectation_capteur` et `signaux` : M2 tombe alors que M1
+  passe — un panneau vide sur huit, le plus difficile à repérer.

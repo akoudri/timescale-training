@@ -1,0 +1,157 @@
+L14 — ÉTAPE 2 : JOURNAL DE DIAGNOSTIC — INCIDENT 1 (le tableau de bord figé)
+==============================================================================
+
+Fiche : « Remplir l14/journal-modele.md, rubrique par rubrique. Hypothèses
+classées par probabilité ET par coût de vérification — la moins chère
+passe en premier. Une seule requête doit départager. Appliquer la
+correction, puis MESURER son effet. Écrire la requête qui aurait détecté
+l'incident trois jours plus tôt. »
+
+-------------------------------------------------------------------------
+1. Le journal attendu (l14/journal-incident-1.md)
+-------------------------------------------------------------------------
+SYMPTÔME (reformulé sans hypothèse)
+  Les valeurs du tableau de bord du site 2 n'évoluent plus depuis le
+  matin ; les autres écrans paraissent normaux (non vérifié). Périmètre
+  déclaré : site 2 ; périmètre réel : à établir. Depuis : quelques heures.
+
+HYPOTHÈSES, par coût de vérification croissant
+  1. Le rafraîchissement des agrégats ne tourne plus — UNE requête
+     catalogue (famille AUTOMATISATION), coût nul.
+  2. Le flux du site 2 est muet : plus de points bruts pour ces séries —
+     une requête de fraîcheur par site, quelques secondes (index de L05).
+  3. Le cloisonnement de L13 filtre plus que prévu (vue _site, valeur de
+     mistral.site) — rejouer la requête de l'écran sous un autre rôle.
+  L'ordre n'est pas l'ordre de probabilité : l'hypothèse 2 est aussi
+  plausible que la 1, mais la 1 coûte une lecture de catalogue.
+
+REQUÊTE DE VÉRIFICATION (une seule a départagé)
+  Famille : AUTOMATISATION — fichier l15/diagnostic/automatisation.sql.
+  Résultat discriminant, sur ce poste :
+
+   job_id | proc_name                           | scheduled | next_start                 | last_run_status | last_successful_finish     | total_failures
+   1003   | policy_refresh_continuous_aggregate | f         | 2026-09-14 19:18:46+00     | Success         | 2026-09-14 19:17:46+00     | 0
+   (les neuf autres jobs : scheduled = t, next_start dans le futur)
+
+   job_errors : trois lignes anciennes du job 1008 (provocation de L10),
+   RIEN sur 1003.
+
+   fraîcheur :  mistral_1min  dernier seau 2026-10-29 21:59:00
+                mistral_1h    dernier seau 2026-10-29 21:00:00
+                brut (réf.)   max(ts)      2026-10-29 22:59:50   ← 1 h de retard
+
+  Trois signes concordants sur UNE requête : `scheduled = f`, un
+  `next_start` gelé trois jours dans le passé, un dernier succès vieux de
+  trois jours — et `last_run_status = Success`, `total_failures = 0`,
+  aucune erreur nulle part. C'est le piège central : UN JOB SUSPENDU
+  N'ÉCHOUE PAS, IL DISPARAÎT. Quelqu'un qui filtre job_errors ou
+  last_run_status ne voit rien. La discrimination se fait sur
+  `scheduled` et `next_start`. La vue job_stats le dit aussi à sa façon :
+  `job_status = Paused`, `next_start` NULL.
+
+  Les hypothèses 2 et 3 tombent sans autre requête : le retard de
+  fraîcheur est global (le niveau minute est figé pour TOUS les sites),
+  et le brut, lui, avance. Par acquit, la fraîcheur par site (index de
+  L05 + jointure référentiel) le confirme en une requête :
+
+   site_id | dernier_point_brut     | dernier_seau_1min      | series
+   1       | 2026-10-29 21:59:50+00 | 2026-10-29 21:59:00+00 | 149
+   2       | 2026-10-29 22:59:50+00 | 2026-10-29 21:59:00+00 | 179   ← seul site avec des points « du matin »
+   3       | 2026-10-29 21:59:50+00 | 2026-10-29 21:59:00+00 | 110
+   4       | 2026-10-29 21:59:50+00 | 2026-10-29 21:59:00+00 | 49
+
+  (149/179/49 et non 150/180/50 : les capteurs 137, 208 et 451 coupés en
+  L10 n'ont pas de point dans la dernière heure — c'est un AUTRE fait,
+  connu, documenté dans alertes_qualite, à ne pas mélanger avec
+  l'incident.) Le ticket dit « site 2 » parce que le site 2 est le seul
+  où de nouvelles données sont arrivées ce matin : ailleurs, rien n'est
+  arrivé, donc rien n'aurait dû bouger — l'utilisateur ne pouvait pas le
+  voir. Le périmètre réel de l'incident est la pyramide entière.
+
+CAUSE RACINE
+  Le job de rafraîchissement du niveau minute (1003, mistral_1min) est
+  suspendu (`alter_job(…, scheduled => false)`) depuis trois jours. Les
+  niveaux heure et jour dépendent de lui (ils se calculent SUR
+  mistral_1min, L07) : ils tournent, avec succès, sur un niveau minute
+  figé — un « Success » qui ne matérialise rien de neuf. Qui l'a suspendu
+  et pourquoi n'est pas dans la base : c'est une question d'organisation
+  (un `alter_job` passé « pour un test » et oublié — piège de L10).
+
+CORRECTION, et effet mesuré
+   SELECT alter_job(1003, scheduled => true);
+   → scheduled = t ; `next_start` reste à la date gelée (14/09, dans le
+     passé) : l'ordonnanceur exécute donc le job dans la minute qui suit
+     (mesuré : total_runs 92 → 94 en deux minutes, next_start replanifié
+     à +1 min, last_successful_finish à l'instant).
+   CALL run_job(1003);        -- 12 ms
+   → aucun effet sur la fraîcheur : max(seau) reste à 21:59. La politique
+     rafraîchit une fenêtre RELATIVE À now() (start_offset 30 min) ; sur un
+     jeu daté, cette fenêtre ne contient pas le 29/10. Le run_job « de
+     rattrapage » de la référence ne vaut que si la fenêtre de la
+     politique couvre les points en retard — en production, un retard de
+     trois jours dépasse aussi le start_offset de 30 min : même conclusion.
+   CALL refresh_continuous_aggregate('mistral_1min', '2026-10-29 21:00+00', '2026-10-30 00:00+00');  -- 376 ms
+   → max(seau) 1min = 22:59 : le niveau minute est à jour.
+   → mistral_1h reste à 21:00 : la propagation n'est PAS automatique
+     (leçon de L07 étape 5) — puis, borné, niveau par niveau :
+   CALL refresh_continuous_aggregate('mistral_1h', '2026-10-29 20:00+00', '2026-10-30 01:00+00');  -- 30 ms
+   CALL refresh_continuous_aggregate('mistral_1j', '2026-10-28 23:00+00', '2026-10-30 23:00+00');  -- 33 ms
+   → 1h à 22:00 ; 1j inchangé (le seau du 29/10 Paris couvre déjà 22:00-
+     22:59 UTC, il est recalculé, pas ajouté).
+  Effet sur le symptôme : le tableau de bord du site 2 affiche l'heure
+  « du matin » ; délai de correction ≈ 1 s de requêtes, une fois la cause
+  trouvée. Le rafraîchissement automatique repart à la minute suivante.
+
+PRÉVENTION (la requête qui aurait détecté l'incident trois jours plus tôt)
+  Un job suspendu, ou sans succès depuis plus de 3 × sa période, parmi
+  les jobs déjà exécutés au moins une fois — voir l14s4 (P1). Sur cet
+  incident elle retourne « 1003 SUSPENDU depuis 3 days » avant correction,
+  et RIEN après. Elle devient l'alerte A2 de L15.
+
+-------------------------------------------------------------------------
+2. Ce qu'il faut faire comprendre
+-------------------------------------------------------------------------
+- `last_run_status` répond à la question « la dernière exécution
+  a-t-elle réussi ? ». Un job suspendu a réussi sa dernière exécution —
+  il y a trois jours. La question utile est « ce job est-il encore dans
+  l'ordonnanceur, et quand passe-t-il ? » : `scheduled`, `next_start`.
+- L'ancienneté du dernier succès se compare à la PÉRIODE du job (3 ×
+  schedule_interval), jamais à une durée absolue : 3 jours sans succès
+  est catastrophique pour un job à la minute, normal pour la rétention
+  quotidienne.
+- Un incident sur le niveau bas de la pyramide se voit aussi aux niveaux
+  hauts, mais eux affichent « Success » : le diagnostic remonte toujours
+  à la source du niveau qui ne bouge plus (L07 : « chacun défini au-dessus
+  du précédent »).
+- La correction ne se limite pas à `scheduled => true` : il faut
+  RATTRAPER la fenêtre manquée, bornée, niveau par niveau, puis vérifier
+  la fraîcheur — sinon le trou reste (la politique ne remonte pas au-delà
+  de son start_offset).
+
+-------------------------------------------------------------------------
+3. Sur ce poste : l'érosion de septembre n'est PAS l'incident
+-------------------------------------------------------------------------
+Depuis L09, la politique 1003 (fenêtre relative à now() = 17/09, dans la
+zone purgée par la rétention) matérialise du vide et ÉRODE mistral_1min
+puis mistral_1h sur 14-24 septembre (documenté l9s0 §5). Pendant
+l'incident 1, cette érosion s'ARRÊTE (le job est suspendu) ; elle reprend
+à la correction. Un binôme qui compare count(*) de mistral_1min avant et
+après pourrait conclure à l'envers. Le fait discriminant reste le
+catalogue des jobs, pas le volume de l'agrégat. À signaler en restitution
+si un binôme tombe dessus ; sinon, ne pas l'évoquer.
+
+-------------------------------------------------------------------------
+4. Erreurs fréquentes
+-------------------------------------------------------------------------
+- Chercher dans job_errors, ne rien trouver, conclure « les jobs vont
+  bien » : c'est le contraire, l'absence d'erreur est le symptôme.
+- Diagnostiquer « le collecteur du site 2 » parce que le ticket dit
+  « site 2 » : la requête de fraîcheur par site montre que le brut du
+  site 2 est le plus FRAIS des quatre.
+- Corriger par `run_job` et déclarer le problème réglé sans vérifier
+  max(seau) : la fenêtre n'a pas été rattrapée.
+- Rattraper le niveau minute et oublier 1h/1j : le tableau de bord
+  horaire reste figé, second ticket dans l'heure.
+- « On a remis le job en marche et ça va mieux » sans écrire pourquoi il
+  était arrêté : la cause racine (un alter_job humain) reste inconnue, et
+  se reproduira.

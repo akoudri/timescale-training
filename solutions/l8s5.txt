@@ -1,0 +1,92 @@
+L08 — ÉTAPE 5 : LA CARDINALITÉ, EN CHIFFRES
+===========================================
+
+Fiche : « Basculer mesures_hc avec segmentby = 'series_id'. Comparer au
+ratio de cmp_serie, obtenu avec la même configuration. L'écart doit
+être expliqué et chiffré, pas constaté. »
+
+-------------------------------------------------------------------------
+1. Commandes attendues
+-------------------------------------------------------------------------
+  ALTER TABLE mesures_hc SET (timescaledb.compress,
+    timescaledb.compress_segmentby = 'series_id',
+    timescaledb.compress_orderby   = 'ts DESC');
+  SELECT compress_chunk(c) FROM show_chunks('mesures_hc') AS c;   -- 3,8 s
+  \set table mesures_hc
+  \i l08/ratios.sql
+
+  -- lignes par segment et par chunk : un chunk PLEIN de chaque
+  SELECT 'cmp_serie', count(*) / count(DISTINCT series_id)
+  FROM cmp_serie  WHERE ts >= '2026-09-25T00:00:00Z' AND ts < '2026-09-26T00:00:00Z'
+  UNION ALL
+  SELECT 'mesures_hc', count(*) / count(DISTINCT series_id)
+  FROM mesures_hc WHERE ts >= '2026-10-23T00:00:00Z' AND ts < '2026-10-24T00:00:00Z';
+
+Le « jour 1 » de mesures_hc n'est PAS son premier chunk : le chunk du
+22/10 ne contient que 2 h (160 000 lignes). Prendre le 23/10.
+
+-------------------------------------------------------------------------
+2. Résultats du poste
+-------------------------------------------------------------------------
+  mesures_hc : 775 Mo → 139 Mo, ratio ×5,6 (référence ×5,6)
+    par chunk : 111 Mo → 19 Mo (×5,9) sur les six chunks pleins ;
+    102 → 18 Mo (×5,5) sur le dernier ; 9,7 → 8,0 Mo (×1,2 !) sur le
+    chunk partiel du 22/10 (8 lignes par segment).
+
+                              cmp_serie (25/09)   mesures_hc (23/10)
+  lignes dans le chunk          4 229 606           1 920 000
+  séries                        490                 20 000
+  lignes / segment / chunk      8 631               96
+  lots dans le chunk compressé  4 405               20 000
+  lignes par lot (moyenne)      960                 96
+  octets compressés / ligne     6,49                10,28
+  dont ts                       0,06                0,64
+  dont valeur                   4,86                7,56
+
+-------------------------------------------------------------------------
+3. L'explication en trois phrases (ce que la fiche attend)
+-------------------------------------------------------------------------
+Un lot est l'unité de compression : jusqu'à 1 000 lignes d'un même
+segment (timescaledb.compression_batch_size_limit = 1000), triées par
+orderby, chaque colonne compressée à part avec ses métadonnées (compte,
+min/max de ts, valeur du segment, en-tête de tuple : ~40 octets fixes
+par lot, plus les amorces de chaque algorithme).
+
+Quand un segment remplit plusieurs lots (cmp_serie : 8 631 lignes → 9
+lots de ~960), ce coût fixe s'amortit sur mille valeurs et les
+algorithmes ont de la matière : delta-delta voit mille pas de 10 s
+(0,06 octet par horodatage), Gorilla voit mille flottants voisins.
+
+Quand un segment ne remplit pas un lot (mesures_hc : 96 lignes → 1 lot
+de 96, 20 000 lots par chunk), tout est dix fois moins amorti : ts
+coûte ×10 (0,64 o), valeur ×1,6 (7,56 o), et les métadonnées de lot
+pèsent proportionnellement dix fois plus. Le ratio passe de ×9,3 à
+×5,6 — divisé par 1,7 à configuration identique. Le chunk partiel
+(8 lignes par segment) le montre à l'extrême : ×1,2, presque rien.
+
+Formulation attendue : « le ratio ne dépend pas de la cardinalité en
+soi mais du nombre de lignes par segment ET PAR CHUNK ; à 20 000
+séries, il faudrait des chunks de 10 jours (960 lignes/segment) pour
+retrouver des lots pleins — et c'est un choix d'intervalle de chunk
+(M04), pas de compression. »
+
+-------------------------------------------------------------------------
+4. Le lien avec les autres modules
+-------------------------------------------------------------------------
+- M04 (intervalle de chunk) : sur un jeu à forte cardinalité, chunk
+  plus large = lots plus pleins = meilleur ratio, au prix d'un chunk
+  actif plus gros.
+- M15 : mesures_hc reste dans l'état ; A3 (flux muet) la retrouvera.
+- Le support annonce « ÷4 » pour le mauvais segmentby : sur ce jeu c'est
+  ÷2 (aucun) et ÷1,7 (cardinalité) — ordre de grandeur, pas constante.
+
+-------------------------------------------------------------------------
+5. Erreurs fréquentes
+-------------------------------------------------------------------------
+- Chercher une erreur de configuration : il n'y en a pas, la
+  configuration est celle de cmp_serie (vérifier compression_settings).
+- Mesurer les lignes par segment sur le chunk partiel du 22/10 (8) ou
+  sur toute la table (672 = 96 × 7) : c'est PAR CHUNK que le lot se
+  remplit.
+- Confondre « lignes par lot » et « lots par segment » : à 96 lignes
+  par segment, 1 lot par segment et il est vide aux neuf dixièmes.

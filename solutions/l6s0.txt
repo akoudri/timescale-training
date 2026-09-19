@@ -1,0 +1,72 @@
+L06 — TROIS INDICATEURS MISTRAL — PROTOCOLE COMMUN (corrigé formateur)
+=======================================================================
+
+Fichiers : l6s1 (indicateur 1, production pondérée, + E1/E4), l6s2
+(indicateur 2, disponibilité), l6s3 (indicateur 3, p95 vent, + E2/E3).
+
+-------------------------------------------------------------------------
+1. Ce que l'atelier vérifie
+-------------------------------------------------------------------------
+Trois grandeurs qui ne s'agrègent pas comme une somme :
+  1. une moyenne sur un pas IRRÉGULIER (la moyenne arithmétique pondère
+     par le nombre de points, pas par le temps) ;
+  2. un taux dont le DÉNOMINATEUR n'est pas la fenêtre (une absence
+     d'information n'est pas un état) ;
+  3. un percentile, qui n'existe pas « par morceaux » (le p95 de deux
+     heures n'est pas la moyenne des deux p95) — d'où un ÉTAT
+     intermédiaire réagrégeable (percentile_agg) au prix d'une
+     approximation à borner.
+La règle qui en sort (bloc 7.2) : dans une hiérarchie d'agrégats, le
+niveau bas stocke des ÉTATS (somme + compte, time_weight, state_agg,
+percentile_agg), jamais des moyennes, des taux ni des percentiles.
+M08 en fait une décision d'architecture.
+
+-------------------------------------------------------------------------
+2. Préalables sur ce poste
+-------------------------------------------------------------------------
+- Toolkit 1.25.0 présent dans `mistral` (vérifié : time_weight,
+  average, state_agg, duration_in, percentile_agg, approx_percentile,
+  rollup, lttb, interpolated_average existent).
+- Index (series_id, ts DESC) : objet de L05 étape R5, doit être en place
+  (état mistral-M06). Sans lui l'indicateur 3 (filtre sur 42 séries)
+  balaye 190 M de lignes.
+- Bornes : `\i l05/bornes.sql` en session psql (:debut, :fin,
+  :serie_vent). Pas de mesure.sh en L06 : on ne mesure pas des durées,
+  on chiffre des ÉCARTS.
+- `evenements` : hypertable (8 chunks, 0,7 M lignes), colonnes
+  (ts, machine_id, type, code, attributs jsonb). Quatre types : alarme
+  (696 524), changement_etat (2 319), arret (997, durée dans attributs),
+  maintenance (141). L'état vit dans `attributs->>'etat'` des lignes de
+  type changement_etat, valeurs : production (1 181), arret (997),
+  maintenance (141). Aucun NULL.
+- Les trois arrêts de maintenance (contrainte 6.2 du générateur,
+  `l06/machines-avec-arret.sql`) : machine 15 (site 1) du 3 au 4 octobre,
+  28 (site 2) du 7 au 8, 42 (site 3) du 11 au 12 ; ≈ 43-45 h chacun, pas
+  d'échantillonnage à 3 600 s pendant l'arrêt.
+
+Coût : chaque requête sur `mesures_production` sans filtre parcourt
+190 M de lignes (40 s et plus, cf. R2 de L05). Restreindre l'indicateur 1
+aux trois machines et à octobre pour l'itération, puis lancer une fois
+sur le parc pour le critère « résultat cohérent sur l'ensemble ».
+
+-------------------------------------------------------------------------
+3. Mesures de référence (env. 2 vCPU / 8 Go, Toolkit 1.25)
+-------------------------------------------------------------------------
+Indicateur 1 (octobre, kW) :
+  machine   naïve    pondérée   écart
+  15        702,3    659,8      +6,4 %
+  28        865,6    812,5      +6,5 %
+  42        561,0    525,8      +6,7 %
+Indicateur 2 : 98,0 à 99,8 % selon machine, jamais > 100 %.
+Indicateur 3 (p95 vent, approché / exact, m/s) :
+  site 1 : 11,94 / 11,83 (0,97 %) · site 2 : 11,94 / 11,95 (0,09 %) ·
+  site 3 : 11,56 / 11,52 (0,37 %).
+Même générateur, même graine : les valeurs du poste devraient être
+identiques. Mesures du poste de l'utilisateur : à reporter.
+
+-------------------------------------------------------------------------
+4. État de sortie mistral-M07
+-------------------------------------------------------------------------
+Aucun objet persistant : l'état M07 diffère de M06 par trois fichiers
+dans `l06/indicateurs/` et une section de mesures.md. C'est le seul
+module de la chaîne dans ce cas (NOTES-PRODUCTION).

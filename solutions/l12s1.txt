@@ -1,0 +1,87 @@
+L12 — ÉTAPE 1 : SAUVEGARDE DE BASE ET ARCHIVAGE
+=================================================
+
+Fiche : « Vérifier que l'archivage fonctionne réellement — un archivage
+configuré mais en échec est le mode de défaillance le plus courant. »
+
+-------------------------------------------------------------------------
+1. Ce que fait l12/activer-archivage.sh, et pourquoi un redémarrage
+-------------------------------------------------------------------------
+  ALTER SYSTEM SET archive_mode = on;
+  ALTER SYSTEM SET archive_command =
+    'test ! -f /archives/wal/%f && cp %p /archives/wal/%f';
+  docker compose restart timescaledb
+
+- `archive_mode` ne se change qu'au redémarrage (comme
+  shared_preload_libraries en L01) ; `archive_command` se recharge à
+  chaud, mais sans archive_mode elle ne sert à rien.
+- La commande refuse d'écraser un segment déjà archivé (`test ! -f`) :
+  c'est la règle de PostgreSQL — un archive_command qui écrase peut
+  détruire l'unique copie d'un segment. Le retour non nul fait retenir le
+  segment dans pg_wal et compte un échec.
+- `/archives` est le répertoire `atelier/archives/` de l'hôte, monté
+  dans le conteneur (compose). Il doit appartenir à l'uid 1000 : c'est
+  le piège « répertoire non inscriptible » de la fiche, réglé par le
+  parcours amont qui le crée au nom du participant.
+
+Sur le poste : 4,3 s, redémarrage compris ; les 8 jobs repartent (3
+processus TimescaleDB, 8/8 planifiés).
+
+-------------------------------------------------------------------------
+2. Vérifier que l'archivage FONCTIONNE
+-------------------------------------------------------------------------
+  SELECT archived_count, last_archived_wal, last_archived_time,
+         failed_count, last_failed_wal, last_failed_time
+  FROM   pg_stat_archiver;
+  → archived=1, last=00000001000000A90000008A, failed=0
+
+Puis forcer un segment : `SELECT pg_switch_wal();`
+
+Subtilité vécue : le premier `pg_switch_wal()` a retourné A9/8B000000 et
+n'a rien archivé de plus. Le script venait de faire un switch et RIEN
+n'avait été écrit depuis : PostgreSQL ne bascule pas un segment vide, il
+retourne la position courante. Il faut une écriture réelle entre deux
+switch pour voir `archived_count` monter. Le formulaire attendu du
+participant : « failed_count = 0 ET last_archived_time récent ET un
+segment de plus après un switch précédé d'une écriture ».
+
+Le mode de défaillance à faire nommer : `failed_count` > 0 ne bloque
+rien côté applicatif — l'instance continue, pg_wal grossit lentement, et
+la restauration à un instant donné est impossible sans qu'on le sache.
+On le découvre le jour où on en a besoin. D'où : la vérification appartient
+à la mise en service de l'archivage, et à la supervision (M15 : une alerte
+sur failed_count et sur l'âge de last_archived_time).
+
+-------------------------------------------------------------------------
+3. La sauvegarde de base, chronométrée
+-------------------------------------------------------------------------
+  time ./l12/sauvegarde-base.sh
+  → pg_basebackup -U postgres -D /archives/base -Fp -Xs -c fast
+
+- `-Fp` format plain : une copie de PGDATA directement utilisable par
+  `mv`/`cp` (restaurer.sh en dépend) ; `-Xs` : les journaux produits
+  PENDANT la sauvegarde sont reçus en flux dans pg_wal de la copie ;
+  `-c fast` : checkpoint immédiat plutôt qu'étalé, on ne veut pas attendre.
+- backup_label de la copie : START WAL LOCATION A9/8C000028 (segment
+  …8C), START TIME 18:49:59 UTC, timeline 1. C'est le point de départ du
+  rejeu ; tout segment antérieur est inutile, tout segment postérieur
+  jusqu'à l'instant cible est indispensable.
+
+Poste : 36,9 s pour 21 Go (référence 33,6 s / 17 Go). Le débit (≈ 570
+Mo/s) est celui d'un NVMe local ; la durée est proportionnelle au volume
+— y compris `mesures_avant`, 12 Go hors kit que le participant a laissés :
+on sauvegarde aussi ce qu'on a oublié de nettoyer, et on le paiera à la
+restauration (copie de 21 Go).
+
+-------------------------------------------------------------------------
+4. Erreurs fréquentes
+-------------------------------------------------------------------------
+- Lire `SHOW archive_mode` = on et conclure que l'archivage marche :
+  seul pg_stat_archiver le dit.
+- Vérifier l'archivage APRÈS la sauvegarde : si le premier segment
+  postérieur au START WAL n'est pas archivé, la sauvegarde ne sert à
+  rien. L'ordre de la fiche (vérifier, puis sauvegarder) n'est pas
+  décoratif.
+- Lancer pg_basebackup depuis l'hôte vers un répertoire de l'hôte : le
+  script le lance DANS le conteneur, vers /archives ; les chemins de
+  restore_command sont ceux du conteneur.

@@ -1,0 +1,88 @@
+L07 — PYRAMIDE D'AGRÉGATS MISTRAL — PROTOCOLE COMMUN (corrigé formateur)
+=========================================================================
+
+Fichiers : l7s1 (étape 1, niveau minute), l7s2 (étape 2, niveaux heure
+et jour + contrôle de somme), l7s3 (étape 3, politiques), l7s4 (étape 4,
+gain du tableau de bord + E1/E2), l7s5 (étape 5, donnée tardive + E3/E4).
+
+-------------------------------------------------------------------------
+1. Ce que l'atelier vérifie
+-------------------------------------------------------------------------
+Deux choses, et l'une conditionne l'autre :
+  a) le niveau bas ne stocke que des grandeurs RÉAGRÉGEABLES (somme,
+     compte, max) — jamais une moyenne ; une erreur ici est plausible à
+     l'œil et ne se voit qu'au contrôle de somme ;
+  b) une donnée tardive ne « remonte » pas seule : le rafraîchissement
+     est borné par fenêtre, niveau par niveau, et la procédure de
+     propagation manuelle est le livrable réel.
+
+-------------------------------------------------------------------------
+2. État du poste vérifié le 17/09/2026 (avant L07)
+-------------------------------------------------------------------------
+- TimescaleDB 2.29.2, 8 workers d'arrière-plan, lanceur + 2 ordonnanceurs
+  actifs (la requête des prérequis retourne 3 lignes).
+- Aucun agrégat continu : les trois vues sont à créer.
+- `mesures` : 8 chunks de 7 j (10/09 → 05/11 en bornes de chunk), aucun
+  compressé. ATTENTION : `mesures` porte DÉJÀ une politique columnstore
+  (job 1000, compress_after 7 jours, sans segmentby ni orderby), de même
+  que `mesures_charge` (job 1001). Elle vient de la création par
+  `CREATE TABLE … WITH (tsdb.hypertable)` (2.29 ajoute la politique par
+  défaut ; `l04/creer-charge.sql` le fait explicitement). Elle est
+  inerte aujourd'hui (le premier chunk, borne 17/09, ne sera « plus vieux
+  que 7 jours » qu'à partir du 24/09/2026) mais compressera alors un
+  chunk par semaine, avec des réglages par défaut, AVANT que L08 ne
+  tranche segmentby/orderby. À décider avant L08, pas pendant :
+  `SELECT remove_columnstore_policy('mesures');` puis reposer la politique
+  tranchée en L08 étape 5 — comme le fait la chaîne de reprise M09.
+  Sans effet sur L07.
+- Section « M05 — retard d'arrivée » de mesures.md : VIDE sur ce poste
+  (les mesures existent : p50 2,2 s · p95 1 min 56 · p99 13 min 20 · pire
+  cas 39 min 04, relevées le 16/09). La remplir avant l'étape 3 : c'est
+  le prérequis de la justification du start_offset.
+- Bornes du jeu : max(ts) = 29/10 21:59:50 UTC. J-3 (jour de Paris) =
+  26 octobre 2026, soit [25/10 23:00, 26/10 23:00[ UTC ; fenêtre de
+  rattrapage de l'étape 5 : max(ts) − 4 j → max(ts) − 2 j = [25/10
+  21:59:50, 27/10 21:59:50] UTC, qui la couvre.
+- Fuseau de session Etc/UTC : les seaux minute et heure sont UTC (sans
+  incidence : heures entières), le seau jour porte Europe/Paris.
+
+-------------------------------------------------------------------------
+3. Corrections du kit apprenant faites le 17/09 (à connaître)
+-------------------------------------------------------------------------
+- `l07/controle-somme.sql` comparait brut / 1min / 1h sur un jour UTC :
+  le niveau jour (Europe/Paris) n'était PAS contrôlé, alors que la fiche
+  exige « les trois niveaux » et que l'étape 5 rafraîchit `mistral_1j`
+  sans jamais le vérifier. Le contrôle porte maintenant sur le jour civil
+  de Paris et comprend quatre lignes : brut, 1min, 1h, 1j.
+- `l07/injecter-tardif.sh` injecte sur le même jour de Paris (sinon 4 %
+  des points tombaient sur J-2 au sens du contrôle).
+- Étape 4 : `mesure.sh` n'a pas d'option `--source`. Le participant
+  écrit `l07/tableau-de-bord-pyramide.sql` (c'est l'exercice : brancher
+  chaque requête sur le bon niveau) et mesure les deux fichiers avec
+  `--bornes complet`. Q4 du fichier brut porte le fuseau Europe/Paris,
+  comme Q2, pour que les deux versions retournent les mêmes lignes.
+
+-------------------------------------------------------------------------
+4. Mesures de référence (env. 2 vCPU / 8 Go, NVMe)
+-------------------------------------------------------------------------
+Matérialisation initiale : 1min 4 min 07 (31 660 833 lignes) · 1h 17,8 s
+(529 024) · 1j 0,6 s (22 050).
+Politiques : 1min 30 min / 1 min / 1 min · 1h 4 h / 5 min / 10 min ·
+1j 3 j / 1 h / 1 h.
+Tableau de bord : brut 26 099 ms → pyramide 109 ms (× 239).
+Contrôle de somme J-3 : comptes identiques (4 332 865 points sur le jour
+UTC de la référence ; le jour de Paris donne un autre compte, du même
+ordre) ; sommes flottantes égales à ~10⁻¹³ relatif.
+Donnée tardive : 100 000 points ; rien ne bouge avant rattrapage ;
+refresh borné 1min → 1min à jour, 1h/1j inchangés ; run_job forcé du 1h
+ne rattrape pas ; propagation manuelle 1h puis 1j → écart nul partout.
+Mesures du poste de l'utilisateur : à reporter.
+
+-------------------------------------------------------------------------
+5. État de sortie mistral-M08
+-------------------------------------------------------------------------
+Trois agrégats continus (mistral_1min, mistral_1h, mistral_1j), trois
+politiques (jobs « Refresh Continuous Aggregate Policy »), les 100 000
+points tardifs (qualite = 2) rattrapés aux trois niveaux. L'index de L05
+toujours en place. Volume ajouté : ≈ 4 Go pour le niveau minute (non
+compressé — sujet de L08 E2 et de M10).

@@ -1,0 +1,126 @@
+L09 — CHAÎNE COMPLÈTE — PROTOCOLE COMMUN (corrigé formateur)
+==============================================================
+
+Fichiers : l9s1 (étape 1, appliquer la chaîne), l9s2 (étape 2, état des
+chunks et granularité), l9s3 (étape 3, cohérence des fenêtres — et le
+piège des deux horloges), l9s4 (étape 4, économie sur les deux échelles
++ politiques.sql attendu), l9s5 (extensions E1-E4).
+
+-------------------------------------------------------------------------
+1. Ce que l'atelier vérifie
+-------------------------------------------------------------------------
+Trois choses, et la troisième est la seule qui fasse mal :
+  a) une politique relative à now() sur un jeu daté s'exécute, réussit et
+     ne fait RIEN : l'effet s'obtient à borne explicite (compress_chunk /
+     drop_chunks sur show_chunks(older_than => max(ts) − n)) ;
+  b) la rétention ne supprime que des chunks ENTIERS : avec des chunks de
+     7 j (M04), la frontière « 30 jours » est nette à ± 7 j — c'est une
+     conséquence d'une décision antérieure, pas un défaut ;
+  c) rétention et rafraîchissement ne sont cohérents que si leurs fenêtres
+     se comparent SUR LA MÊME HORLOGE : le contrôle de l'étape 3 (30 j >
+     3 j) passe, et pourtant l'agrégat s'est vidé sur ce poste — parce
+     que la rétention a été appliquée relativement à max(ts) (29/10) et
+     que les rafraîchissements tournent relativement à now() (17/09),
+     42 jours plus tôt, en plein dans la zone purgée. Voir l9s3.
+
+-------------------------------------------------------------------------
+2. État du poste vérifié le 17/09/2026 (avant L09)
+-------------------------------------------------------------------------
+- Sortie de L08 : `mesures` 190 058 049 lignes, 8 chunks de 7 j, 0
+  compressé, 18 Go (heap 1,7 Go + index 1,2 Go par chunk plein : deux
+  index, ts seul + série/ts), compression configurée series_id / ts DESC,
+  politique job 1006 (7 j, planifiée 12 h). Pyramide : 1min 4 074 Mo
+  (31 660 848 lignes), 1h 63 Mo (529 026), 1j 2,8 Mo (22 050), jobs
+  1003-1005. Base : 35 Go ; disque : 114 Go libres.
+- max(ts) = 29/10 21:59:50 UTC → bornes d'atelier : bascule 27/10
+  21:59:50, rétention 29/09 21:59:50.
+- `mesures_avant` (hypertable de l'utilisateur, 190 M lignes, job 1000)
+  et `mesures_charge` (vide, job 1001) : non touchées.
+- **La date de la séance (17/09/2026) est DANS la fenêtre du jeu (15/09 →
+  30/10)**. Conséquence développée en l9s3 : après la purge des chunks
+  10/09 → 24/09, les politiques de rafraîchissement (fenêtres [now − 30
+  min], [now − 4 h], [now − 3 j]) recalculent une zone sans donnée brute
+  et VIDENT mistral_1min à raison de 490 lignes par minute (mesuré :
+  31 660 848 → 31 645 658 → 31 644 188 en quelques minutes ; 15 190 =
+  31 × 490). La référence formateur, jouée avant le 15/09, n'a pas vu ce
+  phénomène. Il est documenté, pas corrigé (voir §5 et NOTES-PRODUCTION).
+
+-------------------------------------------------------------------------
+3. Corrections du kit apprenant faites le 17/09 (à connaître)
+-------------------------------------------------------------------------
+- Fiche, étape 1 : la phrase « vérifier que la bascule de M09 est bien
+  réglée sur 2 jours plutôt que 7 » contredisait L08 (délai tranché et
+  justifié : 7 j) et la référence (politique laissée à 7 j, effet
+  d'atelier par compress_chunk borné à 2 j). Reformulée : la politique
+  (7 j) est une valeur de production et ne bouge pas ; les 2 jours sont
+  la borne explicite appliquée à la main, étiquetée ATELIER.
+- `l09/coherence-fenetres.sql` : les trois politiques de rafraîchissement
+  sortaient toutes sous l'étiquette « rafraîchissement 1min ». Jointure
+  ajoutée sur continuous_aggregates (mat_hypertable_id) : l'étiquette
+  porte maintenant le nom de la vue. Le verdict était juste.
+- `etat-chunks.sql`, `economie.sql` : fonctionnent tels quels. Piège à
+  connaître : pg_total_relation_size() d'un chunk basculé affiche 16 ko
+  (les données vivent dans le chunk interne compress_hyper_*) ;
+  utiliser chunk_compression_stats() ou hypertable_detailed_size().
+
+-------------------------------------------------------------------------
+4. Mesures de référence (env. 2 vCPU / 8 Go, NVMe) et mesures du poste
+-------------------------------------------------------------------------
+                                référence         poste (17/09)
+  bascule bornée (6 chunks, 15,2 Go)   —          53,1 s, 864 Mo de WAL
+  rétention bornée (2 chunks)          —          19 ms, 140 ko de WAL
+  chunks < 2 j (rowstore)             2           2 (22-29/10, 29/10-05/11)
+  chunks 2-30 j (columnstore)         4           4 (24/09 → 22/10)
+  chunks > 30 j (supprimés)           2           2 (10/09 → 24/09)
+  ratio par chunk (total, 2 index)    —           ×16,1 ; heap seul ×9,6
+  mesures après chaîne          3 981 Mo          3 981 Mo (heap 1 951 +
+                                                  index 1 341 + toast 689)
+  mistral_1h                  529 025 lignes      529 026, 14/09 22:00 →
+                              14/09 → 29/10       29/10 21:00 ; min(seau)
+                                                  < min(ts) = 24/09 00:00
+  cohérence                   COHÉRENT            COHÉRENT (30 j > 3 j)
+  pyramide 1min               4 074 Mo            4 074 Mo (4 254 après E2)
+  net atelier                 18 → 8,1 Go         18 → 8,1 Go (3 981 +
+                                                  4 074 + 63 + 3 Mo)
+  base mistral                —                   35 → 21 Go
+  disque libre                —                   114 → 129 Go
+  production 3 ans            2,9 To → 320 Go     3,03 To → ≈ 115 Go
+                                                  (1min compressée) ou
+                                                  ≈ 356 Go (1min brute)
+  E2 : 1min compressée        —                   4 074 → 546 Mo (×7,5),
+                                                  13,2 s ; retour 61 s et
+                                                  6,7 Go de WAL
+  E4 : drop_chunks / DELETE   —                   0,30 s / 1,13 s + 0,92 s
+       WAL                                        110 ko / 471 Mo + 167 Mo
+       espace rendu                               405 → 0 Mo / 405 → 405
+                                                  puis 161 Mo après VACUUM
+
+Le ratio ×16 sur `mesures` contre ×9,3 sur cmp_serie (L08) n'est pas une
+contradiction : hypertable_compression_stats compte heap + index. cmp_*
+n'avait qu'un index ; `mesures` en a deux (1,2 Go par chunk) qui
+disparaissent à la bascule. Heap contre heap+toast : ×9,6, cohérent avec
+L08 (×9,3, chunks journaliers un peu moins denses).
+
+-------------------------------------------------------------------------
+5. État de sortie mistral-M10 (vérifié à 18:05 UTC)
+-------------------------------------------------------------------------
+- `mesures` : 6 chunks (4 columnstore, 2 rowstore), 151 612 534 lignes,
+  min(ts) 24/09 00:00 UTC, 3 981 Mo ; index mesures_ts_idx1 et
+  mesures_series_id_ts_idx présents.
+- Jobs : 1006 compression 7 j et 1007 rétention 30 j sur `mesures`,
+  chacun exécuté une fois (Success, sans effet — jeu daté) ; 1003-1005
+  rafraîchissements actifs ; 1000/1001 inchangés.
+- Pyramide : 3 agrégats, matérialisation 1min en rowstore (E2 annulée :
+  n'entre pas dans l'état ; la propriété timescaledb.compress reste
+  posée sur la vue, sans politique), 4 254 Mo.
+- Aucune table de travail (e1_*, e4_*) résiduelle. Base 21 Go, 128 Go
+  libres.
+- RÉSERVE : mistral_1min perd 490 lignes par minute tant que now() est
+  dans la zone purgée (jusqu'au 24/09/2026 en temps réel) ; à 18:05, le
+  trou couvre 17/09 17:33 → now. Les niveaux 1h/1j étaient encore
+  intacts (176 400 points sur chaque heure de 17/09, 3 passages de la
+  politique 1h sans recalcul : les suppressions faites par le
+  rafraîchissement 1min ne semblent pas propagées comme invalidations au
+  niveau supérieur — observé, non garanti). Aucun atelier suivant ne lit
+  cette zone (L10-L15 travaillent sur J-3 = 26/10 et sur les jobs) ; les
+  comptes de L07 (contrôle de somme J-3) restent exacts.

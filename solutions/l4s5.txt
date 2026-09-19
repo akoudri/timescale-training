@@ -1,0 +1,100 @@
+L04 — ÉTAPE 5 : LE RETARD D'ARRIVÉE — CORRIGÉ FORMATEUR
+========================================================
+
+Objet : la seule valeur de M05 dont un autre module dépend
+structurellement — M08 dimensionne ses fenêtres de rafraîchissement
+avec. Livrable : quatre valeurs dans mesures.md, section marquée
+« reprise en M08 », et une réponse écrite à la question p95 / p99 / pire.
+
+-------------------------------------------------------------------------
+1. Protocole
+-------------------------------------------------------------------------
+  TRUNCATE mesures_charge;
+
+  uv run l04/injecteur.py --strategie lots --taille-lot 1000 --duree 60 \
+                           --profil-retard mistral
+
+  \i l04/retard.sql        -- percentile_disc 0,50 / 0,95 / 0,99 et max
+                           -- de (ingere_le - ts)
+
+Le profil est OBLIGATOIRE : sans lui l'injecteur horodate à l'instant de
+l'insertion, le retard est mécaniquement nul et la valeur exportée vers
+M08 est inutilisable — et cela ne se découvre qu'un jour et demi plus
+tard. Vérifier "profil_retard": "mistral" dans la sortie JSON.
+
+Le débit baisse légèrement avec le profil (71 000 contre 77 000 pts/s
+sur le poste du 16/09 : le client tire les retards) — sans importance,
+ce n'est pas le débit qu'on mesure ici.
+
+-------------------------------------------------------------------------
+2. Résultats
+-------------------------------------------------------------------------
+| Valeur   | Référence | Poste 16/09/2026 | Profil (mistral.json)       |
+|----------|-----------|------------------|-----------------------------|
+| p50      | 2,2 s     | 2,2 s            | 2 s (normale 2 ± 1 s, 85 %) |
+| p95      | 1 min 56  | 1 min 56         | ~90 s (lognormale, 12 %)    |
+| p99      | 13 min 20 | 13 min 20        | ~800 s (reprise 600-900 s)  |
+| pire cas | 36 min 20 | 39 min 04        | queue lognormale isolée     |
+
+Les trois percentiles sont reproductibles d'un poste à l'autre (le
+profil est statistique, pas le débit) ; seul le pire cas bouge, c'est un
+point isolé au bout de la queue lognormale des liaisons dégradées, pas
+la reprise groupée. C'est exactement pour cela que le pire cas est un
+mauvais critère de dimensionnement.
+
+Ce que chaque valeur raconte du parc :
+- p50 : le régime nominal, la majorité des capteurs remonte en 2 s ;
+- p95 : les liaisons dégradées (12 % des points) : dizaines de secondes
+  à quelques minutes ;
+- p99 : la reprise groupée après un incident de collecte (3 %) : les
+  points reviennent 10 à 15 minutes plus tard, tous ensemble ;
+- pire : un point. Réel, mais seul.
+
+À consigner :
+  ## M05 — retard d'arrivée  ← REPRIS EN M08
+  | p50 | p95 | p99 | pire cas |
+  | 2,2 s | 1 min 56 | 13 min 20 | 39 min 04 |
+  Profil de décalage : mistral (l04/profils/mistral.json), lots de
+  1 000 pendant 60 s.
+
+-------------------------------------------------------------------------
+3. La question posée pour M08 : quelle valeur retenir, et que perd-on ?
+-------------------------------------------------------------------------
+Il n'y a pas de bonne valeur : il y a un arbitrage entre le coût d'une
+fenêtre de rafraîchissement large et la part des points arrivés trop
+tard pour être rattrapés automatiquement. Une phrase par option :
+
+- p95 (≈ 2 min) : fenêtre courte, agrégats frais et bon marché ; 5 % des
+  points arrivent après la fenêtre et ne sont repris que par un
+  rafraîchissement manuel (le protocole de L07 étape 5).
+- p99 (≈ 13-15 min) : fenêtre d'un quart d'heure ; 1 % des points
+  échappe au rattrapage automatique.
+- pire cas (≈ 40 min) : rien n'est perdu, mais les agrégats ont
+  40 minutes de retard sur le flux et chaque passage rebalaie 40 minutes
+  de données — pour protéger un point.
+
+Choix de la chaîne d'instantanés (reprise/M08.sql) : start_offset du
+niveau minute calé sur le p99, arrondi à 30 minutes, en écrivant :
+« on accepte de perdre le rattrapage automatique du dernier pour cent ;
+il reste possible à la main ». Ce n'est pas la bonne réponse, c'est
+celle de la référence : un participant qui retient le p95 et l'assume
+par écrit a raison aussi. Ce qui ne passe pas : retenir le pire cas
+« pour être sûr » sans chiffrer ce que cela coûte, ou retenir une valeur
+sans dire ce qu'on perd.
+
+Même valeur, troisième usage en M09 : le délai de bascule vers le
+columnstore doit dépasser cette fenêtre — un chunk basculé qui reçoit
+encore des points tardifs coûte une décompression à chaque insertion.
+
+-------------------------------------------------------------------------
+4. Erreurs fréquentes
+-------------------------------------------------------------------------
+- Profil oublié : quatre valeurs à zéro, découvertes en L07.
+- Table non vidée avant : les lignes des étapes 2-4 (retard nul) tirent
+  les percentiles vers le bas — le p50 tombe sous la seconde.
+- Dimensionner sur le pire cas par réflexe de prudence.
+- Oublier de marquer la section « reprise en M08 » : le critère de
+  réussite l'exige, et tests/M05.sql vérifie sa présence.
+
+Nettoyage : TRUNCATE mesures_charge — la table reste, vide, dans l'état
+de reprise mistral-M05.

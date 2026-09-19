@@ -1,0 +1,51 @@
+L10 — ÉTAPE 1 : LA TABLE DE CONSIGNATION ET LA COUPURE DES CAPTEURS
+=====================================================================
+
+Fiche : « \i l10/alertes-qualite.sql — elle contient au minimum l'instant
+de détection, la série, l'horodatage de son dernier point et l'ancienneté.
+Simuler ensuite l'arrêt de trois capteurs :
+./l10/couper-capteurs.sh --series 137,208,451 --depuis "3 hours" »
+
+-------------------------------------------------------------------------
+1. La table (fournie)
+-------------------------------------------------------------------------
+  alertes_qualite(detecte_le timestamptz NOT NULL, series_id int NOT NULL,
+                  dernier_point timestamptz, anciennete interval)
+Quatre colonnes, aucune clé : c'est un JOURNAL de détections, pas un état.
+Le même capteur muet y sera consigné à chaque passage du job (toutes les
+heures) — c'est le comportement voulu d'une consignation ; la
+déduplication est l'affaire de la restitution (M15), pas de l'action.
+
+-------------------------------------------------------------------------
+2. La coupure (résultat du poste)
+-------------------------------------------------------------------------
+  avant : 137 / 208 / 451 → max(ts) 29/10 21:59:50, ≈ 310 500 points chacune
+  ./l10/couper-capteurs.sh --series 137,208,451 --depuis "3 hours"
+    → DELETE 3240   (3 séries × 3 h × 360 points/h), 0,1 s
+  après : max(ts) 29/10 18:59:50 pour les trois ; le reste du parc est
+  toujours à 21:59:50.
+
+Trois choses à faire remarquer dans le script :
+- « depuis » se mesure au DERNIER POINT DU PARC (max(ts)), pas à l'horloge
+  murale : le résultat est le même quel que soit le jour où l'atelier est
+  joué (ici now() est 42 jours avant la fin du jeu — un `now() - 3 h` ne
+  supprimerait rien).
+- La borne est passée en LITTÉRAL (\gset) et non en sous-requête. Sur
+  cette hypertable, les chunks avant le 22/10 sont en columnstore : une
+  borne connue seulement à l'exécution marquerait comme candidats à la
+  décompression tous les lots des trois séries dans les chunks basculés
+  (limite DML dépassée, comme en L08 étape 4). Avec le littéral, le
+  planificateur exclut les chunks columnstore et le DELETE ne touche que
+  le chunk rowstore 29/10-05/11 : 0,1 s.
+- Le DELETE porte sur `mesures`, pas sur une table de travail : c'est la
+  vérification du piège « les trois capteurs n'apparaissent pas ».
+
+-------------------------------------------------------------------------
+3. Erreurs fréquentes
+-------------------------------------------------------------------------
+- Lancer le script depuis l10/ : il fait `cd "$(dirname "$0")/.."` et
+  attend le compose dans atelier/ — fonctionne de partout, mais un
+  participant qui recopie le SQL à la main dans psql oublie le \gset et
+  obtient soit une erreur DML, soit plusieurs secondes.
+- Couper « depuis 3 hours » puis mettre un seuil de 4 h à l'étape 3 :
+  rien n'est détecté, et ce n'est pas un bug (dernier piège de la fiche).

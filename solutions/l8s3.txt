@@ -1,0 +1,88 @@
+L08 — ÉTAPE 3 : LES TROIS PROFILS DE REQUÊTE
+============================================
+
+Fiche : « Laquelle des trois requêtes creuse l'écart entre les
+configurations, et sur laquelle des trois tables. L'expliquer par ce que
+le prédicat de la requête a le droit d'éliminer avant toute
+décompression. »
+
+-------------------------------------------------------------------------
+1. Commandes attendues
+-------------------------------------------------------------------------
+  for t in cmp_serie cmp_machine cmp_aucun; do
+    for r in R1 R2 R3; do ./mesure.sh l08/$r.sql --table $t; done
+  done
+
+Les trois fichiers utilisent {{table}} et des bornes en dur (25-26/09
+UTC) : mesure.sh calcule des bornes :debut/:fin mais elles ne servent
+pas ici. R2 est en réalité une fenêtre d'UN jour (le 25/09) filtrée sur
+la série 137 — la fiche dit « trois jours », les tables n'en ont que
+deux ; sans conséquence sur la leçon.
+
+-------------------------------------------------------------------------
+2. Résultats du poste (médiane de 5, ms) — et temps serveur réels
+-------------------------------------------------------------------------
+                    cmp_serie   cmp_machine   cmp_aucun
+  R1 dernier point     80          85            81
+  R2 fenêtre + série   83          98           121
+  R3 agrégation        126        132           166
+
+Le plancher de mesure.sh est ~80 ms (docker exec + psql). Les temps
+serveur, relevés par EXPLAIN (ANALYZE) pour lire l'écart réel :
+
+                    cmp_serie   cmp_machine   cmp_aucun
+  R1                 0,08 ms      —            0,06 ms
+  R2                 0,28 ms     14,2 ms       39,3 ms
+  R3                 38 ms        —            51 ms
+
+C'est R2 qui creuse l'écart, et c'est sur cmp_aucun qu'il se creuse :
+×140 entre serie et aucun côté serveur (×1,5 vu de mesure.sh, à cause
+du plancher). R3 ne filtre rien : les trois configurations lisent tout,
+l'écart (38 → 51 ms) ne vient que du volume à décompresser (52 contre
+103 Mo). R1 est plat : LIMIT 1 s'arrête au premier lot du dernier chunk.
+
+-------------------------------------------------------------------------
+3. Le mécanisme, lu dans les plans (E1 en donne le détail)
+-------------------------------------------------------------------------
+cmp_serie, R2 :
+  ColumnarScan on _hyper_15_157_chunk (rows=8640)
+    -> Index Scan using …_compressed_series_id__ts_meta… (rows=9)
+       Index Cond: (series_id = 137)
+  → 9 LOTS lus sur 4 407, par l'index que le columnstore pose sur
+    (segmentby, _ts_meta_min/max). Le reste du chunk n'est jamais
+    ouvert : élimination AVANT décompression.
+
+cmp_aucun, R2 :
+  ColumnarScan on _hyper_17_161_chunk (rows=4320)
+    Vectorized Filter: (series_id = 137)
+    Rows Removed by Filter: 2 110 483   (× 2 workers)
+    -> Parallel Seq Scan on …_compressed (rows=2115 × 2)
+  → TOUS les lots sont lus et décompressés (4 230), le filtre s'applique
+    APRÈS, ligne par ligne (vectorisé, mais sur 4,2 M lignes).
+
+cmp_machine, R2 : même plan que cmp_aucun (filtre vectorisé, 4 256 lots
+lus) ; il va deux fois plus vite parce que le chunk est plus petit et
+que series_id se lit en run-length dans un lot de 10 séries. Le prédicat
+porte sur series_id, qui n'est PAS la colonne de segment : rien n'est
+éliminé. C'est le piège « R2 n'est pas plus rapide » de la fiche.
+
+Ce que le prédicat « a le droit d'éliminer » : uniquement ce que les
+MÉTADONNÉES de lot décrivent — la valeur de segment (exacte) et
+l'intervalle min/max de la colonne orderby. Tout autre prédicat attend
+la décompression.
+
+Formulation attendue : « une requête filtrée sur la colonne de segment
+ne décompresse que les lots de ce segment ; filtrée sur une autre
+colonne, elle décompresse tout puis filtre — le columnstore devient
+alors un rowstore plus lent à lire. »
+
+-------------------------------------------------------------------------
+4. Erreurs fréquentes
+-------------------------------------------------------------------------
+- Conclure de R1 que « ça ne change rien » : LIMIT 1 ne mesure pas la
+  lecture ; c'est R2 qui juge.
+- Ne pas voir l'écart parce que mesure.sh plafonne à 80 ms : faire
+  EXPLAIN (ANALYZE, BUFFERS) et lire « Rows Removed by Filter » et le
+  nombre de lignes du scan sur la table _compressed (= lots lus).
+- Écart-type > 20 % sur R3 (obtenu une fois : 10 %) : le VectorAgg
+  parallèle dépend des deux vCPU ; relancer si un job tourne.

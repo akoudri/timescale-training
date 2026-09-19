@@ -1,0 +1,146 @@
+L05 — R2 : ÉNERGIE JOURNALIÈRE FACTURABLE — RAPIDE, FAUSSE (corrigé)
+=====================================================================
+
+Fiche : « ne pas corriger avant d'avoir DÉMONTRÉ l'erreur. Choisir la
+semaine du changement d'heure, exécuter la requête d'origine, la variante
+corrigée, produire le tableau des écarts jour par jour. Réussi si l'écart
+est chiffré en kWh sur la journée concernée, et si le participant sait
+dire pourquoi la somme sur l'année reste identique. »
+
+-------------------------------------------------------------------------
+1. Le problème : un « jour » découpé en UTC
+-------------------------------------------------------------------------
+`time_bucket(INTERVAL '1 day', ts)` sans troisième argument aligne les
+seaux sur minuit UTC (origine 2000-01-03 00:00 UTC). Un jour civil de
+MISTRAL (Europe/Paris) commence à 22:00 UTC la veille en été, 23:00 UTC
+en hiver. Conséquences, dans l'ordre d'importance :
+
+a) TOUS les jours sont décalés de 2 h (été) puis 1 h (hiver) : le seau
+   étiqueté « 20 octobre » contient 02:00 → 02:00 heure locale, pas
+   00:00 → 24:00. Pour une production éolienne (non nulle la nuit) l'écart
+   par jour vaut −3 % à +5 % selon le vent des deux heures déplacées.
+b) Le 25 octobre (dernier dimanche d'octobre, jour de 25 h en heure
+   locale) et le jour d'après ont une DURÉE fausse : le seau UTC fait
+   24 h partout, le jour civil fait 25 h. Le seau « 25 octobre » perd les
+   deux premières heures locales et gagne une heure du 26.
+c) Le total sur la semaine, le mois, l'année est INVARIANT : les deux
+   découpages partitionnent le même ensemble de points, seule
+   l'ÉTIQUETTE de jour change. Un contrôle de cohérence par somme ne peut
+   rien voir ; seule une comparaison jour par jour le peut.
+
+L'instance ayant `timezone = Etc/UTC`, `date_trunc('day', ts)` donnerait
+le MÊME résultat faux ; sur un poste client en Europe/Paris, date_trunc
+donnerait le bon — et deux tableaux de bord se contrediraient. C'est
+l'argument pour un fuseau EXPLICITE dans la requête.
+
+-------------------------------------------------------------------------
+2. La démonstration imposée (l05/R2-demonstration.md)
+-------------------------------------------------------------------------
+Bornes de la semaine en heure locale, en littéral avec offset (une des
+rares bornes en dur admises : le 25 octobre est une constante de
+calendrier, c'est LA contrainte de génération du jeu, L00 §5) :
+
+WITH j_utc AS (   -- requête d'origine
+    SELECT time_bucket(INTERVAL '1 day', ts)::date AS jour,
+           sum(puissance_kw) / 360.0               AS energie
+    FROM   mesures_production
+    WHERE  ts >= '2026-10-19T00:00:00+02' AND ts < '2026-10-27T00:00:00+01'
+    GROUP  BY 1
+), j_loc AS (     -- variante corrigée
+    SELECT (time_bucket(INTERVAL '1 day', ts, 'Europe/Paris')
+            AT TIME ZONE 'Europe/Paris')::date     AS jour,
+           sum(puissance_kw) / 360.0               AS energie
+    FROM   mesures_production
+    WHERE  ts >= '2026-10-19T00:00:00+02' AND ts < '2026-10-27T00:00:00+01'
+    GROUP  BY 1
+)
+SELECT coalesce(j_utc.jour, j_loc.jour)                    AS jour,
+       round(j_utc.energie::numeric, 0)                    AS sans_fuseau_kwh,
+       round(j_loc.energie::numeric, 0)                    AS avec_fuseau_kwh,
+       round((j_loc.energie - j_utc.energie)::numeric, 0)  AS ecart_kwh,
+       round(100 * (j_loc.energie - j_utc.energie)::numeric
+             / nullif(j_utc.energie, 0)::numeric, 2)       AS ecart_pct
+FROM   j_utc FULL JOIN j_loc USING (jour)
+ORDER  BY 1;
+
+-- invariance du total
+SELECT round((sum(puissance_kw) / 360.0)::numeric, 0) AS total_semaine_kwh
+FROM   mesures_production
+WHERE  ts >= '2026-10-19T00:00:00+02' AND ts < '2026-10-27T00:00:00+01';
+
+Pourquoi `/ 360.0` : la vue expose la puissance instantanée (kW) au pas
+de 10 s ; l'énergie d'un point vaut kW × 10 s / 3 600 s = kW / 360 kWh.
+La colonne `energie_kwh` de la vue est un COMPTEUR CUMULATIF : le sommer
+donne ~10¹² kWh/jour (errata [SLIDES] du support) ; il se traite en M07
+avec counter_agg (deltas, remises à zéro).
+
+Lecture du tableau attendu :
+- une ligne « 2026-10-18 » avec sans_fuseau seul (NULL en face) : le seau
+  UTC du 18 récupère les points de 22:00 à 00:00 UTC du 18, qui sont le
+  début du 19 en heure locale. C'est un artefact NORMAL du FULL JOIN, et
+  la preuve visible du décalage ;
+- écarts non nuls tous les jours (−3,05 % à +5,35 % sur la référence) ;
+- le 25 octobre : +17 900 kWh, +2,35 % sur la référence — c'est LE
+  chiffre demandé par le critère ;
+- total_semaine_kwh : 7 423 951 sur la référence, identique pour les deux
+  découpages (le vérifier en sommant chaque colonne du tableau).
+
+Mesures du poste de l'utilisateur : à reporter (même générateur, même
+graine : les valeurs devraient être identiques à la référence).
+
+-------------------------------------------------------------------------
+3. Requête après (l05/apres/R2.sql)
+-------------------------------------------------------------------------
+-- Nœud responsable : AUCUN. La requête n'était pas lente, elle était
+-- fausse ; le plan est identique (Seq Scan des 8 chunks ⋈ référentiel,
+-- HashAggregate par jour) et la durée aussi (× 0,9 : bruit de mesure).
+SELECT time_bucket(INTERVAL '1 day', ts, 'Europe/Paris') AS jour,
+       sum(puissance_kw) / 360.0                         AS energie_kwh
+FROM   mesures_production
+WHERE  ts >= :'debut' AND ts < :'fin'
+GROUP  BY 1 ORDER BY 1;
+
+Le seau retourné est un timestamptz à minuit heure de Paris (affiché
+22:00+00 ou 23:00+00 sous un client en UTC). Pour un libellé de jour
+civil : `(… AT TIME ZONE 'Europe/Paris')::date`.
+
+Note de cohérence : le fichier `apres/R2.sql` de la copie -sol utilise
+encore `sum(energie_kwh)` (compteur cumulatif) ; c'est un reliquat
+antérieur à l'errata, le corrigé ci-dessus fait foi. R2 dure 36-40 s
+parce que la vue joint 190 M de lignes au référentiel sans prédicat sur
+le signal côté hypertable : le gain viendra de M08, pas d'ici.
+
+-------------------------------------------------------------------------
+4. Pourquoi le contrôle annuel ne voit rien (réponse attendue à l'oral)
+-------------------------------------------------------------------------
+« Les deux requêtes lisent les mêmes points et les additionnent tous ;
+elles ne diffèrent que par la clé de regroupement. Toute somme sur une
+période qui commence et finit aux mêmes points — l'année, le mois si les
+bornes sont prises dans le même découpage — est identique. L'erreur est
+une erreur d'IMPUTATION, pas de VOLUME : elle est invisible à tout
+contrôle qui agrège au-dessus du jour, et visible uniquement en comparant
+jour par jour contre une référence indépendante (compteur de site,
+facture du gestionnaire de réseau). »
+
+Pour E1 (année complète, tarifs.md) : deux bascules par an ; l'écart
+imputé un jour est repris le lendemain, donc à tarif constant (87 €/MWh)
+la facture annuelle est juste — ~1 560 € déplacés d'un jour à l'autre
+pour le seul 25 octobre. Le préjudice apparaît dès que le tarif varie
+par jour ou par heure (prix spot, heures pleines/creuses, pénalités de
+prévision journalière) : alors chaque jour est facturé sur une énergie
+fausse de ±3 à 5 %, et le total « juste » masque un montant faux.
+
+Erreurs fréquentes :
+- corriger avant de démontrer (le critère exige le tableau) ;
+- chercher l'écart sur une semaine de septembre et conclure « jour
+  décalé mais pas de bug de bascule » : l'écart quotidien existe partout,
+  le jour de 25 h n'est visible que le 25-26 octobre ;
+- démontrer avec `sum(energie_kwh)` : chiffres de 10¹² kWh, la
+  démonstration perd toute crédibilité ;
+- `AT TIME ZONE 'Europe/Paris'` appliqué au ts AVANT time_bucket
+  (résultat timestamp sans fuseau, seaux justes mais colonne devenue
+  non exclusive de chunks dans les agrégats continus) : préférer le
+  troisième argument ;
+- comparer `j_utc.jour = j_loc.jour` sans caster les deux en date : les
+  timestamptz de seau ne coïncident jamais (22:00 vs 00:00) et le FULL
+  JOIN affiche deux lignes par jour.

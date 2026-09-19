@@ -1,0 +1,120 @@
+L15 — TABLEAU DE BORD ET ALERTES — PROTOCOLE COMMUN (corrigé formateur)
+=========================================================================
+
+Fichiers : l15s1 (étape 0, rôle de supervision + import du tableau de
+bord), l15s2 (étape 1, les quatre alertes), l15s3 (étape 2, provocations),
+l15s4 (étape 3, le test du silence), l15s5 (extensions E1 régression,
+E2 alertes de L14, E3 note « liste courte »). Exports bruts :
+l15-regles-alertes-export.yaml (six règles Grafana, format provisioning)
+et l15-tableau-de-bord-export.json (le tableau de bord importé).
+
+-------------------------------------------------------------------------
+1. Ce que l'atelier vérifie
+-------------------------------------------------------------------------
+Quatre alertes qui se déclenchent quand il faut ET qui se taisent le reste
+du temps. Le second critère est le seul difficile : une alerte permanente
+ou bruyante est une alerte morte (personne ne la lit). D'où les trois
+contraintes de la fiche : A2 et A3 en RELATIF (période du job, pas du
+flux), A2 bornée aux jobs déjà échus, A4 en seuil ET tendance. Et d'où
+l'étape 3 : quatre minutes de silence ne prouvent rien, le test est un
+raisonnement écrit par alerte.
+
+Le tableau de bord est fourni construit ; ce que l'atelier fait construire,
+c'est le RÔLE qui le nourrit (leçon de L13 appliquée à la supervision) et
+les quatre règles.
+
+-------------------------------------------------------------------------
+2. État du poste vérifié le 17/09/2026 (avant L15)
+-------------------------------------------------------------------------
+- mistral-M15 : jobs 1000-1008 planifiés (1003 = rafraîchissement
+  mistral_1min, 1008 = controle_qualite, total_failures 3 hérité de
+  L10), index `mesures_series_id_ts_idx` en place, 8 workers, 3
+  processus TimescaleDB, `alertes_qualite` 3 lignes, `pg_stat_statements`
+  créée (depuis L12), rôles L13 en place.
+- Trois flux muets PERMANENTS depuis L10 : séries 137, 208, 451 (3 h
+  d'ancienneté au sens du dernier point du parc) — A3 sera en alerte dès
+  sa création, et c'est normal (voir l15s4).
+- Grafana 12.1 non démarré ; démarré par `docker compose --profile outils
+  up -d grafana`. Source « PostgreSQL MISTRAL » provisionnée (uid
+  mistral-supervision, user mistral_supervision / supervision, base
+  mistral). Santé de la source AVANT création du rôle :
+    {"status":"ERROR","message":"Database error: Failed to connect …
+     password authentication failed for user \"mistral_supervision\""}
+  → tous les panneaux seraient vides, et Grafana ne dit pas pourquoi dans
+  le panneau (seulement dans la page de la source).
+- Personne ne clique : tout l'atelier a été joué par l'API HTTP de
+  Grafana (`curl -u admin:mistral`) — import, interrogation des panneaux,
+  création des règles, lecture de leur état. Commandes dans l15s1-l15s3.
+
+-------------------------------------------------------------------------
+3. Corrections du kit apprenant faites le 17/09 (à connaître)
+-------------------------------------------------------------------------
+- `l15/provoquer.sh` (A2) codait `alter_job(1002, …)` en dur : sur ce
+  poste le job du niveau minute est 1003 ; le script aurait suspendu…
+  rien (1002 n'existe pas → erreur, `set -e` arrête le script). Corrigé :
+  l'identifiant est résolu par requête (proc_name =
+  'policy_refresh_continuous_aggregate' AND hypertable_name =
+  'mistral_1min'), avec échec explicite s'il n'existe pas.
+- `l15/provoquer.sh` (etat_a2) : garde-fou aligné sur la version éprouvée
+  en L14 (`total_runs > 0`) — la version `last_run_started_at IS NOT
+  NULL` est inopérante : un job jamais échu affiche `-infinity`, pas NULL
+  (vérifié en L14 sur le job 1001).
+- Fiche, piège « panneaux vides » : il est plus nuancé que l'énoncé. Les
+  vues `timescaledb_information.*`, `hypertable_compression_stats()`,
+  `pg_stat_database` et `pg_stat_activity` (colonne application_name)
+  répondent à un rôle SANS AUCUN GRANT : M4-M8 s'affichent avec le rôle
+  nu. Seules M1-M3 (mesures, agrégats, référentiel) restent vides. Le
+  premier panneau vide est en réalité la SOURCE entière (mot de passe /
+  rôle absent). À reformuler dans la fiche (non modifiée ici — c'est une
+  nuance, pas une erreur).
+- Rien d'autre modifié dans le kit. `-sol/atelier/l15/alertes.md` porte
+  encore le garde-fou `last_run_started_at IS NOT NULL` : à réaligner
+  (consigné dans NOTES-PRODUCTION §L15).
+
+-------------------------------------------------------------------------
+4. Mesures de référence vs mesures du poste
+-------------------------------------------------------------------------
+Référence (mesures.md §M15 L15) : huit métriques validées ; A2/A3 en
+relatif ; provocations A2 0/1/0, A3 3/4/n.a. ; A2 se déclenchait en
+régime normal (politiques jamais échues) → garde-fou ajouté.
+
+Poste (17/09) :
+  rôle          mistral_supervision : SELECT sur mesures, mistral_1min/
+                1h/1j, affectation_capteur, signaux (+ supervision_taille
+                pour A4) ; membre de pg_read_all_stats (E1)
+  source        ERROR (rôle absent) → OK après création
+  import        POST /api/dashboards/db → uid mistral-supervision, v1
+  8 métriques   toutes répondent par /api/ds/query (M1 2 954 pts/min,
+                M2 4 familles à 0 s, M3 50 s / 59 min 50 / 22 h 59,
+                M4 7 hypertables, M5 ratio 16,1 / rowstore 33 %,
+                M6 10 jobs, M7 22,4 Go, M8 98,64 %)
+  règles        6 créées par l'API de provisioning (A1-A4 + P2, P3 de
+                L14 ; A2 = P1), groupe évalué toutes les 10 s
+  A2            0 → 1 (1003 suspendu 25 s, règle « firing ») → 0
+  A3            3 → 4 (série 490 coupée 30 min ; règle déjà « firing »
+                à cause des 3 muets de L10 — permanent, documenté)
+  A1            3 processus → 0 (max_background_workers = 0 + restart,
+                règle « firing » ; P3 aussi) → 3, règle « inactive »
+  A4            10,4 % de 200 Go ; tendance NULL (2 relevés) → inactive
+  E1            R5 avec index 36 ms/appel, sans index 3 362 ms, temp
+                0 → 419 325 blocs, lus 7 679 → 653 966 ; recréation
+                8,85 s ; P2 « firing » pendant, « inactive » après
+
+-------------------------------------------------------------------------
+5. État de sortie : mistral-M15 augmenté des quatre alertes
+-------------------------------------------------------------------------
+- Rôle `mistral_supervision` (LOGIN) avec les droits ci-dessus.
+- Grafana laissé en marche : tableau de bord « MISTRAL — supervision
+  TimescaleDB » (uid mistral-supervision), dossier MISTRAL, six règles
+  (A1-A4, P2, P3). A3 en alerte permanente : 137, 208, 451 (L10) et 490
+  (provocation A3, non remise en état par construction).
+- Ajout à l'état pour A4 : table `supervision_taille` + procédure
+  `relever_taille` + job **1031** (1 h) — l'historique de taille sans
+  lequel la tendance n'existe pas (voir l15s2). À reporter dans
+  reprise/M15.sql ou à supprimer si l'on préfère la tendance côté Grafana.
+- `mesures` 151 609 114 lignes (−180 : la demi-heure de la série 490),
+  index `mesures_series_id_ts_idx` recréé (E1), workers 8, jobs
+  1000-1008 + 1031 planifiés, `alertes_qualite` 3 lignes (TRUNCATE +
+  run_job 1008 — noter que l'action de L10, seuil 1 h, ne voit PAS la
+  série 490 coupée 30 min : A3 à 10 min la voit ; deux seuils, deux
+  usages), `pg_stat_statements` remise à zéro par E1, 128 Go libres.

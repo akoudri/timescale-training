@@ -1,0 +1,77 @@
+L08 — ÉTAPE 2 : BASCULER ET RELEVER LES RATIOS
+==============================================
+
+Fiche : « Ne basculer que les chunks pleins. Un chunk partiel donne un
+ratio flatteur et non représentatif. Reporter les trois ratios dans
+mesures.md. »
+
+-------------------------------------------------------------------------
+1. Commandes attendues (version corrigée du 17/09)
+-------------------------------------------------------------------------
+  \set table cmp_serie
+  \i l08/basculer.sql            -- compress_chunk sur show_chunks(:'table')
+  \set table cmp_machine
+  \i l08/basculer.sql
+  \set table cmp_aucun
+  \i l08/basculer.sql
+  \set table cmp_serie
+  \i l08/ratios.sql              -- chunk par chunk, puis total
+
+`\i` ne prend pas d'argument : le nom de table passe par la variable
+psql `table`, lue avec :'table'.
+
+-------------------------------------------------------------------------
+2. Résultats du poste
+-------------------------------------------------------------------------
+  table        bascule    avant    après    ratio   (par chunk)
+  cmp_serie    1,30 s     486 Mo    52 Mo   ×9,3    9,2 / 9,3
+  cmp_machine  2,50 s     486 Mo    97 Mo   ×5,0    5,0 / 5,0
+  cmp_aucun    1,93 s     486 Mo   103 Mo   ×4,7    4,7 / 4,7
+
+Les deux chunks de chaque table donnent le même ratio à 0,1 près : ils
+sont pleins et nominaux, la comparaison est valide. Référence formateur :
+×9,3 / ×5,0 / ×4,7 — identiques, le ratio ne dépend que des données et
+de la configuration, pas du poste.
+
+-------------------------------------------------------------------------
+3. Interprétation à faire écrire
+-------------------------------------------------------------------------
+Le mauvais choix divise le ratio par DEUX (9,3 → 4,7) sur des données
+strictement identiques. Pourquoi :
+
+- Un lot de compression (≤ 1 000 lignes, timescaledb.compression_batch_
+  size_limit) regroupe des lignes d'UN MÊME segment, triées par orderby.
+  Chaque colonne du lot est compressée séparément (delta-delta pour les
+  entiers et horodatages, Gorilla/XOR pour les flottants, dictionnaire
+  ou run-length pour ce qui se répète).
+- Avec segmentby series_id, un lot = 1 000 points consécutifs d'une seule
+  série : ts progresse de 10 s en 10 s (delta-delta → presque 0 octet),
+  valeur est autocorrélée (le vent à t ressemble au vent à t+10 s : XOR
+  court), qualite est constante, series_id n'est stocké qu'une fois par
+  lot. Mesuré sur un chunk (l8s7 E3) : 4,2 M lignes → ts 259 ko, valeur
+  20 Mo, series_id 17 ko.
+- Sans segmentby, un lot = 1 000 lignes triées par ts, donc 490 séries
+  entremêlées à deux ou trois horodatages : valeur saute d'une éolienne à
+  un onduleur à un compteur (XOR long : 32 Mo), series_id et machine_id
+  changent à chaque ligne (6,6 Mo + 4,2 Mo au lieu de 17 ko + 225 ko).
+- machine_id, cardinalité 46, est entre les deux : un segment mêle ~10
+  séries de signaux différents (kW, °C, tr/min…), et c'est la colonne
+  valeur qui paie (31 Mo).
+
+Formulation attendue : « segmentby doit être la colonne qui rend les
+valeurs d'un lot semblables entre elles ET sur laquelle les requêtes
+filtrent — ici la série ; une cardinalité plus faible fait des lots
+plus hétérogènes, pas des lots plus pleins. »
+
+-------------------------------------------------------------------------
+4. Erreurs fréquentes
+-------------------------------------------------------------------------
+- Lire le ratio sur `hypertable_compression_stats` seule : elle ne dit
+  pas si les chunks sont pleins ; l08/ratios.sql (chunk par chunk) est
+  le contrôle. Ici les deux chunks sont pleins par construction ; sur
+  mesures_hc (étape 5) le chunk partiel du 22/10 donnera ×1,2 — le
+  piège joue dans les deux sens.
+- Comparer des « après » de tables qui n'ont pas le même « avant » :
+  vérifier que before_compression_total_bytes est identique (486 Mo).
+- Relancer basculer.sql sur une table déjà basculée : compress_chunk
+  répond « already compressed », sans dommage.

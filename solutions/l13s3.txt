@@ -1,0 +1,114 @@
+L13 — ÉTAPE 3 : LES TROIS TENTATIVES DE CONTOURNEMENT
+======================================================
+
+Fiche : « Exécuter chacune, constater si elle réussit, et corriger.
+Consigner pour chacune : réussie ou non avant correction, et la
+correction appliquée. »
+
+Protocole suivi sur le poste : étape 2 faite d'abord sur `mesures` SEULE
+(le cas courant), T1 jouée, correction (vues sur les agrégats), T1
+rejouée ; T2 ; T3 avec les droits stricts, puis avec un GRANT naïf, puis
+corrigée.
+
+-------------------------------------------------------------------------
+1. T1 — passer par l'agrégat
+-------------------------------------------------------------------------
+\i l13/contournements/T1.sql   (SET mistral.site = 2 ; SET ROLE mistral_lecture ;
+                                count(DISTINCT series_id) FROM mistral_1h)
+AVANT : mistral_1h | 490        → RÉUSSIE : le parc entier, en 50 ms.
+Pourquoi : un agrégat continu est un objet DISTINCT (vue + hypertable de
+matérialisation). Le REVOKE sur `mesures` ne le touche pas ; le GRANT de
+l'étape 1 sur mistral_1h reste. Et l'agrégat est plus rapide que la table
+qu'il contourne : c'est le canal de fuite idéal.
+Correction : vues mistral_1min_site / 1h_site / 1j_site + REVOKE des
+trois agrégats (l13s2 §2).
+APRÈS : `permission denied for view mistral_1h` ; mistral_1h_site → 180.
+
+-------------------------------------------------------------------------
+2. T2 — utiliser le propriétaire
+-------------------------------------------------------------------------
+\i l13/contournements/T2.sql
+proprietaire  | 490      (postgres, superutilisateur)
+mistral_admin | 490      (GRANT ALL de l'étape 1)
+→ RÉUSSIE, deux fois. Et ce n'est PAS corrigeable techniquement pour le
+propriétaire : une vue barrière ne filtre que ceux qui lisent la vue ;
+le propriétaire lit la table. Un superutilisateur contourne de toute
+façon tout mécanisme applicatif (même la RLS, sauf FORCE + non-superuser).
+
+Ce que l'étape attend : une RÈGLE D'ORGANISATION écrite, pas un GRANT :
+  - personne ne travaille sous le compte propriétaire des tables ;
+  - `mistral_admin` voit tout, et c'est un choix EXPLICITE et AUDITÉ
+    (log_statement = 'all' pour ce rôle, ou pgaudit) — pas un accident ;
+  - toute vérification de cloisonnement se fait sous un rôle dédié.
+Et la vérification PAR REQUÊTE, pas de mémoire :
+  SELECT grantee, table_name, string_agg(privilege_type, ',')
+  FROM information_schema.role_table_grants
+  WHERE table_name IN ('mesures','mistral_1min','mistral_1h','mistral_1j')
+    AND grantee <> 'postgres' GROUP BY 1, 2;
+  → mistral_admin : tout sur les quatre ; mistral_ingestion : INSERT sur
+    mesures ; mistral_lecture : plus rien. Conforme.
+  SELECT rolname, rolsuper, rolbypassrls FROM pg_roles WHERE rolname LIKE 'mistral%';
+  → aucun superuser, aucun BYPASSRLS (sans objet ici : pas de RLS — la
+    référence donnait BYPASSRLS à mistral_admin, c'est un reliquat).
+
+-------------------------------------------------------------------------
+3. T3 — passer par un job
+-------------------------------------------------------------------------
+Faits : le job 1008 (controle_qualite) a pour `owner` = postgres. Il lit
+`mesures` avec les droits de postgres, tous sites confondus, et consigne
+dans alertes_qualite les capteurs 137 (site 1), 208 (site 2), 451
+(site 4).
+
+\i l13/contournements/T3.sql   (run_job(1008), puis lecture de
+                                alertes_qualite sous mistral_lecture site 2)
+a) Droits stricts de l'étape 1 : ERROR: permission denied for table
+   alertes_qualite → ÉCHOUÉE, mais par absence de droit, pas par
+   cloisonnement. Le job, lui, a bien tout vu (NOTICE : 3 capteurs).
+b) Avec un GRANT « par réflexe » (`GRANT SELECT ON alertes_qualite TO
+   mistral_lecture`, ou un GRANT … ON ALL TABLES) : series_consignees 3 |
+   lignes 9 → RÉUSSIE : le lecteur du site 2 apprend que des capteurs
+   des sites 1 et 4 sont muets — et lesquels.
+Deux surfaces, comme le dit la fiche :
+   - sous quel rôle l'action s'exécute : son créateur (postgres). Non
+     corrigé ici — c'est E3 (recréer l'action sous un rôle dédié, et
+     constater ce qu'elle ne voit plus) ;
+   - qui lit la table qu'elle remplit : correction immédiate.
+Correction :
+  REVOKE SELECT ON alertes_qualite FROM mistral_lecture;
+  CREATE VIEW alertes_qualite_site WITH (security_barrier) AS
+    SELECT q.* FROM alertes_qualite q WHERE q.series_id IN (… sous-requête site …);
+  GRANT SELECT ON alertes_qualite_site TO mistral_lecture;
+APRÈS : T3 → permission denied for table alertes_qualite ;
+        alertes_qualite_site, site 2 → 4 lignes (toutes le capteur 208 :
+        run_job avait été forcé 4 fois) ; site 1 → 4 lignes (137).
+
+Effet de bord à connaître : chaque `\i T3.sql` force run_job et AJOUTE
+3 lignes à alertes_qualite (12 lignes après trois passages). L'état de
+reprise M14 attend 3 lignes : `TRUNCATE alertes_qualite; CALL
+run_job(1008);` en fin d'atelier.
+
+-------------------------------------------------------------------------
+4. resultats.md attendu (l13/contournements/resultats.md)
+-------------------------------------------------------------------------
+# L13 — les trois tentatives de contournement
+Contexte 2.29.2 : RLS refusée sur hypertable columnstore (« operation not
+supported on hypertables that have columnstore enabled ») et sur les
+matérialisations (« operation not supported on materialization tables »)
+→ vues security_barrier + retrait des accès directs.
+
+| Tentative | Avant correction | Correction appliquée |
+|---|---|---|
+| T1 agrégat | RÉUSSIE : 490 séries via mistral_1h (GRANT de l'étape 1 intact) | vues mistral_1{min,h,j}_site + REVOKE des agrégats ; après : 180, accès direct → permission denied |
+| T2 propriétaire | RÉUSSIE : postgres 490, mistral_admin 490 | structurelle — règle d'organisation : jamais sous le propriétaire ; mistral_admin voit tout, explicite et audité ; contrôle par role_table_grants |
+| T3 job | ÉCHOUÉE avec droits stricts (permission denied) ; RÉUSSIE avec un GRANT naïf : 3 séries de 3 sites lisibles | REVOKE + vue alertes_qualite_site ; le rôle d'exécution du job reste postgres → E3 |
+
+-------------------------------------------------------------------------
+5. Erreurs fréquentes
+-------------------------------------------------------------------------
+- Conclure de T3-a (« permission denied ») que le cloisonnement marche :
+  il n'y a simplement pas de droit. La question est celle du jour où on
+  l'accordera.
+- Chercher à « corriger T2 » par un REVOKE sur postgres : impossible et
+  hors sujet. La réponse est un paragraphe, pas une commande.
+- Ne pas rejouer la tentative après correction. « Corrigé » se prouve
+  par la même commande qui échoue désormais.

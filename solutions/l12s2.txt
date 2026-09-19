@@ -1,0 +1,67 @@
+L12 — ÉTAPE 2 : PROVOQUER L'INCIDENT
+=====================================
+
+Fiche : « Le script relève l'instant précis AVANT de supprimer, et
+l'affiche. Noter cet horodatage. »
+
+-------------------------------------------------------------------------
+1. Ce que fait l12/incident.sql
+-------------------------------------------------------------------------
+  SELECT now() AS instant_avant_incident \gset
+  \echo === INSTANT AVANT INCIDENT (à noter) : :instant_avant_incident
+  SELECT max(ts) - interval '3 days' AS coupure FROM mesures \gset
+  DELETE FROM mesures WHERE ts >= :'coupure';
+
+Poste : instant 2026-09-17 18:50:44.820222+00 ; DELETE 20,1 s ;
+151 609 294 → 138 912 615 lignes, soit 12 696 679 supprimées (les trois
+derniers jours, ts ≥ 26/10 21:59:50 UTC). Le max(ts) restant est
+26/10 21:59:48.5 : un des 100 000 points tardifs de L07 (décalés d'une
+demi-seconde), preuve que la coupure tombe pile sur la frontière.
+Journaux produits par le DELETE : LSN A9/8D000060 → A9/EC52C000 ≈ 1,5 Go,
+99 segments archivés. Un DELETE écrit chaque tuple supprimé dans le WAL,
+c'est cette fenêtre que le rejeu devra traverser… jusqu'à l'instant
+cible, qui est AVANT elle.
+
+-------------------------------------------------------------------------
+2. Les trois choix du script, à faire expliquer
+-------------------------------------------------------------------------
+a) L'instant est relevé AVANT le DELETE, par `now()` côté serveur, en
+   UTC avec le fuseau explicite. En production, on le reconstitue depuis
+   un ticket ou les journaux (log_statement, pg_stat_statements) — long
+   et approximatif. La précision compte : la restauration s'arrête avant
+   le premier COMMIT postérieur à l'instant ; si l'instant relevé est
+   celui du COMMIT du DELETE lui-même, la suppression est rejouée (piège
+   de la fiche « l'instant cible tombe après l'incident »). Ici le DELETE
+   a commité 20 s après l'instant relevé : marge confortable.
+b) La fenêtre se calcule depuis max(ts), jamais depuis now() : le jeu
+   est daté, l'atelier doit se comporter pareil quel que soit le jour.
+c) Trois jours et pas vingt et un (énoncé d'origine, errata) : les trois
+   derniers jours sont en zone ROWSTORE. Un DELETE qui traverse des
+   chunks columnstore doit d'abord décompresser les lots touchés, et la
+   limite DML (100 000 tuples par instruction, vue en L08 étape 4)
+   fait échouer l'instruction : « tuple decompression limit exceeded ».
+   La compression protège, de fait, l'historique froid des suppressions
+   accidentelles massives — l'incident crédible sur une base compressée
+   porte sur la zone chaude.
+
+-------------------------------------------------------------------------
+3. Constater les dégâts
+-------------------------------------------------------------------------
+  SELECT count(*), min(ts), max(ts) FROM mesures;
+  → 138 912 615 | 2026-09-24 00:00:00+00 | 2026-10-26 21:59:48.5+00
+
+Faire remarquer que les agrégats, eux, n'ont rien perdu (mistral_1h couvre
+toujours jusqu'au 29/10) : la pyramide est matérialisée, elle ne suit pas
+le DELETE tant qu'un rafraîchissement ne repasse pas sur la plage. Un
+tableau de bord bâti sur les agrégats ne montrerait PAS l'incident — la
+détection passe par le brut ou par le contrôle de cohérence de L10 E4.
+
+-------------------------------------------------------------------------
+4. Erreurs fréquentes
+-------------------------------------------------------------------------
+- Noter l'instant affiché par le prompt de l'hôte plutôt que celui du
+  serveur : décalage de fuseau ou d'horloge, restauration à côté.
+- Relever l'instant après coup avec `SELECT now()` : c'est l'instant de
+  la question, pas celui d'avant l'incident.
+- Étendre la fenêtre à 21 jours « pour que ce soit plus impressionnant » :
+  l'instruction échoue sur la limite DML, et l'atelier s'arrête.

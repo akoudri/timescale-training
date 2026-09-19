@@ -1,0 +1,98 @@
+L07 — ÉTAPE 2 : LES NIVEAUX HEURE ET JOUR, ET LE CONTRÔLE DE SOMME
+====================================================================
+
+Fiche : « Chacun se définit au-dessus du précédent, jamais sur les
+mesures brutes. Si une des quatre expressions de l'étape 1 ne se laisse
+pas réagréger proprement ici, c'est l'étape 1 qu'il faut revoir. Le
+niveau jour porte le fuseau Europe/Paris. Vérifier la cohérence
+immédiatement. »
+
+-------------------------------------------------------------------------
+1. Requêtes attendues (agregats.sql, parties 2 et 3)
+-------------------------------------------------------------------------
+CREATE MATERIALIZED VIEW mistral_1h
+WITH (timescaledb.continuous) AS
+SELECT time_bucket(INTERVAL '1 hour', seau) AS seau,
+       series_id,
+       sum(somme)   AS somme,      -- une somme de sommes est une somme
+       sum(points)  AS points,     -- un compte se somme, ne se compte pas
+       max(maximum) AS maximum     -- un max de max est un max
+FROM   mistral_1min
+GROUP  BY 1, 2
+WITH NO DATA;
+CALL refresh_continuous_aggregate('mistral_1h', NULL, NULL);   -- ≈ 18 s
+
+-- le niveau jour porte le fuseau : leçon de R2 (M06)
+CREATE MATERIALIZED VIEW mistral_1j
+WITH (timescaledb.continuous) AS
+SELECT time_bucket(INTERVAL '1 day', seau, 'Europe/Paris') AS seau,
+       series_id,
+       sum(somme)   AS somme,
+       sum(points)  AS points,
+       max(maximum) AS maximum
+FROM   mistral_1h
+GROUP  BY 1, 2
+WITH NO DATA;
+CALL refresh_continuous_aggregate('mistral_1j', NULL, NULL);   -- < 1 s
+
+Les DEUX pièges de syntaxe :
+- `count(*)` au niveau heure : compterait les MINUTES (≤ 60), pas les
+  points. Le compte se somme.
+- `avg(somme / points)` ou `avg(moyenne)` : la moyenne de moyennes. Le
+  niveau heure doit rester somme + points.
+Le test du critère « chacun défini au-dessus du précédent » :
+  SELECT view_name, view_definition FROM timescaledb_information.continuous_aggregates;
+  → FROM mistral_1min / FROM mistral_1h, pas FROM mesures.
+
+Alignement des seaux (piège « le niveau supérieur refuse d'être créé ») :
+1 h = 60 × 1 min et 1 jour (Paris) = 24 ou 23/25 × 1 h — l'heure
+entière s'aligne sur toute frontière de jour, y compris le 25 octobre.
+Un seau de 45 s au niveau bas ou un seau jour UTC au-dessus d'un seau
+heure Paris seraient refusés.
+
+-------------------------------------------------------------------------
+2. Le contrôle de somme (l07/controle-somme.sql, version 17/09)
+-------------------------------------------------------------------------
+Sur J-3 au sens du jour civil de Paris (26 octobre 2026, [25/10 23:00,
+26/10 23:00[ UTC), quatre lignes : brut, 1min, 1h, 1j — somme et compte.
+
+  SELECT (date_trunc('day', max(ts) AT TIME ZONE 'Europe/Paris')
+          - interval '3 days') AT TIME ZONE 'Europe/Paris' AS j3
+  FROM mesures \gset
+  SELECT 'brut', sum(valeur), count(*) FROM mesures
+   WHERE ts >= :'j3' AND ts < :'j3'::timestamptz + interval '1 day'
+  UNION ALL SELECT '1min', sum(somme), sum(points) FROM mistral_1min WHERE seau …
+  UNION ALL SELECT '1h',   sum(somme), sum(points) FROM mistral_1h   WHERE seau …
+  UNION ALL SELECT '1j',   sum(somme), sum(points) FROM mistral_1j   WHERE seau …;
+
+Résultat attendu : les quatre COMPTES identiques (entiers) ; les quatre
+SOMMES égales à ~10⁻¹³ relatif près (double precision, ordre de sommation
+différent à chaque niveau). Comparer des entiers, jamais des flottants —
+c'est déjà la leçon des contrôles de migration de M12. Un écart de
+compte À CE STADE est une erreur d'agrégabilité (count(*) au niveau
+heure, seau jour mal aligné, temps réel activé sur un seul niveau), pas
+un problème de rafraîchissement : aucune politique n'existe encore.
+
+Pourquoi un jour de Paris et pas un jour UTC : le niveau jour n'a de
+seau que pour des jours de Paris ; un contrôle sur [00:00, 24:00[ UTC ne
+peut pas inclure la ligne 1j (c'est pourquoi la version initiale du
+fichier ne comparait que trois lignes). Les seaux heure (UTC) s'alignent
+sur 23:00 UTC : le contrôle reste exact aux quatre niveaux.
+
+-------------------------------------------------------------------------
+3. Formulation attendue dans mesures.md §M08
+-------------------------------------------------------------------------
+  Trois niveaux : 1min (somme, points, maximum ; 31,7 M lignes, 4 min 07)
+  → 1h (18 s, 529 024) → 1j Europe/Paris (0,6 s, 22 050). Aucune moyenne
+  stockée. Contrôle de somme J-3 avant politiques : comptes identiques
+  brut / 1min / 1h / 1j, sommes égales à 10⁻¹³ relatif.
+
+Erreurs fréquentes :
+- niveau jour défini sur `mesures` « parce que c'est plus simple » :
+  fonctionne, mais recalcule 190 M de lignes à chaque rafraîchissement
+  du jour au lieu de 529 024 (E1 chiffre ce coût) ;
+- `time_bucket('1 day', seau)` sans fuseau : jours UTC, bug de R2 ;
+- conclure d'un écart de 10⁻¹³ sur les sommes que « la pyramide est
+  fausse » ;
+- lancer le contrôle avant la fin du CALL du niveau 1min : lignes
+  manquantes, écart énorme, fausse alerte. Attendre la fin du CALL.

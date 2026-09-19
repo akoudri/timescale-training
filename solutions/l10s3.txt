@@ -1,0 +1,77 @@
+L10 — ÉTAPE 3 : ENREGISTRER, PLANIFIER, VÉRIFIER
+=================================================
+
+Fiche : « SELECT add_job('controle_qualite', INTERVAL '1 hour', config =>
+'{"seuil": "1 hour"}'::jsonb); CALL run_job(<job_id>) hors transaction ;
+puis vérifier l'enregistrement et la prochaine échéance, l'historique
+d'exécution, le résultat métier. »
+
+-------------------------------------------------------------------------
+1. Résultat du poste
+-------------------------------------------------------------------------
+  SELECT add_job(...)  → 1008          (référence : 1006)
+  CALL run_job(1008);
+    NOTICE: controle_qualite job=1008 seuil=01:00:00
+    NOTICE: controle_qualite : 3 capteurs muets      — 25 ms
+
+  jobs :      1008 | controle_qualite | {"seuil": "1 hour"} | scheduled t
+              | next_start 18:12:07 (= l'instant de l'add_job)
+  job_stats : last_run_started_at -infinity, last_successful_finish
+              -infinity, total_runs 0                ← juste après run_job
+  alertes_qualite : 137 / 208 / 451, dernier_point 29/10 18:59:50,
+              anciennete 03:00:00 — les trois capteurs coupés à l'étape 1.
+
+Trente secondes plus tard :
+  job_stats : last_run_started_at 18:12:07.99, last_successful_finish
+              18:12:08.02, Success, total_runs 1, durée 33 ms
+  alertes_qualite : 6 lignes — deux détections à 0,3 s d'écart.
+
+-------------------------------------------------------------------------
+2. Ce que ces chiffres enseignent
+-------------------------------------------------------------------------
+a) add_job PLANIFIE UNE PREMIÈRE EXÉCUTION IMMÉDIATE (next_start = now()
+   à la création, sauf `initial_start`). L'ordonnanceur a donc lancé le
+   job pendant que le run_job forcé s'exécutait : deux exécutions, deux
+   fois trois lignes. Ce n'est pas un doublon de l'action, c'est la
+   preuve que l'ordonnanceur fonctionne — les workers sont là (première
+   cause d'échec de l'atelier écartée).
+
+b) run_job EN SESSION N'EST PAS UNE EXÉCUTION AUX YEUX DE L'ORDONNANCEUR :
+   total_runs est resté à 0 après le CALL, job_history est vide ; seule
+   l'exécution planifiée a incrémenté les compteurs. run_job valide le
+   code (même procédure, même config, même signature) ; il n'alimente ni
+   les statistiques ni le journal des erreurs (l10s4). Un participant qui
+   « vérifie l'historique » juste après son run_job voit -infinity et
+   croit que rien ne s'est passé : lui faire lire la table métier, puis
+   attendre le passage planifié.
+
+c) Les trois requêtes de vérification lisent trois choses DIFFÉRENTES,
+   qu'il faut savoir distinguer sans hésiter :
+   - timescaledb_information.jobs : le CATALOGUE — ce que le job est
+     (proc_name, config, schedule_interval, scheduled, next_start) ;
+   - timescaledb_information.job_stats : le COMPTEUR — ce qu'il a fait
+     (last_run_started_at, last_successful_finish, last_run_status,
+     job_status, total_runs / successes / failures, next_start) ;
+   - alertes_qualite : le RÉSULTAT MÉTIER.
+   Une quatrième, timescaledb_information.job_errors (et job_history),
+   n'a rien à dire tant que tout va bien : c'est l'objet de l'étape 4.
+
+d) `run_job` hors transaction : comme refresh_continuous_aggregate, la
+   procédure fait ses propres COMMIT ; dans un BEGIN explicite elle
+   échoue (« cannot be executed in a transaction block »). Dans psql sans
+   BEGIN, chaque instruction est sa propre transaction : c'est bon.
+
+-------------------------------------------------------------------------
+3. Erreurs fréquentes
+-------------------------------------------------------------------------
+- Table vide alors que le job « s'est exécuté avec succès » : config lue
+  sans erreur mais seuil NULL (clé mal orthographiée) → 0 ligne, Success.
+  Le RAISE NOTICE de la première ligne le dit : « seuil=<NULL> ». Voir
+  l10s4 §3.
+- Seuil supérieur à l'ancienneté simulée (4 h pour une coupure de 3 h) :
+  personne n'est muet, et c'est correct.
+- Chercher le job par hypertable_name : une action utilisateur n'a pas
+  d'hypertable (colonne NULL) ; filtrer sur proc_name.
+- Oublier le `::jsonb` sur la config : add_job accepte le texte, mais un
+  JSON mal formé est refusé à l'enregistrement — c'est la seule erreur de
+  config qui se voit tout de suite.

@@ -1,0 +1,180 @@
+L10 — EXTENSIONS E1-E4 (non évaluées, hors état mistral-M11)
+=============================================================
+
+Tout ce qui suit a été joué sur le poste le 17/09/2026 puis supprimé
+(jobs, procédures, tables de travail) : l'état de reprise ne contient
+que la table alertes_qualite, la procédure socle et le job 1008.
+
+-------------------------------------------------------------------------
+E1 — Purge sélective paramétrée
+-------------------------------------------------------------------------
+Sur une COPIE de travail (jamais sur mesures) : e1_mesures, hypertable à
+chunks d'un jour, 2 séries du site 1 + 2 séries du site 2, 5 derniers
+jours (173 597 lignes, INSERT 0,2 s).
+
+CREATE OR REPLACE PROCEDURE purge_site(job_id int, config jsonb)
+LANGUAGE plpgsql AS $$
+DECLARE
+  site       int      := (config->>'site')::int;
+  profondeur interval := (config->>'profondeur')::interval;
+  borne      timestamptz; n bigint;
+BEGIN
+  RAISE NOTICE 'purge_site job=% site=% profondeur=%', job_id, site, profondeur;
+  IF site IS NULL OR profondeur IS NULL THEN
+    RAISE EXCEPTION 'purge_site : config incomplète (%)', config;  -- refuser, pas se taire
+  END IF;
+  SELECT max(ts) - profondeur INTO borne FROM e1_mesures;          -- relatif au jeu
+  DELETE FROM e1_mesures m
+  USING affectation_capteur af, actifs a
+  WHERE af.series_id = m.series_id AND a.machine_id = af.machine_id
+    AND a.site_id = site AND m.ts < borne;
+  GET DIAGNOSTICS n = ROW_COUNT;
+  RAISE NOTICE 'purge_site : % lignes supprimées (site %, avant %)', n, site, borne;
+END $$;
+SELECT add_job('purge_site', INTERVAL '1 day',
+               config => '{"site": 1, "profondeur": "3 days"}', scheduled => false);
+
+Résultat du poste :
+  run_job → site 1 : 34 934 lignes supprimées avant le 26/10 21:59
+            (site 1 : 86 794 → 51 860 ; site 2 intact : 86 803)
+  alter_job(config => '{"site": 2, "profondeur": "2 days"}') ; run_job
+          → site 2 : 52 241 supprimées avant le 27/10 21:59 (→ 34 562) ;
+            site 1 inchangé. RIEN N'A ÉTÉ REDÉPLOYÉ : ni procédure, ni
+            script — la configuration vit dans le catalogue.
+  alter_job(config => '{"site": 2}') ; run_job
+          → ERROR: purge_site : config incomplète ({"site": 2})
+            (l'action refuse ; sans le garde-fou, profondeur NULL aurait
+            donné borne NULL et un DELETE de 0 ligne « réussi »)
+
+Ce qu'il faut faire dire : la rétention globale (M10) supprime des CHUNKS
+entiers par âge ; une purge métier supprime des LIGNES par critère
+(site, machine, qualité) — plus lent (DELETE, WAL, pas d'espace rendu :
+l9s5 E4), mais c'est le seul outil pour un périmètre qui n'est pas la
+clé de partitionnement. Sur des chunks columnstore, un tel DELETE compte
+dans la limite DML : à planifier AVANT la bascule, ou par
+decompress/recompress.
+
+-------------------------------------------------------------------------
+E2 — L'effet d'un job long (mesuré autrement que la fiche)
+-------------------------------------------------------------------------
+Plutôt qu'une matérialisation complète en arrière-plan (4 min, et elle
+se disputerait la zone érodée de mistral_1min), on sature les workers
+avec N actions dormantes (procédure `dormir` : pg_sleep 100 s, une par
+job) et on observe la politique 1min (job 1003, pas 1 minute) :
+
+  N actions   slots occupés (lanceur 1 + ordonnanceurs 2 + N)   retard de 1003
+     6              8 (une action attend)                          +90 s
+     5              8                                              +78 s
+     4              7                                               0
+     3              6                                               0
+
+Lecture : timescaledb.max_background_workers = 8 compte LE LANCEUR ET
+LES ORDONNANCEURS (un par base ayant des jobs : postgres et mistral,
+visibles dans pg_stat_activity avec backend_type 'TimescaleDB Background
+Worker Scheduler'). Il ne reste que 5 slots pour les jobs. Le sixième job
+attend qu'un worker se libère ; la politique 1min, planifiée à la
+minute, a démarré à 18:17:08 au lieu de 18:15:38 — 90 s de retard — sans
+erreur, sans échec, Success. Son next_start suivant est recalé sur
+l'heure réelle de fin (18:18:08), pas sur la grille : le retard se
+propage tant que la saturation dure.
+Le décalage se lit exactement où la fiche le dit : next_start prévu
+(catalogue, relevé AVANT) contre last_run_started_at réel (job_stats,
+relevé APRÈS). C'est l'incident 3 de L14 (« un seul worker : rien
+n'échoue, tout est en retard »).
+Point de disparition : à partir de 4 actions longues simultanées sur ce
+réglage, plus de retard. En production : dimensionner
+max_background_workers = 3 + (nombre de jobs pouvant se recouvrir) —
+avec max_worker_processes en face (le plafond global l'emporte, premier
+piège de la fiche).
+
+-------------------------------------------------------------------------
+E3 — Instrumenter l'action
+-------------------------------------------------------------------------
+CREATE TABLE journal_actions (job_id int NOT NULL, debut timestamptz NOT NULL,
+                              duree interval NOT NULL, lignes bigint NOT NULL);
+Dans controle_qualite :
+  DECLARE t0 timestamptz := clock_timestamp();  -- pas now() : now() est
+                                                -- figé au début de la transaction
+  … après GET DIAGNOSTICS n = ROW_COUNT :
+  INSERT INTO journal_actions VALUES (job_id, t0, clock_timestamp() - t0, n);
+
+Résultat du poste (deux run_job) :
+  1008 | 18:14:37.889 | 00:00:00.021736 | 3
+  1008 | 18:14:37.912 | 00:00:00.015216 | 3
+La métrique de fraîcheur de M15 en découle :
+  SELECT job_id, max(debut) AS derniere_execution, now() - max(debut) AS age,
+         avg(duree) FROM journal_actions GROUP BY 1;
+Pourquoi une table dédiée et pas job_stats : job_stats ne connaît que la
+DERNIÈRE exécution et des cumuls ; il ne dit ni combien de lignes chaque
+passage a produit, ni comment la durée évolue (dérive = symptôme avant
+la panne). Et il est vidé avec le job (delete_job). Un journal par
+action est la première source du tableau de bord de M15.
+
+-------------------------------------------------------------------------
+E4 — Le contrôle de cohérence agrégat / brut
+-------------------------------------------------------------------------
+CREATE TABLE ecarts_coherence (detecte_le timestamptz NOT NULL, seau timestamptz NOT NULL,
+  points_agregat bigint, points_brut bigint, somme_agregat float8, somme_brut float8,
+  ecart_relatif float8);
+CREATE OR REPLACE PROCEDURE controle_coherence(job_id int, config jsonb)
+LANGUAGE plpgsql AS $$
+DECLARE
+  n_ech   int    := coalesce((config->>'echantillon')::int, 5);
+  tol     float8 := coalesce((config->>'tolerance')::float8, 1e-9);
+  domaine text   := coalesce(config->>'domaine', 'brut');
+  d0 timestamptz; d1 timestamptz; n int;
+BEGIN
+  -- LE CHOIX DE L'ÉCHANTILLON : tirer les heures dans la zone où le brut
+  -- EXISTE ENCORE (rétention !), sinon tout écart est trivial
+  IF domaine = 'brut' THEN SELECT min(ts), max(ts) INTO d0, d1 FROM mesures;
+  ELSE SELECT min(seau), max(seau) INTO d0, d1 FROM mistral_1h; END IF;
+  INSERT INTO ecarts_coherence
+  SELECT now(), h.seau, a.points, b.points, a.somme, b.somme,
+         abs(coalesce(a.somme,0) - coalesce(b.somme,0))
+           / nullif(greatest(abs(a.somme), abs(b.somme)), 0)
+  FROM  (SELECT DISTINCT time_bucket(INTERVAL '1 hour', d0 + random() * (d1 - d0)) AS seau
+         FROM generate_series(1, n_ech)) h
+  LEFT JOIN LATERAL (SELECT sum(points) AS points, sum(somme) AS somme
+                     FROM mistral_1h WHERE seau = h.seau) a ON true
+  LEFT JOIN LATERAL (SELECT count(*) AS points, sum(valeur) AS somme
+                     FROM mesures WHERE ts >= h.seau AND ts < h.seau + INTERVAL '1 hour') b ON true
+  WHERE coalesce(a.points,0) <> coalesce(b.points,0)            -- comptes : exacts
+     OR abs(coalesce(a.somme,0) - coalesce(b.somme,0))
+        > tol * greatest(abs(a.somme), abs(b.somme), 1);         -- sommes : tolérance relative
+  GET DIAGNOSTICS n = ROW_COUNT;
+  RAISE NOTICE 'controle_coherence : % écart(s) sur % heure(s) entre % et %', n, n_ech, d0, d1;
+END $$;
+
+Résultat du poste :
+  config {"echantillon": 8, "tolerance": 1e-9}, domaine brut (24/09 →
+  29/10) : 0 écart sur 8 heures, 1,05 s (chaque heure = 176 400 points
+  bruts relus, en columnstore pour la plupart).
+  config {"echantillon": 12, "domaine": "agregat"} (14/09 → 29/10) :
+  2 écarts sur 12 : seaux 17/09 19:00 et 19/09 03:00 — points_agregat
+  176 400, points_brut 0, écart relatif 1. C'est la zone que la rétention
+  a purgée en L09 : l'agrégat a gardé ce que le brut n'a plus. Ce n'est
+  PAS l'agrégat vide du bloc 10.2 (ici l'agrégat est plein et le brut
+  vide) — c'est son inverse, et il est normal. Le contrôle doit donc
+  savoir OÙ il a le droit de comparer : c'est le sens du paramètre
+  `domaine`, et de la réflexion demandée par la fiche.
+
+Trois choix à défendre :
+- L'échantillon : uniforme sur la zone où le brut existe (min(ts) →
+  max(ts)), tiré à chaque passage (random()), 5 à 10 heures : ≈ 1 s par
+  passage, contre des minutes pour un contrôle exhaustif. Un échantillon
+  FIXE (toujours les mêmes heures) ne verrait jamais un trou ailleurs ;
+  un échantillon biaisé vers le récent (là où les politiques
+  travaillent) est une variante défendable.
+- Comparer des ENTIERS (points) exactement, des flottants avec une
+  tolérance relative : la somme diffère de ~10⁻¹³ selon l'ordre de
+  sommation (leçon de L07 et de M12).
+- Consigner l'écart avec les deux valeurs, pas seulement le seau : c'est
+  ce qui permet, à la lecture, de dire de quel côté est le trou.
+Le vrai agrégat vide (bloc 10.2, provoqué en l9s5 E1) donnerait la ligne
+symétrique : points_brut > 0, points_agregat 0 ou inférieur.
+Note d'observation : la zone érodée de mistral_1min par la politique
+relative à now() (l9s3) a commencé à se propager au niveau 1h pendant
+l'atelier (seau 17/09 17:00 : 174 points au lieu de 360 pour la série 1,
+après le passage de 18:13 de la politique 1h). Un échantillon tiré sur
+« agregat » pourrait tomber dessus et consigner un écart partiel ; c'est
+le contrôle qui fait son travail.

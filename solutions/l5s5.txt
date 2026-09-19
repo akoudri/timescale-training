@@ -1,0 +1,127 @@
+L05 — R5 : DERNIÈRE VALEUR DE CHAQUE CAPTEUR (corrigé)
+========================================================
+
+Fiche : « Huit secondes. C'est le motif du bloc 6.3. Démarche imposée :
+1) DISTINCT ON sans index, mesurer, constater que le gain est faible ;
+2) créer l'index (series_id, ts DESC), mesurer sans changer la requête ;
+3) produire les deux plans et expliquer. C'est l'index qui fait le
+travail, pas la syntaxe. Réussi si < 1 s et si le participant explique
+le plan à un voisin sans lire ses notes. »
+
+-------------------------------------------------------------------------
+1. Le problème : « le dernier point de chacune des 490 séries »
+-------------------------------------------------------------------------
+Le seul index disponible est (ts DESC). Il répond à « le dernier point
+de la table » (R1 de L01, une lecture) mais pas à « le dernier point PAR
+série » : pour savoir où s'arrête chaque série il faut, sans index sur
+series_id, lire toute la table. Plan avant (relevé sur ce poste) :
+
+  Nested Loop
+    Finalize HashAggregate (max(ts) par series_id)
+      Gather → Parallel Append → 8 × (Partial HashAggregate → Parallel
+      Seq Scan)                      ← 190 M de lignes lues : 12 s
+    Append → 8 × Index Scan sur mesures_ts_idx (ts = max) Filter series_id
+                                     ← 490 × 8 sondes : négligeable
+
+Le sous-plan d'agrégation est le nœud coûteux ; la jointure de retour est
+déjà bien servie par l'index ts. Rien à gagner en réécrivant tant que
+l'agrégation exige un balayage complet.
+
+-------------------------------------------------------------------------
+2. Étape 1 — DISTINCT ON sans index : mesurer, ne PAS créer l'index
+-------------------------------------------------------------------------
+SELECT DISTINCT ON (series_id) series_id, ts, valeur
+FROM   mesures
+ORDER  BY series_id, ts DESC;
+
+Plan (relevé sur ce poste) : Unique → Sort (series_id, ts DESC) → Append
+de 8 Seq Scan. Non parallèle, et le Sort porte 190 M de lignes ×
+(4 + 8 + 8 octets) ≈ 4 Go : il déborde sur disque (work_mem) en
+plusieurs passes. Référence : 61 016 ms — CINQ fois PIRE que l'avant
+(12 127 ms), qui au moins agrégeait en hachage parallèle sans trier.
+
+C'est le résultat attendu et c'est le but de l'étape : la syntaxe
+« recommandée » du bloc 6.3, appliquée sans son index, aggrave. Le
+consigner tel quel dans mesures.md (« DISTINCT ON sans index : 61 s,
+× 0,2 »). Un participant qui crée l'index d'abord ne pourra plus
+observer ce point : d'où l'ordre imposé.
+
+-------------------------------------------------------------------------
+3. Étape 2 — l'index, puis la même requête
+-------------------------------------------------------------------------
+CREATE INDEX mesures_series_id_ts_idx ON mesures (series_id, ts DESC);
+
+Sur une hypertable, un index par chunk (8) ; ≈ 55 s sur la référence,
+≈ 4-5 Go sur disque (vérifier `df` avant : L00 §7). La requête est
+INCHANGÉE. Référence : 118 ms (× 103 par rapport à l'avant, × 517 par
+rapport à l'étape 1).
+
+Plan après, attendu (à relever et à coller dans mesures.md) :
+  Unique
+    Merge Append (series_id, ts DESC)       ← fusion ordonnée des 8 chunks
+      8 × Custom Scan (SkipScan) on _hyper_2_N_chunk
+            Index Only Scan using _hyper_2_N_chunk_mesures_series_id_ts_idx
+
+Ce qui a changé : le Sort a DISPARU (l'index livre déjà l'ordre demandé)
+et les Seq Scan sont remplacés par un parcours d'index « par saut » : pour
+chaque valeur distincte de series_id, le nœud lit la PREMIÈRE entrée
+(ts DESC → la plus récente) puis saute à la série suivante. 490 séries ×
+8 chunks ≈ 4 000 lectures d'index au lieu de 190 M de lignes. Si SkipScan
+n'apparaît pas (paramètre timescaledb.enable_skipscan à off, ou
+statistiques absentes : ANALYZE mesures), le plan de repli est Unique →
+Merge Append → Index Only Scan complet : encore un parcours de 190 M
+d'entrées, mais trié et sans heap — quelques secondes, pas 118 ms.
+Vérifier que le nœud SkipScan est bien là avant de conclure.
+
+Pourquoi (series_id, ts DESC) et pas (ts DESC, series_id) : l'index doit
+être ordonné d'abord par la clé de regroupement, ensuite par le temps,
+pour que « la dernière de chaque » soit « la première entrée de chaque
+groupe ». L'ordre inverse ne sert que le prédicat temporel, déjà couvert
+par mesures_ts_idx. M09 reprendra cet argument pour choisir
+segmentby = series_id, orderby = ts DESC dans le columnstore : même
+structure, même raison.
+
+-------------------------------------------------------------------------
+4. Explication attendue « à un voisin, sans notes »
+-------------------------------------------------------------------------
+« Avant, la base devait lire toutes les lignes pour savoir où chaque
+série s'arrête. Avec un index trié par série puis par temps décroissant,
+la réponse pour une série est la première entrée de son groupe : la base
+saute de série en série et lit 490 entrées par chunk. Le DISTINCT ON
+sans l'index a même été pire, parce qu'il a fallu trier 190 millions de
+lignes pour produire cet ordre que l'index fournit gratuitement. »
+
+Référence :   avant 12 127 ms · DISTINCT ON seul 61 016 ms ·
+              index 55,6 s · DISTINCT ON + index 118 ms (× 103)
+Poste de l'utilisateur : à reporter (les trois durées séparément).
+
+Formulation attendue dans mesures.md :
+  R5 : 12 127 → 118 ms, × 103. Étape 1 (DISTINCT ON sans index) :
+  61 016 ms, × 0,2 — le Sort de 190 M de lignes déborde sur disque.
+  Étape 2 (index (series_id, ts DESC), requête inchangée) : 118 ms.
+  Nœud responsable : SkipScan sur le nouvel index, Sort disparu. La
+  syntaxe seule aggrave ; l'index fait tout.
+
+Effet de bord à noter : R3 (filtre series_id) et la variante latérale de
+E2 profitent du même index ; relancer R3 après l'index est un bon
+contrôle (attendu : de 9 s à quelques dizaines de ms).
+
+E2 (trois variantes) : DISTINCT ON, jointure LATERAL sur le référentiel
+(`FROM affectation_capteur af, LATERAL (SELECT … WHERE series_id =
+af.series_id ORDER BY ts DESC LIMIT 1)`), et max(ts) + jointure. Avec
+l'index, LATERAL gagne sur un petit nombre de séries (20 : 20 sondes,
+pas de Merge Append sur 8 chunks) ; DISTINCT ON/SkipScan rattrape puis
+dépasse quand le nombre de séries croît (490) ; le seuil se situe vers
+quelques dizaines à une centaine de séries sur 8 chunks, et dépend du
+nombre de chunks. Sans index, les trois sont mauvaises — LATERAL est la
+pire (490 balayages).
+
+Erreurs fréquentes :
+- créer l'index avant l'étape 1 (l'écart ne peut plus être mesuré) ;
+- attribuer le gain à DISTINCT ON ;
+- index (ts DESC, series_id) « parce que le temps d'abord » : le plan
+  reste un balayage ;
+- oublier que l'index fait partie de l'état mistral-M06 : le supprimer
+  « pour nettoyer » casse M09 et L14 ;
+- ne pas vérifier la présence du nœud SkipScan et conclure sur un plan
+  de repli à quelques secondes que « l'index ne suffit pas ».

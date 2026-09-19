@@ -1,0 +1,133 @@
+L14 — EXTENSIONS E1 (incident 3), E2 (préventions éprouvées), E3 (alertes)
+============================================================================
+
+-------------------------------------------------------------------------
+E1 — Le troisième incident (famille ACTIVITÉ) : un seul worker
+-------------------------------------------------------------------------
+Injection (formateur, après correction des deux premiers) :
+  ALTER SYSTEM SET timescaledb.max_background_workers = 1;  + restart
+  (19:21:27 UTC ; laissé actif 2 h 10.)
+
+Ce que la référence annonçait : « rien n'échoue, rien ne s'arrête : les
+jobs s'exécutent en file, chacun avec un retard croissant ». Ce que
+2.29.2 fait RÉELLEMENT : le seul worker disponible est le LANCEUR ;
+l'ordonnanceur de la base `mistral` n'obtient pas de worker et ne démarre
+pas ; plus aucun job ne s'exécute. Le journal serveur le dit UNE fois, au
+démarrage, puis se tait :
+  LOG:  TimescaleDB background worker limit of 1 exceeded
+  HINT: Consider increasing timescaledb.max_background_workers.
+(Pour obtenir la file d'attente décrite, il faudrait 3 workers : lanceur
++ ordonnanceur + un seul exécutant.)
+
+Symptôme utilisateur : AUCUN. Le tableau de bord d'un jeu daté ne bouge
+pas de toute façon ; en production, la fraîcheur des agrégats se
+dégraderait lentement (30 min de start_offset avant que le niveau minute
+ne prenne du retard visible), la compression et la rétention ne
+s'exécuteraient plus (le volume grossit), le contrôle qualité ne
+consignerait plus rien (silence = « tout va bien »). Tout paraît sain.
+
+Diagnostic — comment on le voit, et avec quelle référence :
+  activite.sql, première requête :
+    workers_timescaledb = 1        (référence M02 : 3 — lanceur + 2
+                                    ordonnanceurs ; l7s0 §2, l10s0)
+  automatisation.sql, première requête, colonne next_start :
+    1003 next_start 19:21:46 — retard 2 h 10 (période 1 min)
+    1004 19:23:37 — 2 h 08 (10 min) ; 1005 19:43 — 1 h 48 (1 h) ;
+    1008 20:12 — 1 h 20 (1 h) ; last_run_started_at figé pour tous,
+    total_runs inchangé, Success partout, job_errors vide.
+  Comparaison à la référence tenue : sur ce poste, `mesures.md` §M11 n'a
+  pas été rempli par le participant (L10 déroulé par corrigé) ; les
+  références utilisées sont celles de l10s3/l10s5 (exécution 33 ms,
+  moyenne 19-30 ms par job, `journal_actions`) et `bgw_job_stat`
+  (total_duration / total_runs : 1003 23 ms, 1004 30 ms, 1008 19 ms). Ce
+  qui a changé n'est PAS la durée (aucune exécution n'a eu lieu) mais
+  l'ÉCART entre `next_start` et maintenant, et `last_run_started_at` qui
+  n'avance plus. Sans référence (« à quelle heure ce job passe-t-il
+  d'habitude ? »), un `next_start` dans le passé de deux heures passe
+  inaperçu dans une liste de dix jobs. C'est exactement pourquoi
+  mesures.md a été tenu cinq jours.
+  Requête discriminante : `SHOW timescaledb.max_background_workers` → 1
+  (famille ACTIVITÉ, réglage) — ou P3 de l14s4 qui rassemble les trois
+  signes.
+
+Correction et effet mesuré :
+  ALTER SYSTEM RESET timescaledb.max_background_workers;  + restart
+  → 8 ; 3 processus TimescaleDB ; dans la seconde qui suit, TOUS les jobs
+  en retard s'exécutent (1003, 1004, 1005, 1008 : last_run_started_at
+  21:32:21, next_start replanifiés à +1 min / +10 min / +1 h / +40 min ;
+  1001, jamais échu, fait sa première exécution). P3 : sortie vide.
+
+Leçon : c'est la panne n° 7 du catalogue de M15 (« aucun processus
+TimescaleDB ») sous sa forme la plus sournoise : un seul processus, donc
+`count(*) = 0` ne la voit PAS — l'alerte A1 de L15 doit tester « < 3 »
+(ou « pas d'ordonnanceur pour la base »), pas « = 0 ».
+
+-------------------------------------------------------------------------
+E2 — Les requêtes de prévention, en série (réintroduction un par un)
+-------------------------------------------------------------------------
+Protocole : état sain → prévention (vide) → réintroduire l'incident →
+prévention (doit se déclencher, avec le bon message) → corriger →
+prévention (doit se taire). Joué sur ce poste :
+
+  E2a incident 1  alter_job(1003, scheduled => false)
+      P1 : « 1003 SUSPENDU depuis 00:00:02 »  ; P2, P3 : vide
+      alter_job(1003, scheduled => true) → P1 vide
+  E2b incident 2  DROP INDEX mesures_series_id_ts_idx
+      P2 : « (series_id, ts DESC) ABSENT »   ; P1, P3 : vide
+      CREATE INDEX … (8,12 s) → P2 vide
+  E2c incident 3  max_background_workers = 1 + restart (E1)
+      P3 : réglage = 1 ; 1 processus ; 4 jobs EN RETARD
+      P1 : 1003, 1004 « SANS SUCCÈS depuis 2 h » (recouvrement)
+      RESET + restart → P1, P3 vides
+
+Deux défauts de la version de référence révélés PAR CE TEST (et corrigés
+dans l14s4) :
+- P2 par nom d'index : se déclenchait sur les DEUX index en régime sain
+  (noms différents sur ce poste) → alerte permanente ;
+- P1 sans garde-fou : remontait 1001 « sans succès depuis infinity » en
+  régime sain (job jamais échu ; `last_run_started_at = -infinity`, le
+  test `IS NOT NULL` de la référence L15 ne suffit pas).
+Une prévention qui ne se tait pas en régime sain est la première chose
+que l'équipe filtre ; le test du silence (L15 étape 3) commence ici.
+
+-------------------------------------------------------------------------
+E3 — En faire des alertes (les quatre critères du bloc 15.3)
+-------------------------------------------------------------------------
+Pour chacune : déclenchement provoqué (E2 : fait), silence en régime
+normal (E2 : fait, après correction des deux défauts), action écrite,
+propriétaire nommé. Ce qui reste à écrire :
+
+  P1 → alerte « job sans succès / suspendu »  (= A2 de L15)
+    Expression : la requête P1 retourne ≥ 1 ligne.
+    Action : lire `job_errors` ; si vide, chercher une suspension
+    (`scheduled`, `next_start`) et QUI l'a posée ; réactiver + rattrapage
+    borné (l14s2).
+    Propriétaire : exploitant de la plateforme données.
+    Situation normale qui la franchit : une maintenance qui suspend
+    volontairement un job → la suspension doit être datée et bornée
+    (alter_job avec next_start), ou l'alerte mise en pause nommément.
+
+  P2 → alerte « dérive de structure »
+    Expression : la requête P2 retourne ≥ 1 ligne (index manquant) ;
+    à étendre aux hypertables attendues et aux agrégats.
+    Action : comparer à schema.sql, recréer, chercher le DDL dans les
+    journaux (`log_statement = 'ddl'`).
+    Propriétaire : responsable du schéma (celui qui tient schema.sql).
+    Situation normale : une migration de schéma planifiée → la référence
+    (schema.sql) se met à jour AVANT le déploiement, pas après.
+
+  P3 → alerte « capacité d'exécution »  (= A1 de L15, durcie)
+    Expression : réglage < 8, OU processus < 3, OU un job en retard de
+    plus d'une période.
+    Action : `SHOW` des deux paramètres, journal serveur au dernier
+    démarrage (« worker limit exceeded »), restart après correction.
+    Propriétaire : exploitant de la plateforme.
+    Situation normale : un redémarrage (les jobs sont « en retard » le
+    temps que l'ordonnanceur reparte : quelques secondes) → tolérance
+    d'une période, déjà dans P3.
+
+Laquelle retirer pour rester à quatre alertes en L15 ? P1 et P3 se
+recouvrent (P1 voit aussi l'incident 3) : garder P1 (A2) et fusionner P3
+dans A1 (« processus < 3 » au lieu de « = 0 ») ; P2 devient la cinquième
+alerte candidate de L15 E2, à défendre ou à retirer dans la note E3 de
+L15.

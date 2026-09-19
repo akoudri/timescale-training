@@ -1,0 +1,117 @@
+L08 — ÉTAPE 6 : TRANCHER (politiques.sql), ET NETTOYAGE
+========================================================
+
+Fiche : « Écrire dans politiques.sql la configuration retenue, avec le
+ratio mesuré qui la justifie, le délai de bascule retenu, et la
+vérification explicite que ce délai dépasse le retard d'arrivée mesuré
+en M05. »
+
+-------------------------------------------------------------------------
+1. Le piège du poste, AVANT tout : la politique par défaut existe déjà
+-------------------------------------------------------------------------
+Sur une hypertable créée par `CREATE TABLE … WITH (tsdb.hypertable)`
+(2.29), une politique columnstore par défaut est posée à la création :
+job policy_compression, compress_after 7 days, SANS segmentby ni orderby
+explicites (ils seraient choisis à la bascule par les fonctions
+*_default_function : segmentby déduit des index, orderby ts DESC).
+
+  SELECT job_id, proc_name, hypertable_name, config
+  FROM timescaledb_information.jobs WHERE proc_name = 'policy_compression';
+  → 1002 | policy_compression | mesures | {"compress_after": "7 days"}
+
+Conséquences :
+- `SELECT add_compression_policy('mesures', INTERVAL '7 days')` échoue :
+  « columnstore policy already exists for hypertable or continuous
+  aggregate "mesures" ». Ce n'est pas `if_not_exists => true` qu'il
+  faut (il garderait la politique par défaut), c'est :
+  SELECT remove_compression_policy('mesures');
+- Cette politique est inerte en salle (les chunks ont des bornes
+  d'octobre 2026, now() - 7 j ne les dépasse qu'à partir du 24/09) mais
+  aurait basculé, un jour, des chunks avec une configuration non
+  tranchée. C'est exactement ce que l'étape interdit.
+Les jobs 1000 (mesures_avant) et 1001 (mesures_charge) ont la même
+origine ; sans effet sur la suite.
+
+-------------------------------------------------------------------------
+2. Contenu attendu de politiques.sql (section M09)
+-------------------------------------------------------------------------
+-- M09 — COMPRESSION. Mesures L08 (poste 17/09) :
+--   ratio : segmentby series_id ×9,3 · machine_id ×5,0 · aucun ×4,7
+--   R2 filtrée sur série : 9 lots lus (0,3 ms) contre 4 230 (39 ms)
+--   UPDATE série-jour : 15 ms segmenté ; REFUSÉ sans segmentby
+--     (limite DML 100 000 tuples, 4,23 M à décompresser)
+--   cardinalité : mesures_hc 96 lignes/segment/chunk → ×5,6
+SELECT remove_compression_policy('mesures');        -- politique par défaut
+ALTER TABLE mesures SET (
+  timescaledb.compress,
+  timescaledb.compress_segmentby = 'series_id',
+  timescaledb.compress_orderby   = 'ts DESC');
+-- Délai de bascule : 7 jours.
+-- justification : ratio mesuré 9,3 ; retard d'arrivée p99 = 13 min 20
+-- (pire cas 36 min 20) ; marge = 7 j / 36 min ≈ ×280 sur le pire cas.
+-- La vraie contrainte n'est pas le retard d'arrivée mais le backfill de
+-- correction (L08 étape 4) : une correction sur chunk basculé coûte la
+-- décompression d'un segment, une correction de masse celle du chunk.
+-- 7 jours = l'intervalle de chunk (M04) : on ne bascule que des chunks
+-- que plus rien n'écrit.
+SELECT add_compression_policy('mesures', INTERVAL '7 days');
+-- NOTE D'ATELIER : le jeu est daté ; la politique (relative à now()) ne
+-- basculera rien en salle. La bascule observable se fait en L09 par
+-- compress_chunk borné sur max(ts) — même mécanique, borne explicite.
+
+Vérifications :
+  SELECT attname, segmentby_column_index, orderby_column_index, orderby_asc
+  FROM timescaledb_information.compression_settings WHERE hypertable_name='mesures';
+  → series_id seg 1 ; ts ord 1, orderby_asc f
+  SELECT job_id, config, schedule_interval FROM timescaledb_information.jobs
+  WHERE proc_name='policy_compression' AND hypertable_name='mesures';
+  → 1006, compress_after 7 days, 12:00:00
+  SELECT count(*) FILTER (WHERE is_compressed), count(*)
+  FROM timescaledb_information.chunks WHERE hypertable_name='mesures';
+  → 0 | 8   (rien n'est basculé : c'est L09)
+
+L'ALTER émet « updated compression settings will only apply to future
+compressions » : normal, aucun chunk n'est encore compressé.
+
+-------------------------------------------------------------------------
+3. Pourquoi series_id, pas machine_id, pas « laisser le défaut »
+-------------------------------------------------------------------------
+- Ratio : ×9,3 contre ×5,0 et ×4,7 — divise le volume par deux de plus.
+- Lecture : toutes les requêtes du tableau de bord filtrent ou groupent
+  par série (R5 de L05, la pyramide de L07 est GROUP BY series_id) ;
+  c'est la colonne de segment qui rend l'élimination de lots possible.
+- Écriture : les corrections arrivent par capteur (recalibrage) — un
+  segment série est le plus petit périmètre de décompression possible.
+- « Laisser le défaut » : segmentby déduit des index à la bascule ;
+  ici il tomberait sur series_id (index série/ts de L05)… ou sur rien
+  si l'index n'existait pas. Une configuration déduite n'est pas une
+  configuration tranchée : elle change avec les index.
+
+Ce que la cardinalité (étape 5) ajoute : à 490 séries et chunks de 7 j,
+un segment fait 60 480 lignes par chunk = 60 lots pleins. Le choix tient.
+Il ne tiendrait plus à 20 000 séries sur chunks journaliers.
+
+-------------------------------------------------------------------------
+4. Nettoyage et état de sortie
+-------------------------------------------------------------------------
+  DROP TABLE cmp_serie, cmp_machine, cmp_aucun;
+mesures_hc reste, compressée (139 Mo). Disque : 114 Go libres, inchangé
+à l'échelle du df (les cmp_* pesaient 260 Mo). État mistral-M09 vérifié
+(l8s0 §5).
+
+-------------------------------------------------------------------------
+5. Erreurs fréquentes
+-------------------------------------------------------------------------
+- `add_compression_policy(…, if_not_exists => true)` pour faire taire
+  l'erreur : la politique par défaut reste, la configuration tranchée
+  ne s'applique qu'aux « futures compressions » — mais elle s'applique
+  quand même (l'ALTER est pris). Le résultat est bon par accident ;
+  exiger le remove explicite.
+- Poser add_compression_policy AVANT l'ALTER TABLE … SET : en 2.29
+  cela passe (le columnstore est activé implicitement) mais avec les
+  réglages par défaut. L'ordre est : configurer, puis planifier.
+- Justifier 7 jours par « c'est le défaut » : la fiche exige la marge
+  chiffrée sur le p99 de M05, et le lien avec le coût de l'étape 4.
+- Délai < retard d'arrivée (par ex. 1 h « pour compresser vite ») :
+  faute de conception ; chaque point tardif coûte la décompression
+  d'un segment.

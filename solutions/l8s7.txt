@@ -1,0 +1,113 @@
+L08 — EXTENSIONS E1 À E4
+========================
+
+-------------------------------------------------------------------------
+E1 — Voir l'élimination de lots
+-------------------------------------------------------------------------
+  EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF)
+  SELECT avg(valeur), count(*) FROM cmp_serie
+  WHERE series_id = 137 AND ts >= '2026-09-25T00:00:00Z' AND ts < '2026-09-26T00:00:00Z';
+  -- puis sans le prédicat series_id ; puis les deux sur cmp_aucun
+
+Lots traités (= lignes du scan sur la table *_compressed) :
+                             avec series_id     sans series_id
+  cmp_serie                  9  (0,28 ms)       4 408  (122 ms)
+  cmp_aucun                  4 230 (39 ms)      4 230
+  cmp_machine                4 256 (14 ms)      4 256
+
+Lecture : sur cmp_serie, le prédicat de segment passe par un Index Scan
+sur (series_id, _ts_meta_min/max) de la table compressée → 9 lots
+(8 640 lignes, 64 blocs lus). Sans lui : Parallel Seq Scan des 4 408
+lots (12 465 blocs). Sur cmp_aucun et cmp_machine, le nombre ne change
+pas avec le prédicat : il apparaît sous la forme « Vectorized Filter …
+Rows Removed by Filter: 2 110 483 » — appliqué APRÈS décompression.
+
+-------------------------------------------------------------------------
+E2 — Le retour en rowstore
+-------------------------------------------------------------------------
+  SELECT decompress_chunk('_timescaledb_internal._hyper_15_157_chunk');  -- 709 ms
+  SELECT compress_chunk('_timescaledb_internal._hyper_15_157_chunk');    -- 1 115 ms
+  bascule initiale du même chunk : ~650 ms (1,30 s pour les deux).
+
+La recompression coûte ~1,7× la bascule initiale (le chunk rowstore est
+réécrit puis relu, avec ses pages mortes), la décompression ~1×. Sur un
+chunk de production de 7 jours (7 Go rowstore à l'échelle 4 000
+signaux), l'aller-retour se compte en minutes et double transitoirement
+l'espace du chunk.
+
+Cas de production où c'est nécessaire : correction de masse au-delà de
+la limite DML (recalibrage d'un capteur sur une période), changement de
+segmentby/orderby (les chunks existants gardent l'ancienne
+configuration ; `compress_chunk(c, recompress => true)` les réécrit),
+ajout d'une colonne à valeur par défaut non nulle, migration d'un chunk
+vers un autre espace de stockage.
+
+Fenêtre de maintenance pour un chunk de 30 jours à l'échelle de
+production : ~30 Go rowstore, décompression + recompression ≈ 2 × le
+temps de bascule d'un tel chunk ; à 250 Mo/s de lecture-écriture
+séquentielle on est à 5-10 min par sens, et il faut 30 Go libres
+pendant l'opération. À planifier hors des plages de lecture, chunk par
+chunk, jamais toute la table.
+
+-------------------------------------------------------------------------
+E3 — Le ratio, colonne par colonne
+-------------------------------------------------------------------------
+  SELECT count(*) AS lots, sum(_ts_meta_count) AS lignes,
+         pg_size_pretty(sum(pg_column_size(ts)))      AS ts,
+         pg_size_pretty(sum(pg_column_size(valeur)))  AS valeur,
+         pg_size_pretty(sum(pg_column_size(machine_id))) AS machine_id,
+         pg_size_pretty(sum(pg_column_size(qualite))) AS qualite,
+         pg_size_pretty(sum(pg_column_size(series_id))) AS series_id
+  FROM _timescaledb_internal._hyper_15_156_chunk_compressed;
+  -- le chunk compressé s'appelle <chunk>_compressed en 2.29 ; il porte une
+  -- ligne par lot, les colonnes de données en TOAST, plus _ts_meta_count,
+  -- _ts_meta_min_1/_max_1 (bornes de ts du lot) et la colonne de segment.
+
+Chunk du 26/09, 4 229 230 lignes (57,5 o/ligne en rowstore = 243 Mo) :
+                 ts       valeur   machine_id  qualite  series_id   total
+  cmp_serie      259 ko   20 Mo    225 ko      209 ko   17 ko       26 Mo
+  cmp_machine    6,99 Mo  31 Mo    17 ko       254 ko   3,2 Mo      49 Mo
+  cmp_aucun      387 ko   32 Mo    4,2 Mo      685 ko   6,6 Mo      52 Mo
+
+L'horodatage compresse le mieux (0,06 octet par valeur sur cmp_serie,
+×130 par rapport aux 8 octets bruts) parce qu'il est RÉGULIER : delta-
+delta d'une grille de 10 s = une suite de zéros, encodée en run-length.
+D'où la règle pour orderby : trier par la colonne dont les deltas sont
+les plus réguliers — le temps — et dans le sens des lectures (DESC pour
+« le dernier point »). Sur cmp_machine ts coûte 7 Mo : dans un lot, dix
+séries partagent chaque horodatage, la suite n'est plus une grille
+(t, t, t… t-10, t-10…) et delta-delta perd sa régularité.
+
+La colonne de segment ne coûte rien (17 ko : une valeur par lot). Là où
+elle n'est pas segment, elle coûte 3 à 6,6 Mo. valeur reste la colonne
+incompressible : 4,9 o/valeur au mieux (flottants XOR entre voisins
+d'une même série), 7,5 o quand les voisins sont d'autres séries. C'est
+elle qui fait le ratio : ×9,3 = 57,5 / (4,9 + 0,06 + 0,1 + métadonnées).
+
+-------------------------------------------------------------------------
+E4 — L'économie à l'échelle de production (l08/tarifs-stockage.md)
+-------------------------------------------------------------------------
+Hypothèses reprises de L02 : 37,8 G points sur 3 ans, 50 o/ligne heap +
+30 o/entrée d'index → 3,03 To bruts. Fenêtre rowstore 7 j (19 Go),
+reste en columnstore au ratio mesuré ×9,3 : 323 Go. Total : 343 Go.
+Conversion 1 $ = 0,90 €.
+
+  stockage                        sans compression   avec      économie/an
+  Tiger Cloud HP 0,177 $/Go-mois   5 790 €/an        655 €     5 130 €
+  EBS gp3 0,08 $/Go-mois           2 620 €/an        296 €     2 320 €
+
+Stockage étagé (chaud 90 j compressé en HP = 44 Go ; au-delà, 2 779 Go
+AVANT compression facturés 0,021 $/Go-mois) : 714 €/an — PLUS CHER que
+tout garder compressé en HP (655 €/an). Le point à faire écrire : à
+0,177 / 9,3 = 0,019 $/Go-mois « équivalent brut », le columnstore HP
+bat l'étagé (0,021) dès que le ratio dépasse 8,4. L'étagé n'est un
+argument financier que pour des données peu compressibles, ou si le
+fournisseur facture le volume APRÈS compression — à vérifier sur la
+grille du moment, c'est exactement ce que M10 demande de faire. Ce que
+l'étagé apporte vraiment, c'est de sortir les chunks froids du disque
+de l'instance (IOPS, sauvegardes, taille de pgdata), pas d'économiser
+sur le Go.
+
+Les ordres de grandeur comptent, pas les centimes : la compression
+divise la facture de stockage par 8 à 9 ; l'étagement joue sur le
+dernier facteur 1,1, dans un sens ou dans l'autre.

@@ -1,0 +1,138 @@
+L09 — EXTENSIONS E1 À E4
+========================
+
+Non évaluées ; rien de ce qui suit n'entre dans mistral-M10 (les copies
+de travail sont supprimées, la pyramide 1min est revenue en rowstore).
+
+-------------------------------------------------------------------------
+E1 — Provoquer l'agrégat vide (copie de travail)
+-------------------------------------------------------------------------
+Montage : e1_mesures (chunks journaliers), 12 jours de la série 137
+(16 → 27/10, 103 879 points, copiés depuis `mesures`) ; e1_1h agrégat
+continu horaire, 288 seaux. Les « 20 j » et « 25 j » de la fiche sont
+joués à bornes explicites : purge < 22/10, rafraîchissement 17 → 28/10.
+
+Trois scénarios, résultats :
+  A) purge (6 chunks, 16 → 21/10) PUIS refresh 17 → 28/10, sans aucune
+     donnée tardive : 288 → 168 seaux ; il ne reste que le 16/10, seul
+     jour purgé HORS de la fenêtre de rafraîchissement. Les 120 seaux
+     de 17 → 21/10 ont disparu. Aucun message.
+  B) brut réinjecté, refresh (6 jours revenus), un point tardif inséré le
+     18/10, purge, refresh 17 → 28/10 : même résultat ; le point tardif
+     n'a rien changé — la purge suffit à invalider la plage.
+  C) refresh avec force => true (signature 2.29) : idem.
+  Complément : purge seule → 288 seaux intacts ; refresh d'une fenêtre
+  hors zone (24 → 28/10) → « already up-to-date », 288 ; refresh
+  couvrant 19 → 28/10 → 216 (les jours 19-21 supprimés, 16-18 gardés).
+
+Mécanisme : drop_chunks journalise une invalidation sur la plage
+supprimée ; le prochain rafraîchissement dont la fenêtre l'intersecte
+recalcule ces seaux depuis un brut absent et les efface. La destruction
+est bornée par la FENÊTRE du rafraîchissement, pas par la purge : tant
+qu'aucune fenêtre n'y remonte, l'agrégat survit (c'est le downsampling).
+C'est ce qui s'est produit pour de vrai sur mistral_1min (l9s3).
+
+Requête de détection (deux niveaux, à reprendre en M15) :
+  -- 1. trous : jours entre min et max de l'agrégat sans aucun seau
+  WITH bornes AS (SELECT date_trunc('day', min(seau)) d0,
+                         date_trunc('day', max(seau)) d1 FROM e1_1h),
+       jours  AS (SELECT generate_series(d0, d1, interval '1 day') jour
+                  FROM bornes)
+  SELECT jour::date AS jour_vide
+  FROM   jours j LEFT JOIN e1_1h a ON date_trunc('day', a.seau) = j.jour
+  GROUP  BY j.jour HAVING count(a.seau) = 0 ORDER BY 1;
+  → 19, 20, 21 octobre (après le complément) ; vide sur mistral_1h.
+  -- 2. configuration : rétention ≤ portée max, par hypertable
+  SELECT r.hypertable_name, (r.config->>'drop_after')::interval AS retention,
+         max((j.config->>'start_offset')::interval) AS portee_max,
+         CASE WHEN (r.config->>'drop_after')::interval
+                 > max((j.config->>'start_offset')::interval)
+              THEN 'ok' ELSE 'ALERTE' END AS verdict
+  FROM   timescaledb_information.jobs r
+  JOIN   timescaledb_information.continuous_aggregates ca
+    ON   ca.hypertable_name = r.hypertable_name
+  JOIN   timescaledb_information.jobs j
+    ON   j.proc_name = 'policy_refresh_continuous_aggregate'
+   AND   '_materialized_hypertable_' || (j.config->>'mat_hypertable_id')
+         = ca.materialization_hypertable_name
+  WHERE  r.proc_name = 'policy_retention' GROUP BY 1, 2;
+  → mesures | 30 days | 00:30:00 | ok   (seul mistral_1min lit `mesures`
+    directement ; 1h et 1j lisent l'agrégat du dessous — la jointure ne
+    remonte que le premier niveau, ce qui est le bon périmètre.)
+La détection 1 ne voit pas un trou infra-journalier (celui du poste) :
+ajouter, pour le niveau minute, count(*) par seau horaire < 490.
+
+-------------------------------------------------------------------------
+E2 — Les politiques de l'agrégat lui-même
+-------------------------------------------------------------------------
+  ALTER MATERIALIZED VIEW mistral_1min SET (timescaledb.compress = true);
+  -- NOTICE : defaulting compress_orderby to seau, series_id
+  -- (pas de segmentby par défaut sur un agrégat : orderby seau, series_id)
+  SELECT compress_chunk(c)
+  FROM show_chunks('_timescaledb_internal._materialized_hypertable_12') c;
+
+La matérialisation 1min n'a que DEUX chunks (intervalle par défaut d'un
+agrégat = 10 × celui du brut = 70 j) : 16/07 → 24/09 (812 Mo) et 24/09 →
+03/12 (3 262 Mo). Une bascule « bornée à 2 jours » n'atteindrait que le
+premier ; les deux ont été basculés pour la mesure.
+  13,2 s, 564 Mo de journal ; 812 → 110 Mo (×7,4), 3 262 → 436 Mo (×7,5)
+  pyramide 1min : 4 074 → 546 Mo
+Part du niveau minute dans le total après chaîne : 4 074 / 8 121 Mo =
+50 % non compressée ; 546 / 4 593 Mo = 12 % compressée. Le résultat qui
+surprend : la moitié du volume « après chaîne » était l'agrégat, pas le
+brut.
+
+Retour en rowstore (l'extension n'entre pas dans l'état) :
+  decompress_chunk × 2 : 61,3 s et 6,7 Go de journal (!), 4 254 Mo
+  (le volume revient un peu plus gros : pages neuves, index reconstruits).
+Trois enseignements : (1) la compression de l'agrégat est INDISPENSABLE
+dans la cible de production (politiques.sql : 1 min compressée au-delà
+de 30 j) ; (2) le retour coûte ×5 le départ en temps et ×12 en journal —
+le sens rowstore → columnstore est celui qu'on planifie, l'inverse est
+une opération de maintenance ; (3) avec des chunks de 70 j, la fenêtre
+de rafraîchissement 1min ([now − 30 min]) tombe dans un chunk basculé
+pendant 68 jours sur 70 : régler l'intervalle de chunk de la
+matérialisation (set_chunk_time_interval sur la materialization
+hypertable, p. ex. 7 j) AVANT d'y appliquer une politique de
+compression, sinon chaque passage écrit dans du columnstore.
+Ce qui est laissé : la propriété compress=true sur la vue (inerte sans
+politique), les chunks en rowstore.
+
+-------------------------------------------------------------------------
+E3 — Le stockage étagé, chiffré (pas d'instance managée ici)
+-------------------------------------------------------------------------
+Non exécutable sur le conteneur : l'étagement n'existe qu'en service
+managé (piège de la fiche). Le calcul, lui, est fait en l9s4 §2 avec
+l09/tarifs-stockage.md : étager les chunks > 90 j (2,78 To AVANT
+compression, c'est ainsi qu'il est facturé) coûte ≈ 700 $/an, contre
+≈ 255 $/an pour tout garder en haute performance compressé et ≈ 6 430
+$/an sans chaîne. L'étagé ne devient intéressant que si l'on veut GARDER
+le brut au-delà de la rétention (conformité, réanalyse) : c'est un
+substitut à la suppression, pas à la compression. Argument à formuler
+ainsi en M10.
+
+-------------------------------------------------------------------------
+E4 — Suppression de chunk contre DELETE (copie de travail)
+-------------------------------------------------------------------------
+Montage : e4_drop et e4_delete, chunks journaliers, un jour de `mesures`
+(25/10 UTC, 4 234 902 lignes, 405 Mo avec index série/ts), CHECKPOINT.
+                      drop_chunks        DELETE … WHERE ts ∈ jour
+  durée               0,30 s             1,13 s  (+ VACUUM 0,92 s)
+  journal (WAL)       110 ko             471 Mo  (+ 167 Mo de VACUUM)
+  espace rendu        405 Mo → 16 ko     405 → 405 Mo ; 161 Mo après
+                      immédiatement      VACUUM (le chunk reste : 1)
+Le troisième chiffre est celui qui compte : DELETE ne rend RIEN au
+système de fichiers ; VACUUM ne rend que les pages de queue et laisse un
+chunk vide de 161 Mo (index et pages non tronquées) ; seuls le rejeu de
+VACUUM FULL ou… drop_chunks libèrent réellement. Et le journal : ×4 000
+— en réplication ou en sauvegarde continue (M13), un DELETE de rétention
+se paie deux fois.
+
+-------------------------------------------------------------------------
+Erreurs fréquentes sur les extensions
+-------------------------------------------------------------------------
+- Jouer E1 sur `mesures` : c'est irréversible sur ce poste (le brut est
+  purgé), et c'est déjà arrivé sans le vouloir (l9s3).
+- Compresser la matérialisation sans regarder son intervalle de chunk.
+- Mesurer E4 sans CHECKPOINT préalable : le premier chiffre de WAL
+  contient les pages entières (full page writes) de l'insertion.

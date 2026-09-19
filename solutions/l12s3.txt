@@ -1,0 +1,98 @@
+L12 — ÉTAPE 3 : RESTAURER, ET LIRE LE REJEU
+=============================================
+
+Fiche : « Chronométrer du premier au dernier geste, et relever séparément
+la durée du rejeu des journaux — c'est elle qui croît avec la fenêtre à
+rattraper, indépendamment de la taille de la base. »
+
+-------------------------------------------------------------------------
+1. La commande, et ce que fait chaque geste de l12/restaurer.sh
+-------------------------------------------------------------------------
+  time ./l12/restaurer.sh --instant "2026-09-17 18:50:44.820222+00"
+
+  1. `docker compose stop timescaledb` — on ne remplace pas PGDATA sous
+     une instance ouverte.
+  2. `mv pgdata/data pgdata/data.incident` puis
+     `cp -a archives/base pgdata/data ; chmod 700` — l'état abîmé est mis
+     DE CÔTÉ, pas détruit : si la restauration échoue, on le remet en
+     place. La copie de la sauvegarde devient le nouveau PGDATA (21 Go).
+  3. `touch recovery.signal` — le fichier qui dit au serveur « démarre en
+     restauration » ; `rm -f standby.signal` — pas en réplica.
+     Ajout à postgresql.auto.conf :
+       restore_command = 'cp /archives/wal/%f %p'   (où chercher les segments)
+       recovery_target_time = '<instant>'           (jusqu'où rejouer)
+       recovery_target_action = 'promote'           (puis ouvrir en écriture)
+  4. `docker compose start` — le serveur lit backup_label, part du LSN de
+     début de sauvegarde, réclame les segments un à un via restore_command.
+  5. Boucle sur `pg_is_in_recovery()` jusqu'à `false` : l'instance est
+     promue, ouverte en écriture, sur une NOUVELLE timeline.
+  6. (ajouté le 17/09) `ALTER SYSTEM RESET` des trois paramètres de rejeu.
+
+-------------------------------------------------------------------------
+2. Lecture des journaux du conteneur (docker compose logs timescaledb)
+-------------------------------------------------------------------------
+  18:51:39.806  restored log file "…A90000008C" from archive
+  18:51:39.813  starting point-in-time recovery to 2026-09-17 18:50:44.820222+00
+  18:51:39.818  redo starts at A9/8C000028              ← START WAL du backup_label
+  18:51:39.839  consistent recovery state reached at A9/8C013BB8
+  18:51:39.839  database system is ready to accept read-only connections
+  … 91 × restored log file (≈ 55 ms par segment de 16 Mo)
+  18:51:44.876  recovery stopping before commit of transaction 131237,
+                time 2026-09-17 18:51:04.90612+00       ← le COMMIT du DELETE
+  18:51:44.876  redo done at A9/E60B2FC0 … elapsed: 5.05 s
+  18:51:44.876  last completed transaction was at log time 18:50:27.07
+  18:51:44.882  selected new timeline ID: 2
+  18:51:44.910  archive recovery complete
+  18:51:45.029  checkpoint starting: end-of-recovery
+  18:51:45.403  database system is ready to accept connections
+
+Chaque ligne enseigne quelque chose :
+- « consistent recovery state » : dès que les journaux pris pendant la
+  sauvegarde sont rejoués, la copie est cohérente ; avant ce point, une
+  ouverture serait corrompue.
+- « recovery stopping BEFORE commit of transaction 131237, time
+  18:51:04 » : PostgreSQL ne s'arrête pas « à l'instant » — il s'arrête
+  avant le premier COMMIT dont l'horodatage dépasse la cible. Le DELETE a
+  commité 20 s après l'instant relevé : il n'est PAS rejoué. Si l'instant
+  relevé avait été 18:51:05, il l'aurait été (piège de la fiche).
+- « last completed transaction … 18:50:27 » : la dernière transaction
+  effectivement rejouée est un job d'arrière-plan 17 s avant l'instant.
+  Tout ce qui a commité entre 18:50:27 et 18:51:04 est perdu — ici rien
+  d'autre que le DELETE.
+- « selected new timeline ID: 2 » : l'histoire bifurque. Les segments de
+  la timeline 1 postérieurs à A9/E60B2FC0 (le DELETE et la suite) ne
+  seront plus jamais rejoués sur cette instance. Une sauvegarde de base
+  prise APRÈS doit noter la timeline 2.
+
+-------------------------------------------------------------------------
+3. Les chiffres du poste, décomposés
+-------------------------------------------------------------------------
+  total (time)                              24,3 s   (18:51:21 → 18:51:45)
+    arrêt + mv + cp -a de 21 Go + start   ≈ 18,5 s  (jusqu'à 18:51:39.8)
+    rejeu (redo starts → redo done)          5,05 s  (91 segments, 1,4 Go,
+                                                      A9/8C000028 → A9/E60B2FC0)
+    promotion + checkpoint de fin            0,5 s
+Référence : 21,4 s total, ~8 s de rejeu. La copie des 21 Go domine ici
+parce que la sauvegarde contient 12 Go de mesures_avant (hors kit) ;
+c'est exactement l'effet « le volume fait la durée » à faire constater.
+
+Fenêtre de journaux : du START WAL de la sauvegarde (A9/8C000028) à
+l'arrêt (A9/E60B2FC0) = 0x5A0B2F98 octets ≈ 1,4 Go = 91 segments. Presque
+tout vient du DELETE (1,5 Go de WAL écrits pendant 20 s) — un rejeu de
+5 s pour 20 s d'activité : le rejeu est plus rapide que l'activité
+d'origine (pas de verrous, pas d'attente client), mais il reste
+proportionnel à ce qui a été ÉCRIT dans la fenêtre, pas au temps écoulé.
+
+-------------------------------------------------------------------------
+4. Erreurs fréquentes
+-------------------------------------------------------------------------
+- Lancer restaurer.sh avec `sudo` : data.incident et data passent à root,
+  l'instance ne redémarre plus (piège du parcours amont, à nouveau).
+- Relancer restaurer.sh une deuxième fois : `rm -rf data.incident` efface
+  la mise de côté précédente. Une seule tentative garde l'état d'avant.
+- Chercher « le rejeu ne finit pas » dans psql : c'est dans les journaux
+  du conteneur, à la ligne du segment manquant (« could not restore file
+  … from archive »). Un `pg_is_in_recovery()` qui reste `true` avec un
+  journal muet = segment absent d'archives/wal.
+- Confondre le temps total et le rejeu : c'est le rejeu seul qu'on
+  extrapole avec la fenêtre (étape 5).

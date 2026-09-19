@@ -1,0 +1,131 @@
+L06 — INDICATEUR 3 : PERCENTILE 95 DE LA VITESSE DU VENT (corrigé)
+====================================================================
+
+Fiche : « Comparer au percentile exact calculé sur la même fenêtre, et
+relever l'écart. Il doit être faible et borné — c'est ce qui rend
+l'approximation défendable. »
+
+-------------------------------------------------------------------------
+1. Le problème : un percentile n'a pas d'état intermédiaire exact
+-------------------------------------------------------------------------
+Le p95 de 45 jours ne se déduit pas des 45 p95 journaliers : il faut
+les valeurs, toutes, triées (percentile_disc / percentile_cont : Sort
+de 16 M de lignes pour 42 séries). Pour le matérialiser par niveau (M08)
+il faut un ÉTAT réagrégeable de taille bornée : `percentile_agg`
+construit un UDDSketch (histogramme à cellules de largeur relative
+constante, erreur RELATIVE bornée par construction, ~1 % par défaut) ;
+`rollup()` fusionne deux sketches ; `approx_percentile(0,95, sketch)`
+lit le résultat. Le prix : une approximation — qu'il faut MESURER une
+fois pour pouvoir la défendre.
+
+-------------------------------------------------------------------------
+2. Requête attendue (l06/indicateurs/p95-vent.sql)
+-------------------------------------------------------------------------
+WITH vent AS (
+    SELECT a.site_id, m.valeur
+    FROM   mesures m
+    JOIN   affectation_capteur af
+      ON   af.series_id = m.series_id
+     AND   m.ts >= af.debut AND (af.fin IS NULL OR m.ts < af.fin)
+    JOIN   actifs  a ON a.machine_id = af.machine_id
+    JOIN   signaux g ON g.signal_id  = af.signal_id
+    WHERE  g.libelle = 'vitesse_vent_ms'
+      AND  m.ts >= :'debut' AND m.ts < :'fin'
+)
+SELECT site_id,
+       round(approx_percentile(0.95, percentile_agg(valeur))::numeric, 3)      AS p95_approche,
+       round(percentile_disc(0.95) WITHIN GROUP (ORDER BY valeur)::numeric, 3) AS p95_exact,
+       round((100 * abs(approx_percentile(0.95, percentile_agg(valeur))
+              - percentile_disc(0.95) WITHIN GROUP (ORDER BY valeur))
+              / percentile_disc(0.95) WITHIN GROUP (ORDER BY valeur))::numeric, 2)
+                                                                               AS ecart_pct
+FROM   vent
+GROUP  BY site_id ORDER BY site_id;
+
+Référence (m/s) : site 1 : 11,94 / 11,83 (0,97 %) · site 2 : 11,94 /
+11,95 (0,09 %) · site 3 : 11,56 / 11,52 (0,37 %). Écart < 1 % : borné,
+du même ordre que la précision d'un anémomètre (± 0,1 m/s). Poste de
+l'utilisateur : à reporter.
+
+percentile_disc (une valeur observée) ou percentile_cont (interpolée) :
+les deux sont « exacts » ; l'écart entre eux est du même ordre que
+l'écart avec l'approché sur 16 M de points — le dire si un participant
+s'étonne que « l'exact » dépende de la fonction.
+
+Plan : avec l'index (series_id, ts DESC) de L05 et le Hash Join qui ne
+laisse passer que 42 séries, la lecture domine ; le Sort de
+percentile_disc (16 M de lignes) coûte l'essentiel de la différence
+entre la variante approchée seule et la comparaison. Sans l'index : Seq
+Scan de 190 M de lignes — vérifier l'état M06 avant de mettre en cause
+le Toolkit.
+
+-------------------------------------------------------------------------
+3. Ce qui rend l'approximation défendable (réponse attendue)
+-------------------------------------------------------------------------
+« L'écart est mesuré sur la fenêtre complète : inférieur à 1 % sur les
+trois sites, sous la précision du capteur. La borne est structurelle
+(UDDSketch garantit une erreur relative maximale), pas un constat
+empirique sur un jeu favorable. En échange, l'état se réagrège : le p95
+mensuel se lit dans 30 sketches journaliers au lieu de 16 M de lignes,
+et c'est ce que M08 matérialise. »
+Refuser : « ils sont presque égaux donc c'est bon » sans chiffre, et
+« l'exact est toujours préférable » sans le coût du Sort.
+
+Dans mesures.md §M07 :
+  P95 vent : site 1 11,94 / 11,83 (0,97 %), site 2 11,94 / 11,95
+  (0,09 %), site 3 11,56 / 11,52 (0,37 %). Écart borné < 1 % ; état
+  percentile_agg réagrégeable (M08).
+
+-------------------------------------------------------------------------
+4. E2 — réagréger un état de percentile
+-------------------------------------------------------------------------
+  CREATE TEMP TABLE p95_h AS
+  SELECT a.site_id, time_bucket('1 hour', m.ts) AS heure,
+         percentile_agg(m.valeur) AS etat
+  FROM   mesures m
+  JOIN   affectation_capteur af ON af.series_id = m.series_id
+     AND m.ts >= af.debut AND (af.fin IS NULL OR m.ts < af.fin)
+  JOIN   actifs a ON a.machine_id = af.machine_id
+  JOIN   signaux g ON g.signal_id = af.signal_id
+  WHERE  g.libelle = 'vitesse_vent_ms' AND m.ts >= :'debut' AND m.ts < :'fin'
+  GROUP  BY 1, 2;
+
+  SELECT site_id, time_bucket('1 day', heure, 'Europe/Paris') AS jour,
+         approx_percentile(0.95, rollup(etat)) AS p95_jour
+  FROM   p95_h GROUP BY 1, 2 ORDER BY 1, 2;
+  -- à comparer au p95 journalier direct sur mesures : écart < 1 % encore.
+
+Points à faire remarquer : 1 080 h × 3 sites = 3 240 sketches (quelques
+Ko chacun) remplacent 16 M de lignes ; `rollup` de sketches ne perd pas
+de précision par rapport à un sketch construit d'un bloc (même
+structure) ; une moyenne de p95 horaires, elle, serait fausse et non
+bornée. Table TEMP : E2 n'entre pas dans l'état M07.
+
+-------------------------------------------------------------------------
+5. E3 — réduire une série pour l'affichage (lttb)
+-------------------------------------------------------------------------
+  SELECT (unnest(lttb(ts, valeur, 500))).*
+  FROM   mesures
+  WHERE  series_id = :serie_vent
+    AND  ts >= :'debut' AND ts < :'debut'::timestamptz + interval '1 day';
+  -- contre : SELECT ts, valeur FROM (... ORDER BY ts) s WHERE rn % 17 = 0
+
+LTTB (Largest Triangle Three Buckets) choisit dans chaque seau le point
+qui maximise l'aire du triangle avec ses voisins : les pics et les creux
+survivent, l'échantillon « un sur dix-sept » les rate une fois sur
+dix-sept. Dans Grafana, deux panneaux côte à côte sur une journée de
+rafales : le max de la courbe échantillonnée est plus bas, et pas au
+même endroit. Le message pour M15 : un tableau de bord qui affiche
+8 640 points par série sur 800 px ment sur les extrêmes ; lttb ment
+moins, un agrégat min/max par pixel ne ment pas.
+
+Erreurs fréquentes :
+- `g.libelle = 'vitesse_vent'` (errata) → aucune ligne, p95 NULL ;
+- comparer avec `percentile_cont` puis `percentile_disc` et « l'exact
+  change » ;
+- borner l'écart en valeur absolue (0,11 m/s) sans le rapporter à la
+  valeur : c'est l'écart relatif qui est garanti ;
+- oublier la jointure datée ou le filtre temporel (45 j quand même, mais
+  par principe) ;
+- vouloir stocker `approx_percentile(...)` par heure et le « moyenner »
+  au jour : c'est précisément ce que l'atelier interdit.
